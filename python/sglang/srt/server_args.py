@@ -6272,7 +6272,8 @@ class ServerArgs:
                 "defaulting --linear-attn-decode-backend to flashinfer."
             )
 
-        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        # FlashInfer's pooled-state contract is limited to datacenter Blackwell
+        # (SM100/SM110). SM120 uses the SM90-style unpooled fp32 state path.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
 
         # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
@@ -6294,42 +6295,87 @@ class ServerArgs:
                 "(FlashKDA stays on prefill)."
             )
 
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        flashinfer_requested = (
+            decode == "flashinfer"
+            or prefill == "flashinfer"
+            or self.linear_attn_verify_backend == "flashinfer"
+        )
+        cc_major = (
+            torch.cuda.get_device_capability()[0]
+            if flashinfer_requested and is_cuda()
+            else None
+        )
+
         if (
             decode == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
-            and is_cuda()
-            and torch.cuda.get_device_capability()[0] >= 10
+            and cc_major in (10, 11)
         ):
             raise ValueError(
-                "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                "--linear-attn-decode-backend flashinfer on SM100/SM110 requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
+        if (
+            decode == "flashinfer"
+            and cc_major == 12
+            and self.mamba_ssm_dtype != "float32"
+        ):
+            raise ValueError(
+                "--linear-attn-decode-backend flashinfer on SM120 requires "
+                "unpooled fp32 state (--mamba-ssm-dtype float32); use "
+                "--linear-attn-decode-backend triton otherwise."
+            )
 
         verify = self.linear_attn_verify_backend
-        if verify is None and decode == "flashinfer":
+        if verify is None and decode == "flashinfer" and cc_major == 12:
+            self.linear_attn_verify_backend = "triton"
+            verify = "triton"
+            logger.info(
+                "SM120 FlashInfer GDN MTP verify is unsupported; defaulting "
+                "--linear-attn-verify-backend to triton."
+            )
+        elif verify is None and decode == "flashinfer":
             verify = "flashinfer"
+        if verify == "flashinfer" and cc_major == 12:
+            raise ValueError(
+                "--linear-attn-verify-backend flashinfer is not supported on "
+                "SM120; use --linear-attn-verify-backend triton."
+            )
         if (
             verify == "flashinfer"
             and self.mamba_ssm_dtype != "bfloat16"
-            and is_cuda()
-            and torch.cuda.get_device_capability()[0] >= 10
+            and cc_major in (10, 11)
         ):
             raise ValueError(
-                "--linear-attn-verify-backend flashinfer on SM100+ requires "
+                "--linear-attn-verify-backend flashinfer on SM100/SM110 requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
         # for correctness and best performance.
-        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        if (
+            prefill == "flashinfer"
+            and cc_major == 12
+            and self.mamba_ssm_dtype != "float32"
+        ):
+            raise ValueError(
+                "--linear-attn-prefill-backend flashinfer on SM120 requires "
+                "unpooled fp32 state (--mamba-ssm-dtype float32); use "
+                "--linear-attn-prefill-backend triton otherwise."
+            )
+        if prefill == "flashinfer" and cc_major == 12:
+            logger.info(
+                "SM120 FlashInfer GDN prefill will use unpooled fp32 state."
+            )
         cuda_version = torch.version.cuda
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
         if (
             prefill == "flashinfer"
-            and is_cuda()
-            and torch.cuda.get_device_capability()[0] >= 10
+            and cc_major is not None
+            and cc_major >= 10
             and cuda_major < 13
         ):
             raise ValueError(

@@ -42,13 +42,65 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_sm120_supported,
+    log_info_on_rank0,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _prewarm_qwen4_exp_sm120_jit_kernels(model_runner: ModelRunner) -> None:
+    """Compile Qwen4-Exp's local SM120 JIT modules before graph capture."""
+
+    model_config = model_runner.model_config
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    architecture = architectures[0] if architectures else None
+    if (
+        model_runner.device != "cuda"
+        or architecture != "Qwen4ExpForConditionalGeneration"
+        or not is_sm120_supported()
+    ):
+        return
+
+    config = model_config.hf_text_config
+    dtype = model_runner.dtype
+    block_topk = int(config.indexer_budget) // int(config.indexer_compress_ratio)
+    index_head_dim = int(config.indexer_head_dim)
+    hc_count = int(config.hc_count)
+    hidden_size = int(config.hidden_size)
+
+    from sglang.kernels.ops.attention.qsa_indexer import _jit_qsa_indexer_module
+    from sglang.kernels.ops.elementwise.fast_topk import _jit_fast_topk_module
+    from sglang.kernels.ops.elementwise.hc_combine import _jit_hc_combine_module
+    from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+        _jit_grouped_gemma_rmsnorm_module,
+    )
+
+    tic = time.perf_counter()
+    _jit_fast_topk_module(block_topk)
+    _jit_qsa_indexer_module(dtype, index_head_dim, True)
+    # The module contains both hc_combine and hc_combine_split wrappers.
+    _jit_hc_combine_module(hc_count, hidden_size, dtype)
+    _jit_grouped_gemma_rmsnorm_module(hidden_size, dtype)
+
+    if model_config.quantization == "fp8":
+        from sglang.kernels.ops.gemm.fp8_blockwise_gemm import (
+            _jit_fp8_blockwise_module,
+        )
+
+        # This module is shape-polymorphic across Qwen4's block-FP8 linears.
+        _jit_fp8_blockwise_module()
+
+    logger.info(
+        "Prewarmed Qwen4-Exp SM120 JIT kernels in %.2f seconds",
+        time.perf_counter() - tic,
+    )
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -108,6 +160,7 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner)
+    _prewarm_qwen4_exp_sm120_jit_kernels(model_runner)
 
     if model_runner.is_draft_worker:
         moe_runner_backend = (

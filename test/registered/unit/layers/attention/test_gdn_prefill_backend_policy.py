@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear import gdn_backend
+from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
@@ -245,6 +246,32 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
+
+    def test_sm120_flashinfer_uses_unpooled_state_and_disables_verify(self):
+        kernels = (True, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        with (
+            patch.object(
+                gdn_flashinfer, "_get_flashinfer_gdn_kernels", return_value=kernels
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(12, 0)),
+        ):
+            kernel = gdn_flashinfer.FlashInferGDNKernel()
+
+        self.assertFalse(kernel.use_state_pool)
+        self.assertFalse(kernel.supports_target_verify)
+        with self.assertRaisesRegex(RuntimeError, "unpooled fp32 state"):
+            kernel.decode(
+                None,
+                None,
+                None,
+                None,
+                None,
+                A_log=None,
+                dt_bias=None,
+                ssm_states=torch.empty(1, dtype=torch.bfloat16),
+                cache_indices=None,
+                query_start_loc=None,
+            )
 
 
 if __name__ == "__main__":
