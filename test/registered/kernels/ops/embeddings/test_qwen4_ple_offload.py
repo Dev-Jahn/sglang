@@ -72,6 +72,7 @@ def _make_source_embedding(
         shard_indices=shard_indices,
         embedding_dim=embedding_dim,
         quant_method=UnquantizedEmbeddingMethod(),
+        weight_scale=torch.ones(1, dtype=torch.bfloat16, device="cuda"),
         num_embeddings_per_partition=local_rows,
         num_org_embeddings_per_partition=local_rows,
         num_added_embeddings_per_partition=0,
@@ -137,6 +138,31 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_qwen4_ple_pinned_gather_does_not_read_row_zero_for_non_owner_ids():
+    embedding_dim = 13
+    source = _make_source_embedding(
+        embedding_dim=embedding_dim,
+        vocab_start=4,
+        vocab_end=8,
+        org_vocab_size=8,
+        tp_size=2,
+    )
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    rows = torch.zeros((8, embedding_dim), dtype=torch.bfloat16, device="cuda")
+    rows[4] = torch.nan  # local row zero after TP sharding
+    _load_rows(offloaded, rows)
+
+    ids = torch.tensor([[-1, 0, 3], [8, 100, 2]], device="cuda")
+    output = torch.empty(
+        (*ids.shape, embedding_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    actual = offloaded.gather(ids, out=output)
+
+    # A masked host load must not touch local row zero. If it does, the NaNs
+    # survive the later tl.where on some architectures/compilers.
+    torch.testing.assert_close(actual, torch.zeros_like(actual), rtol=0, atol=0)
 
 
 def test_qwen4_ple_pinned_gather_empty_input():

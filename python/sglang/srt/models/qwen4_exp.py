@@ -737,7 +737,7 @@ def _gather_ple_embedding_from_pinned_kernel(
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     values = tl.load(
         weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
+        mask=mask & in_range,
         other=0.0,
     ).to(tl.bfloat16)
     tl.store(

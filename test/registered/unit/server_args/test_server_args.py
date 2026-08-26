@@ -8,6 +8,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -490,6 +492,61 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             server_args._handle_mamba_backend()
+
+
+class TestSM120FlashInferGDNContract(unittest.TestCase):
+    def handle(self, server_args, capability=(12, 0)):
+        with (
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch("sglang.srt.server_args.is_sm100_supported", return_value=False),
+            patch.object(torch.cuda, "get_device_capability", return_value=capability),
+            patch.object(torch.version, "cuda", "13.2"),
+        ):
+            server_args._handle_linear_attn_backend()
+
+    def test_sm120_flashinfer_prefill_requires_fp32_state(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_prefill_backend="flashinfer",
+            mamba_ssm_dtype="bfloat16",
+        )
+        with self.assertRaisesRegex(ValueError, "SM120 requires unpooled fp32"):
+            self.handle(args)
+
+    def test_sm120_flashinfer_prefill_accepts_fp32_state(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_prefill_backend="flashinfer",
+            mamba_ssm_dtype="float32",
+        )
+        self.handle(args)
+
+    def test_sm120_flashinfer_decode_uses_triton_verify_by_default(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_decode_backend="flashinfer",
+            mamba_ssm_dtype="float32",
+        )
+        self.handle(args)
+        self.assertEqual(args.linear_attn_verify_backend, "triton")
+
+    def test_sm120_rejects_explicit_flashinfer_verify(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_verify_backend="flashinfer",
+            mamba_ssm_dtype="float32",
+        )
+        with self.assertRaisesRegex(ValueError, "not supported on SM120"):
+            self.handle(args)
+
+    def test_sm100_flashinfer_decode_still_requires_bfloat16(self):
+        args = ServerArgs(
+            model_path="dummy",
+            linear_attn_decode_backend="flashinfer",
+            mamba_ssm_dtype="float32",
+        )
+        with self.assertRaisesRegex(ValueError, "SM100/SM110 requires"):
+            self.handle(args, capability=(10, 0))
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
