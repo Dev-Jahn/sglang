@@ -48,6 +48,7 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 _QSA_DECODE_BACKENDS = {"auto", "flash_attn", "triton"}
 
 
+@lru_cache(maxsize=1)
 def _qsa_decode_backend() -> str:
     """Resolve the package-independent sparse decode override.
 
