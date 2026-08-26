@@ -46,6 +46,7 @@ from typing import (
     Annotated,
     Any,
     Callable,
+    Iterable,
     List,
     Literal,
     Optional,
@@ -56,6 +57,23 @@ from typing import (
 )
 
 A = Annotated
+
+
+class Choices(list):
+    """A CLI choice list that out-of-tree code may extend.
+
+    ``Arg(choices=...)`` and argparse both hold this object rather than a copy,
+    so an append made before the parser is built is visible to it. A plain
+    ``list`` would work identically; the type exists so that a module-level
+    choice list reads as an extension point, and so its adder can live on the
+    line below it instead of in a second block that has to be kept in order.
+    """
+
+    def add(self, choices: Iterable[str]) -> None:
+        # list.extend("abc") silently appends three characters.
+        if isinstance(choices, str):
+            raise TypeError("add() takes an iterable of choices, not a single string")
+        self.extend(choices)
 
 
 @dataclasses.dataclass(frozen=True)

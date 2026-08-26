@@ -1,5 +1,4 @@
 import dataclasses
-import importlib
 import json
 import os
 import socket
@@ -26,7 +25,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    SAMPLING_BACKEND_CHOICES,
+    PortArgs,
+    ServerArgs,
+    prepare_server_args,
+)
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -89,6 +93,19 @@ class TestPrepareServerArgs(CustomTestCase):
             ValueError, "--prefill-decode-interval must be non-negative"
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
+
+    def test_hardware_runtime_validation_runs_only_after_dummy_boundary(self):
+        with patch.object(
+            ServerArgs,
+            "_handle_hardware_runtime_validation",
+            side_effect=RuntimeError("hardware validation reached"),
+        ) as validate_runtime:
+            ServerArgs(model_path="dummy").resolve_once()
+            validate_runtime.assert_not_called()
+
+            with self.assertRaisesRegex(RuntimeError, "hardware validation reached"):
+                ServerArgs(model_path="real-model").resolve_once()
+            validate_runtime.assert_called_once_with()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
@@ -1936,40 +1953,34 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
 
-    The choice set is built once at server_args.py import time, so each subtest
-    reloads the module with the env var set to the desired value.
+    The gate is read in add_cli_args, so each subtest just builds a parser with
+    the env var set -- no module reload.
     """
 
-    def _reload_server_args_with_env(self, *, enabled: bool):
-        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
-        try:
-            return importlib.reload(server_args_module)
-        finally:
-            if previous is None:
-                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
-            else:
-                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+    def _parse(self, argv, *, enabled: bool):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1" if enabled else "0"},
+            clear=False,
+        ):
+            return prepare_server_args(argv)
 
     def test_token_oracle_rejected_when_env_disabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=False)
-        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+        self.assertNotIn("token_oracle", SAMPLING_BACKEND_CHOICES)
 
         with self.assertRaises(SystemExit):
-            reloaded.prepare_server_args(
+            self._parse(
                 [
                     "--model-path",
                     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                     "--sampling-backend",
                     "token_oracle",
-                ]
+                ],
+                enabled=False,
             )
 
     def test_token_oracle_accepted_when_env_enabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=True)
-        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
-
-        parsed = reloaded.prepare_server_args(
+        parsed = self._parse(
             [
                 "--model-path",
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -1981,9 +1992,23 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
                 # to "pytorch", masking what we want to verify).
                 "--device",
                 "cuda",
-            ]
+            ],
+            enabled=True,
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+    def test_gate_does_not_mutate_the_module_level_list(self):
+        """The env gate builds the parser's choices; it must not leak."""
+        self._parse(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--device",
+                "cuda",
+            ],
+            enabled=True,
+        )
+        self.assertNotIn("token_oracle", SAMPLING_BACKEND_CHOICES)
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):

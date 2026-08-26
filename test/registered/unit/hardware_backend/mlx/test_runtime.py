@@ -168,7 +168,7 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         and torch.backends.mps.is_available(),
         "requires MLX and MPS",
     )
-    def test_incompatible_runtime_aborts_server_args_before_dummy_shortcut(self):
+    def test_dummy_model_skips_hardware_runtime_validation(self):
         import mlx.core as mx
 
         runtime.use_mlx.cache_clear()
@@ -176,18 +176,22 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         try:
             with mock.patch.dict(os.environ, {"SGLANG_USE_MLX": "1"}):
                 with mock.patch.object(torch, "__version__", "2.12.1"):
-                    with self.assertRaisesRegex(RuntimeError, "stable Torch 2.13.x"):
-                        from sglang.srt.server_args import ServerArgs
+                    from sglang.srt.server_args import ServerArgs
 
-                        # The check runs in the pipeline, and the pipeline runs
-                        # at the gate -- still ahead of the dummy short circuit.
-                        ServerArgs(model_path="dummy").resolve_once()
+                    ServerArgs(model_path="dummy").resolve_once()
+                    with self.assertRaisesRegex(RuntimeError, "stable Torch 2.13.x"):
+                        ServerArgs(
+                            model_path="real-model"
+                        )._handle_hardware_runtime_validation()
 
                 runtime.use_mlx.cache_clear()
                 runtime._validate_runtime.cache_clear()
                 with mock.patch.object(mx, "__version__", "0.31.0"):
+                    ServerArgs(model_path="dummy").resolve_once()
                     with self.assertRaisesRegex(RuntimeError, "MLX >= 0.32.0"):
-                        ServerArgs(model_path="dummy").resolve_once()
+                        ServerArgs(
+                            model_path="real-model"
+                        )._handle_hardware_runtime_validation()
         finally:
             runtime.use_mlx.cache_clear()
             runtime._validate_runtime.cache_clear()

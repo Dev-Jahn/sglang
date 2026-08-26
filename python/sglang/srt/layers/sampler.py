@@ -8,24 +8,14 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import (
-    OutputLogprobProcessor,
-)
+from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    is_cuda,
-    is_hip,
-    is_musa,
-    is_npu,
-)
+from sglang.srt.utils.common import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -534,11 +524,11 @@ def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> 
     if not backend:
         raise ValueError("backend must be a non-empty string")
 
-    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+    from sglang.srt.server_args import add_sampling_backend_choices
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         logger.warning("Overriding existing sampler factory for backend '%s'", backend)
-    SAMPLING_BACKEND_CHOICES.add(backend)
+    add_sampling_backend_choices([backend])
     _CUSTOM_SAMPLER_FACTORIES[backend] = factory
 
 

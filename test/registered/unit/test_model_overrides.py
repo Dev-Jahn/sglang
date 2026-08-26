@@ -2281,8 +2281,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_m3_fp8_attn_gemm_resolution(self):
+        from sglang.srt.arg_groups.minimax_m3_hook import m3_fp8_attn_gemm_enabled
         from sglang.srt.arg_groups.overrides import _minimax_m3_overrides
-        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
         def _args(**kw):
             defaults = dict(
@@ -2331,9 +2331,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ns
 
         hf = SimpleNamespace()
-        with patch.object(overrides_module, "is_hip", return_value=False), patch.object(
-            overrides_module, "is_sm100_supported", return_value=True
-        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+        with (
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(
+                overrides_module, "get_quantization_config", return_value=None
+            ),
+        ):
             # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
             # dense backend with the fp8-q GEMM path); page snaps to 128
             ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)

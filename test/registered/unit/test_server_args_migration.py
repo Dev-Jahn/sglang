@@ -145,9 +145,50 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             )
 
     def test_deprecated_flags_still_work(self):
-        """Deprecated flags set the correct dest field."""
+        """Deprecated flags continue redirecting to their replacement fields."""
         sa = self._parse(["--stream-output"])
         self.assertTrue(sa.incremental_streaming_output)
+
+        sa = self._parse(["--enable-gdn-replayssm-spec"])
+        self.assertTrue(sa.enable_linear_replayssm_spec)
+
+        sa = self._parse(["--enable-expert-distribution-metrics"])
+        self.assertEqual(sa.expert_balancedness_report_mode, "server_log")
+
+    def test_deprecated_registrations_are_sorted_by_date_then_flag(self):
+        expected = [
+            "--prefill-round-robin-balance",
+            "--stream-output",
+            "--enable-flashinfer-allreduce-fusion",
+            "--collect-tokens-histogram",
+            "--speculative-dflash-draft-window-size",
+            "--dsa-prefill-cp-mode",
+            "--enable-dsa-prefill-context-parallel",
+            "--enable-nsa-prefill-context-parallel",
+            "--nsa-decode-backend",
+            "--nsa-prefill-backend",
+            "--nsa-prefill-cp-mode",
+            "--cuda-graph-bs",
+            "--cuda-graph-max-bs",
+            "--disable-cuda-graph",
+            "--disable-piecewise-cuda-graph",
+            "--enable-breakable-cuda-graph",
+            "--enforce-piecewise-cuda-graph",
+            "--piecewise-cuda-graph-compiler",
+            "--piecewise-cuda-graph-max-tokens",
+            "--piecewise-cuda-graph-tokens",
+            "--enable-prefill-context-parallel",
+            "--prefill-cp-mode",
+            "--mamba-scheduler-strategy",
+            "--enable-gdn-replayssm-spec",
+            "--enable-expert-distribution-metrics",
+        ]
+        actual = [
+            action.option_strings[0]
+            for action in self.parser._actions
+            if action.option_strings and action.option_strings[0] in expected
+        ]
+        self.assertEqual(actual, expected)
 
     def test_combined_parse(self):
         """Multiple option types parsed together in one invocation."""
