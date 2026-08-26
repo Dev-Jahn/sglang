@@ -54,9 +54,9 @@ def _make_case(bs, topk, *, single_count=None, padded=True):
         counts[0] = 0
         if bs > 1:
             counts[1] = topk
-    indices = torch.full(
-        (padded_rows, topk), -1, dtype=torch.int32, device=device
-    )
+        if bs > 2:
+            counts[2] = min(65, topk)
+    indices = torch.full((padded_rows, topk), -1, dtype=torch.int32, device=device)
     for row in range(bs):
         count = int(counts[row])
         if count:
@@ -117,10 +117,22 @@ def _run_and_compare(case):
     assert torch.isfinite(actual).all()
     max_abs_err = (actual.float() - expected.float()).abs().max().item()
     assert max_abs_err <= 2e-2, f"max abs error {max_abs_err:.6f}"
+    repeated = qsa_sparse_decode_triton(
+        q,
+        k,
+        v,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        SOFTMAX_SCALE,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(actual, repeated)
     return actual
 
 
-@pytest.mark.parametrize("bs", [1, 4, 17])
+@pytest.mark.parametrize("bs", [1, 4, 16, 64])
 @pytest.mark.parametrize("topk", [512, FINAL_TOPK])
 def test_qsa_sparse_decode_triton_matches_torch(bs, topk):
     _require_cuda()
@@ -210,9 +222,10 @@ def test_qsa_sparse_decode_triton_matches_flash_attn():
     assert max_abs_err <= 2e-2, f"max abs error {max_abs_err:.6f}"
 
 
-def test_qsa_sparse_decode_triton_cuda_graph_replay():
+@pytest.mark.parametrize("bs", [1, 16, 64])
+def test_qsa_sparse_decode_triton_cuda_graph_replay(bs):
     _require_cuda()
-    case = _make_case(4, 512, padded=True)
+    case = _make_case(bs, FINAL_TOPK, single_count=FINAL_TOPK, padded=True)
     q = case[0]
     for _ in range(3):
         qsa_sparse_decode_triton(*case, SOFTMAX_SCALE)
@@ -224,12 +237,15 @@ def test_qsa_sparse_decode_triton_cuda_graph_replay():
     graph.replay()
     torch.cuda.synchronize()
     first = output.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(first, output)
     q.mul_(0.5)
     graph.replay()
     torch.cuda.synchronize()
 
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output[4:], torch.zeros_like(output[4:]))
+    torch.testing.assert_close(output[bs:], torch.zeros_like(output[bs:]))
     assert not torch.equal(first, output)
 
 
@@ -253,15 +269,20 @@ def test_qsa_decode_backend_override(monkeypatch):
 
     for backend in ("triton", "flash_attn"):
         monkeypatch.setenv("SGLANG_QSA_DECODE_BACKEND", backend)
+        _qsa_decode_backend.cache_clear()
         assert _qsa_decode_backend() == backend
     monkeypatch.setenv("SGLANG_QSA_DECODE_BACKEND", "invalid")
+    _qsa_decode_backend.cache_clear()
     with pytest.raises(ValueError, match="SGLANG_QSA_DECODE_BACKEND"):
         _qsa_decode_backend()
     monkeypatch.delenv("SGLANG_QSA_DECODE_BACKEND")
     monkeypatch.setattr(utils, "is_sm120_supported", lambda: True)
+    _qsa_decode_backend.cache_clear()
     assert _qsa_decode_backend() == "triton"
     monkeypatch.setattr(utils, "is_sm120_supported", lambda: False)
+    _qsa_decode_backend.cache_clear()
     assert _qsa_decode_backend() == "flash_attn"
+    _qsa_decode_backend.cache_clear()
 
 
 def _time_us(fn, *, warmup=10, iterations=50):
