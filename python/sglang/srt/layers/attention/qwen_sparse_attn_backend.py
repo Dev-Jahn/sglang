@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -31,6 +32,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    qsa_sparse_decode_triton,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -43,6 +45,27 @@ logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+_QSA_DECODE_BACKENDS = {"auto", "flash_attn", "triton"}
+
+
+def _qsa_decode_backend() -> str:
+    """Resolve the package-independent sparse decode override.
+
+    SM120 defaults to Triton. Other architectures retain the existing
+    flash-attn fallback unless Triton is explicitly requested. SM100's
+    trtllm-gen path is selected before this fallback resolver.
+    """
+    backend = os.environ.get("SGLANG_QSA_DECODE_BACKEND", "auto").lower()
+    if backend not in _QSA_DECODE_BACKENDS:
+        choices = ", ".join(sorted(_QSA_DECODE_BACKENDS))
+        raise ValueError(
+            f"Invalid SGLANG_QSA_DECODE_BACKEND={backend!r}; choose {choices}"
+        )
+    if backend == "auto":
+        from sglang.srt.utils import is_sm120_supported
+
+        return "triton" if is_sm120_supported() else "flash_attn"
+    return backend
 
 
 @lru_cache(maxsize=1)
@@ -188,7 +211,13 @@ class QSAMTPSharedSparseIndices:
 
 
 class QwenSparseAttnBackend(AttentionBackend):
-    """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
+    """QSA backend using trtllm-gen, direct Triton, or packed FA2/FA4 decode.
+
+    ``SGLANG_QSA_DECODE_BACKEND=auto`` (the default) selects direct Triton on
+    SM120 and preserves packed flash-attn elsewhere; ``triton`` and
+    ``flash_attn`` override that fallback choice. SM100 trtllm-gen remains the
+    first choice regardless of this setting.
+    """
 
     # GPU-only serving: compressed addressing is arithmetic and the graph
     # replay refresh runs on device, so graphed decode iterations never need
@@ -1687,6 +1716,23 @@ class QwenSparseAttnBackend(AttentionBackend):
                 topk_indices,
                 trtllm_decode,
             )
+
+        if _qsa_decode_backend() == "triton":
+            output = qsa_sparse_decode_triton(
+                q,
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                metadata.sequence_lengths,
+                layer.scaling,
+            )
+            return output.reshape(q.shape[0], -1)
 
         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
         batch, topk = topk_indices.shape
