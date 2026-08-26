@@ -249,6 +249,28 @@ def test_qsa_sparse_decode_triton_cuda_graph_replay(bs):
     assert not torch.equal(first, output)
 
 
+def test_qsa_sparse_decode_triton_graph_survives_larger_counter_shape():
+    _require_cuda()
+    small = _make_case(1, FINAL_TOPK, single_count=FINAL_TOPK, padded=True)
+    for _ in range(3):
+        qsa_sparse_decode_triton(*small, SOFTMAX_SCALE)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = qsa_sparse_decode_triton(*small, SOFTMAX_SCALE)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = output.clone()
+
+    large = _make_case(16, FINAL_TOPK, single_count=FINAL_TOPK, padded=True)
+    qsa_sparse_decode_triton(*large, SOFTMAX_SCALE)
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(output, expected)
+
+
 def test_qsa_sparse_decode_triton_speculative_rows_share_requests():
     _require_cuda()
     case = list(_make_case(4, 512, padded=True))

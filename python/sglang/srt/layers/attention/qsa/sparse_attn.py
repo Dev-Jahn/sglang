@@ -433,6 +433,8 @@ def _qsa_sparse_decode_splitk(
     v,
     partial_out,
     partial_lse,
+    counters,
+    out,
     req_to_token,
     req_indices,
     indices,
@@ -461,11 +463,15 @@ def _qsa_sparse_decode_splitk(
     sr_n: tl.constexpr,
     si_m: tl.constexpr,
     si_n: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     TOKENS_PER_SPLIT: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
 ):
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -483,7 +489,6 @@ def _qsa_sparse_decode_splitk(
         mask=(offs_h < GROUP_SIZE)[:, None],
         other=0.0,
     )
-    q_values = q_values.to(tl.float32) * scale * 1.4426950408889634
 
     max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
     normalizer = tl.zeros([BLOCK_M], tl.float32)
@@ -515,7 +520,8 @@ def _qsa_sparse_decode_splitk(
         )
         scores = tl.where(
             valid[None, :],
-            tl.dot(q_values, keys.to(tl.float32), input_precision="tf32"),
+            # Scaling Q first rounds log2(e) into BF16 and increases error.
+            tl.dot(q_values, keys) * scale * 1.4426950408889634,
             -float("inf"),
         )
         has_values = tl.sum(valid.to(tl.int32), axis=0) > 0
@@ -561,78 +567,74 @@ def _qsa_sparse_decode_splitk(
         mask=offs_h < GROUP_SIZE,
     )
 
+    counter = counters + row * tl.num_programs(1) + kv_head
+    ticket = tl.atomic_add(counter, 1, sem="acq_rel", scope="gpu")
+    if ticket == NUM_SPLITS - 1:
+        max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
+        lse_base = row * sl_r + kv_head * sl_k + offs_h * sl_h
+        for partial_split in range(NUM_SPLITS):
+            split_lse = tl.load(
+                partial_lse + lse_base + partial_split * sl_s,
+                mask=offs_h < GROUP_SIZE,
+                other=-float("inf"),
+            )
+            max_value = tl.maximum(max_value, split_lse)
 
-@triton.jit
-def _qsa_sparse_decode_combine(
-    partial_out,
-    partial_lse,
-    out,
-    sp_r: tl.constexpr,
-    sp_k: tl.constexpr,
-    sp_s: tl.constexpr,
-    sp_h: tl.constexpr,
-    sp_d: tl.constexpr,
-    sl_r: tl.constexpr,
-    sl_k: tl.constexpr,
-    sl_s: tl.constexpr,
-    sl_h: tl.constexpr,
-    so_m: tl.constexpr,
-    so_h: tl.constexpr,
-    so_d: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    kv_head = tl.program_id(1)
-    offs_h = tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, HEAD_DIM)
-    head_mask = offs_h < GROUP_SIZE
-
-    max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
-    lse_base = row * sl_r + kv_head * sl_k + offs_h * sl_h
-    for split in range(NUM_SPLITS):
-        lse = tl.load(
-            partial_lse + lse_base + split * sl_s,
-            mask=head_mask,
-            other=-float("inf"),
+        normalizer = tl.zeros([BLOCK_M], tl.float32)
+        accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+        partial_base = (
+            row * sp_r
+            + kv_head * sp_k
+            + offs_h[:, None] * sp_h
+            + offs_d[None, :] * sp_d
         )
-        max_value = tl.maximum(max_value, lse)
+        for partial_split in range(NUM_SPLITS):
+            split_lse = tl.load(
+                partial_lse + lse_base + partial_split * sl_s,
+                mask=offs_h < GROUP_SIZE,
+                other=-float("inf"),
+            )
+            weight = tl.where(
+                split_lse > -float("inf"),
+                tl.math.exp2(split_lse - max_value),
+                0.0,
+            )
+            partial = tl.load(
+                partial_out + partial_base + partial_split * sp_s,
+                mask=(offs_h < GROUP_SIZE)[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            accumulator += weight[:, None] * partial
+            normalizer += weight
 
-    normalizer = tl.zeros([BLOCK_M], tl.float32)
-    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
-    partial_base = (
-        row * sp_r + kv_head * sp_k + offs_h[:, None] * sp_h + offs_d[None, :] * sp_d
-    )
-    for split in range(NUM_SPLITS):
-        lse = tl.load(
-            partial_lse + lse_base + split * sl_s,
-            mask=head_mask,
-            other=-float("inf"),
+        output = tl.where(
+            normalizer[:, None] > 0,
+            accumulator / normalizer[:, None],
+            0.0,
         )
-        weight = tl.where(lse > -float("inf"), tl.math.exp2(lse - max_value), 0.0)
-        partial = tl.load(
-            partial_out + partial_base + split * sp_s,
-            mask=head_mask[:, None],
-            other=0.0,
+        tl.store(
+            out
+            + row * so_m
+            + (kv_head * GROUP_SIZE + offs_h[:, None]) * so_h
+            + offs_d[None, :] * so_d,
+            output,
+            mask=(offs_h < GROUP_SIZE)[:, None],
         )
-        accumulator += weight[:, None] * partial
-        normalizer += weight
+        tl.atomic_xchg(counter, 0, sem="release", scope="gpu")
 
-    output = tl.where(
-        normalizer[:, None] > 0,
-        accumulator / normalizer[:, None],
-        0.0,
-    )
-    tl.store(
-        out
-        + row * so_m
-        + (kv_head * GROUP_SIZE + offs_h[:, None]) * so_h
-        + offs_d[None, :] * so_d,
-        output,
-        mask=head_mask[:, None],
-    )
+
+_qsa_splitk_counters = {}
+
+
+def _get_qsa_splitk_counters(device, size):
+    stream = torch.cuda.current_stream(device)
+    # Keep counters captured by older static shapes alive.
+    key = (device, stream.cuda_stream, size)
+    counters = _qsa_splitk_counters.get(key)
+    if counters is None:
+        counters = torch.zeros(size, dtype=torch.int32, device=device)
+        _qsa_splitk_counters[key] = counters
+    return counters
 
 
 def qsa_sparse_decode_triton(
@@ -684,17 +686,18 @@ def qsa_sparse_decode_triton(
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n = 64
     out = torch.empty_like(q)
-    num_splits = 8 if rows <= 1 else 4 if rows <= 16 else 1
+    num_splits = 16 if rows <= 1 else 8 if rows <= 8 else 4 if rows <= 16 else 1
     if num_splits > 1:
         partial_size = rows * num_kv_heads * num_splits * group_size * head_dim
         lse_size = rows * num_kv_heads * num_splits * group_size
         workspace = torch.empty(
             partial_size + lse_size, dtype=torch.float32, device=q.device
         )
+        counters = _get_qsa_splitk_counters(q.device, rows * num_kv_heads)
         partial_out = workspace[:partial_size].view(
             rows, num_kv_heads, num_splits, group_size, head_dim
         )
-        partial_lse = workspace[partial_size:].view(
+        partial_lse = workspace[partial_size : partial_size + lse_size].view(
             rows, num_kv_heads, num_splits, group_size
         )
         tokens_per_split = (
@@ -706,6 +709,8 @@ def qsa_sparse_decode_triton(
             v,
             partial_out,
             partial_lse,
+            counters,
+            out,
             req_to_token,
             req_indices,
             indices,
@@ -734,35 +739,16 @@ def qsa_sparse_decode_triton(
             req_to_token.stride(1),
             indices.stride(0),
             indices.stride(1),
-            GROUP_SIZE=group_size,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            HEAD_DIM=head_dim,
-            TOKENS_PER_SPLIT=tokens_per_split,
-            num_warps=8,
-            num_stages=2,
-        )
-        _qsa_sparse_decode_combine[(rows, num_kv_heads)](
-            partial_out,
-            partial_lse,
-            out,
-            partial_out.stride(0),
-            partial_out.stride(1),
-            partial_out.stride(2),
-            partial_out.stride(3),
-            partial_out.stride(4),
-            partial_lse.stride(0),
-            partial_lse.stride(1),
-            partial_lse.stride(2),
-            partial_lse.stride(3),
             out.stride(0),
             out.stride(1),
             out.stride(2),
             GROUP_SIZE=group_size,
             BLOCK_M=block_m,
+            BLOCK_N=block_n,
             HEAD_DIM=head_dim,
+            TOKENS_PER_SPLIT=tokens_per_split,
             NUM_SPLITS=num_splits,
-            num_warps=4,
+            num_warps=8,
             num_stages=2,
         )
         return out
