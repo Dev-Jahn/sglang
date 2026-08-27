@@ -8,6 +8,26 @@ import torch.nn.functional as F
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
 
+def _quantize_hc_mix_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    absmax = weight.float().abs().amax(dim=1)
+    scale = torch.where(absmax > 0, absmax / fp8_max, torch.ones_like(absmax))
+    quantized = (
+        (weight.float() / scale[:, None])
+        .clamp(min=-fp8_max, max=fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+    return quantized, scale
+
+
+def _dequantize_hc_mix_weight(
+    weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    return (weight.to(torch.bfloat16).float() * scale[:, None]).to(dtype)
+
+
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_count: int = 4
     hidden_size: int = 64
@@ -33,9 +53,7 @@ class GroupedGemmaRMSNorm(nn.Module):
         self.weight.weight_loader = self._weight_loader
         # The JIT kernel requires group_size to be a multiple of 512; this is
         # init-static, so resolve it once here (device/dtype stay per-call).
-        effective_group_size = (
-            group_size if group_size is not None else hidden_size
-        )
+        effective_group_size = group_size if group_size is not None else hidden_size
         self._jit_group_size = (
             effective_group_size if effective_group_size % 512 == 0 else None
         )
@@ -154,6 +172,11 @@ class GatedResidual(HyperConnectionBase):
             from sglang.srt.environ import envs
 
             lowrank = self.config.hc_lowrank
+            capability = (
+                torch.cuda.get_device_capability()
+                if torch.cuda.is_available()
+                else None
+            )
             self._jit_mix_ok = (
                 envs.SGLANG_HC_MIX_CUDA.get()
                 and torch.cuda.is_available()
@@ -166,6 +189,11 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            self._fp8_mix_weights = (
+                envs.SGLANG_HC_MIX_FP8_WEIGHTS.get() and capability == (12, 0)
+            )
+            self.register_buffer("input_mix_weight_down_scale", None, persistent=False)
+            self.register_buffer("input_mix_weight_up_scale", None, persistent=False)
 
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -230,6 +258,22 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _ensure_mix_weights_fp8(self) -> None:
+        if (
+            not self._fp8_mix_weights
+            or self.input_mix_weight_down.weight.dtype == torch.float8_e4m3fn
+        ):
+            return
+        with torch.no_grad():
+            down, down_scale = _quantize_hc_mix_weight(
+                self.input_mix_weight_down.weight
+            )
+            up, up_scale = _quantize_hc_mix_weight(self.input_mix_weight_up.weight)
+            self.input_mix_weight_down.weight = nn.Parameter(down, requires_grad=False)
+            self.input_mix_weight_up.weight = nn.Parameter(up, requires_grad=False)
+            self.input_mix_weight_down_scale = down_scale
+            self.input_mix_weight_up_scale = up_scale
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -237,6 +281,8 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input)
+
+        self._ensure_mix_weights_fp8()
 
         if self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
@@ -270,6 +316,8 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed,
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
+            self.input_mix_weight_down_scale,
+            self.input_mix_weight_up_scale,
         ):
             mixed_input = fused_hc_mix(
                 hyper_input_normed,
@@ -277,12 +325,27 @@ class GatedResidual(HyperConnectionBase):
                 self.input_mix_weight_up.weight,
                 self.hc_count,
                 self.hidden_size,
+                self.input_mix_weight_down_scale,
+                self.input_mix_weight_up_scale,
             ).to(self.params_dtype)
         else:
+            mix_weight_down = self.input_mix_weight_down.weight
+            mix_weight_up = self.input_mix_weight_up.weight
+            if self._fp8_mix_weights:
+                mix_weight_down = _dequantize_hc_mix_weight(
+                    mix_weight_down,
+                    self.input_mix_weight_down_scale,
+                    hyper_input_normed.dtype,
+                )
+                mix_weight_up = _dequantize_hc_mix_weight(
+                    mix_weight_up,
+                    self.input_mix_weight_up_scale,
+                    hyper_input_normed.dtype,
+                )
             mixed_input = self._mix_compute(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                mix_weight_down,
+                mix_weight_up,
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)

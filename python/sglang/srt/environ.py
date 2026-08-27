@@ -967,6 +967,8 @@ class Envs:
     # Route decode-size HC mix through the fused CuTe split-K GEMM pair
     # instead of the persistent Triton mix.
     SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # Store SM120 HC mix projection weights in FP8 with channelwise scales.
+    SGLANG_HC_MIX_FP8_WEIGHTS = EnvBool(False)
     # Log each distinct (m, n, k) the BF16 GEMM dispatch sees (allowlist tuning).
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.

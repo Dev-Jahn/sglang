@@ -1,4 +1,5 @@
 import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,12 @@ from sglang.srt.layers.hc_mix_triton import (
     _select_hc_mix_config,
     fused_hc_mix,
     fused_hc_mix_supported,
+)
+from sglang.srt.layers.hyperconnection import (
+    GatedResidual,
+    HyperConnectionConfig,
+    _dequantize_hc_mix_weight,
+    _quantize_hc_mix_weight,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -40,14 +47,19 @@ def _make_inputs(num_tokens: int, dtype: torch.dtype):
     torch.manual_seed(0)
     x = torch.randn(num_tokens, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda")
     w_down = (
-        torch.randn(LOWRANK, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda")
-        * 0.02
+        torch.randn(LOWRANK, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.02
     )
     w_up = (
-        torch.randn(HC_COUNT * HIDDEN_SIZE, LOWRANK, dtype=dtype, device="cuda")
-        * 0.02
+        torch.randn(HC_COUNT * HIDDEN_SIZE, LOWRANK, dtype=dtype, device="cuda") * 0.02
     )
     return x, w_down, w_up
+
+
+def _make_fp8_inputs(num_tokens: int):
+    x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
+    q_down, down_scale = _quantize_hc_mix_weight(w_down)
+    q_up, up_scale = _quantize_hc_mix_weight(w_up)
+    return x, w_down, w_up, q_down, q_up, down_scale, up_scale
 
 
 _TOLERANCES = {
@@ -63,9 +75,7 @@ def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     assert fused_hc_mix_supported(x, w_down, w_up)
     out = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
     ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
-    torch.testing.assert_close(
-        out.to(torch.float64), ref, **_TOLERANCES[dtype]
-    )
+    torch.testing.assert_close(out.to(torch.float64), ref, **_TOLERANCES[dtype])
 
 
 def test_fused_hc_mix_no_less_accurate_than_eager():
@@ -91,9 +101,67 @@ def test_sm120_fused_hc_mix_matches_reference(dtype, num_tokens):
     assert fused_hc_mix_supported(x, w_down, w_up)
     out = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
     ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
-    torch.testing.assert_close(
-        out.to(torch.float64), ref, **_TOLERANCES[dtype]
+    torch.testing.assert_close(out.to(torch.float64), ref, **_TOLERANCES[dtype])
+
+
+@pytest.mark.parametrize("num_tokens", [17, _SM120_FUSED_MIX_MAX_ROWS])
+def test_sm120_fp8_weight_hc_mix_matches_bf16_reference(num_tokens):
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120-specific FP8 weight path")
+    x, w_down, w_up, q_down, q_up, down_scale, up_scale = _make_fp8_inputs(num_tokens)
+    assert fused_hc_mix_supported(x, q_down, q_up, down_scale, up_scale)
+    out = fused_hc_mix(
+        x,
+        q_down,
+        q_up,
+        HC_COUNT,
+        HIDDEN_SIZE,
+        down_scale,
+        up_scale,
     )
+    ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.testing.assert_close(out.to(torch.float64), ref, rtol=1e-2, atol=7.8125e-3)
+
+
+def test_fp8_weight_dequantized_fallback_matches_kernel():
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120-specific FP8 weight path")
+    x, _, _, q_down, q_up, down_scale, up_scale = _make_fp8_inputs(17)
+    out = fused_hc_mix(
+        x,
+        q_down,
+        q_up,
+        HC_COUNT,
+        HIDDEN_SIZE,
+        down_scale,
+        up_scale,
+    )
+    down = _dequantize_hc_mix_weight(q_down, down_scale, x.dtype)
+    up = _dequantize_hc_mix_weight(q_up, up_scale, x.dtype)
+    fallback = _reference_mix(
+        x, down, up, HC_COUNT, HIDDEN_SIZE, compute_dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(out, fallback, rtol=1e-2, atol=7.8125e-3)
+
+
+def test_fp8_weight_gate_off_keeps_bf16_weights():
+    from sglang.srt.environ import envs
+
+    config = HyperConnectionConfig(
+        hc_count=HC_COUNT,
+        hidden_size=HIDDEN_SIZE,
+        params_dtype=torch.bfloat16,
+        hc_lowrank=LOWRANK,
+    )
+    with envs.SGLANG_HC_MIX_FP8_WEIGHTS.override(False):
+        layer = GatedResidual(config, use_combine=False)
+    layer.hc_norm.weight.data = layer.hc_norm.weight.data.to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    x = torch.randn(1, HC_COUNT * HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    layer.mix(x)
+    assert layer.input_mix_weight_down.weight.dtype == torch.bfloat16
+    assert layer.input_mix_weight_up.weight.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, _SM120_FUSED_MIX_MAX_ROWS])
@@ -122,17 +190,13 @@ def test_sm120_fused_hc_mix_graph_replay_stability(num_tokens):
 
 
 def test_fused_hc_mix_gate_rejects_prefill_rows():
-    x, w_down, w_up = _make_inputs(
-        _SM120_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16
-    )
+    x, w_down, w_up = _make_inputs(_SM120_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
 
 
 def test_fused_hc_mix_deterministic_inference_fallback(monkeypatch):
     x, w_down, w_up = _make_inputs(1, torch.bfloat16)
-    monkeypatch.setattr(
-        hc_mix_triton, "_deterministic_inference_cached", True
-    )
+    monkeypatch.setattr(hc_mix_triton, "_deterministic_inference_cached", True)
     assert not fused_hc_mix_supported(x, w_down, w_up)
 
 
