@@ -44,6 +44,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -795,15 +796,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        cpu_weight = nn.Parameter(
-            torch.empty(
-                source_weight.shape,
-                dtype=source_weight.dtype,
-                device="cpu",
-                pin_memory=True,
-            ),
-            requires_grad=False,
+        # The GPU reads this table over PCIe, so it does not need to sit on the
+        # NUMA node local to the GPU; spreading it keeps a multi-GiB shard from
+        # exhausting a single node (see allocate_interleaved_pinned_table).
+        pinned_data, self._pinned_buffer = allocate_interleaved_pinned_table(
+            tuple(source_weight.shape), source_weight.dtype
         )
+        cpu_weight = nn.Parameter(pinned_data, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader

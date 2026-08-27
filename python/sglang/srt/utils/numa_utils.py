@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import time
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -469,3 +470,197 @@ def init_threads_binding(
                 f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
             )
     return local_omp_cpuid
+
+
+# --- Interleaved pinned host memory -----------------------------------------
+#
+# A host table that only the GPU reads (over PCIe) gains nothing from living on
+# the NUMA node local to that GPU, but it can easily exhaust that node: pinned
+# pages are unswappable, and on hosts whose nodes are not the same size, or that
+# hang several GPUs off one node, a large node-local pinned allocation pushes the
+# node into reclaim and then into the OOM killer. It also starves the kernel
+# allocations the NVIDIA driver needs for the GPU page tables that map the
+# pinning, and a partially mapped pinning shows up much later as an
+# asynchronous "illegal memory access" (Xid 31, MMU FAULT_PDE) at a host
+# address. Spreading the pages over every node avoids all of that.
+
+_PROT_READ_WRITE = 0x1 | 0x2
+_MAP_PRIVATE_ANONYMOUS = 0x02 | 0x20
+
+
+def online_numa_nodes() -> list:
+    """Online NUMA node ids, parsed from /sys/devices/system/node/online."""
+    try:
+        raw = Path("/sys/devices/system/node/online").read_text().strip()
+    except OSError:
+        return []
+    nodes = []
+    for part in raw.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            nodes.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            nodes.append(int(part))
+    return nodes
+
+
+def numa_page_counts(ptr: int, nbytes: int) -> dict:
+    """Pages of the mapping at ``ptr`` per NUMA node, from /proc/self/numa_maps."""
+    counts = {}
+    try:
+        lines = Path("/proc/self/numa_maps").read_text().splitlines()
+    except OSError:
+        return counts
+    for line in lines:
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            start = int(fields[0], 16)
+        except ValueError:
+            continue
+        if not (ptr <= start < ptr + nbytes):
+            continue
+        for token in fields[1:]:
+            if len(token) > 1 and token[0] == "N" and token[1].isdigit():
+                node, _, pages = token[1:].partition("=")
+                counts[int(node)] = counts.get(int(node), 0) + int(pages)
+    return counts
+
+
+class InterleavedPinnedBuffer:
+    """An anonymous mapping interleaved over all NUMA nodes and page-locked.
+
+    ``mmap`` plus ``numa_interleave_memory`` decides where the pages land;
+    ``cudaHostRegister`` then locks them and maps them into the GPU's address
+    space, so the result behaves exactly like ``pin_memory=True`` storage,
+    including raw-pointer reads from device kernels.
+
+    The interleave policy is applied to the mapping before anything faults its
+    pages in, so it also governs the faulting that ``cudaHostRegister`` does.
+    When a node cannot supply its share the kernel takes the pages from another
+    node, which is the behaviour that matters here: the allocation degrades into
+    an uneven split instead of failing.
+    """
+
+    def __init__(self, nbytes: int):
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        self.nbytes = ((nbytes + page_size - 1) // page_size) * page_size
+        self.ptr = None
+        self._registered = False
+
+        nodes = online_numa_nodes()
+        if len(nodes) < 2:
+            raise RuntimeError(f"interleaving needs at least two NUMA nodes, got {nodes}")
+        libnuma = get_libnuma()
+        if libnuma is None or libnuma.numa_available() < 0:
+            raise RuntimeError("libnuma is unavailable")
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self._libc = libc
+
+        ptr = libc.mmap(
+            None,
+            ctypes.c_size_t(self.nbytes),
+            _PROT_READ_WRITE,
+            _MAP_PRIVATE_ANONYMOUS,
+            -1,
+            0,
+        )
+        if not ptr or ptr == ctypes.c_void_p(-1).value:
+            raise MemoryError(
+                f"mmap of {self.nbytes} bytes failed: {os.strerror(ctypes.get_errno())}"
+            )
+        self.ptr = ptr
+
+        try:
+            libnuma.numa_interleave_memory.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.POINTER(_Bitmask),
+            ]
+            all_nodes = ctypes.POINTER(_Bitmask).in_dll(libnuma, "numa_all_nodes_ptr")
+            libnuma.numa_interleave_memory(
+                ctypes.c_void_p(ptr), ctypes.c_size_t(self.nbytes), all_nodes
+            )
+            rc = torch.cuda.cudart().cudaHostRegister(ptr, self.nbytes, 0)
+            if int(rc) != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister of {self.nbytes} bytes failed: {rc}"
+                )
+            self._registered = True
+        except Exception:
+            self.release()
+            raise
+
+    def __del__(self):
+        self.release()
+
+    def release(self):
+        if self.ptr is None:
+            return
+        ptr, self.ptr = self.ptr, None
+        if self._registered:
+            self._registered = False
+            try:
+                torch.cuda.cudart().cudaHostUnregister(ptr)
+            except Exception as e:  # interpreter teardown can retire cudart first
+                logger.debug(f"cudaHostUnregister failed during release: {e}")
+        self._libc.munmap(ctypes.c_void_p(ptr), ctypes.c_size_t(self.nbytes))
+
+    def as_tensor(self, shape, dtype: torch.dtype) -> torch.Tensor:
+        raw = (ctypes.c_uint8 * self.nbytes).from_address(self.ptr)
+        flat = torch.frombuffer(raw, dtype=torch.uint8)
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        return flat.view(dtype)[:numel].view(*shape)
+
+
+def allocate_interleaved_pinned_table(shape, dtype: torch.dtype):
+    """Pinned host tensor whose pages are spread over every NUMA node.
+
+    Returns ``(tensor, buffer)``. ``buffer`` owns the mapping and must be kept
+    alive by the caller for as long as the tensor is used; it is ``None`` when
+    the plain node-local ``pin_memory=True`` path was taken. That fallback is
+    always logged, never silent, because it changes which node the allocation
+    consumes.
+    """
+    def plain():
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True), None
+
+    # On a single-node host node-local pinning is the only placement there is,
+    # so take it without complaining about it.
+    if not envs.SGLANG_PLE_OFFLOAD_NUMA_INTERLEAVE.get() or len(online_numa_nodes()) < 2:
+        return plain()
+
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    nbytes = numel * torch._utils._element_size(dtype)
+    try:
+        buffer = InterleavedPinnedBuffer(nbytes)
+    except Exception as e:
+        logger.warning(
+            f"NUMA-interleaved pinning of {nbytes / 2**30:.1f} GiB is unavailable "
+            f"({e}); falling back to node-local pinned memory, which consumes that "
+            f"much of the NUMA node local to this GPU."
+        )
+        return plain()
+
+    tensor = buffer.as_tensor(shape, dtype)
+    logger.info(
+        f"Pinned {nbytes / 2**30:.1f} GiB of host memory across NUMA nodes; "
+        f"pages per node {numa_page_counts(buffer.ptr, buffer.nbytes)}"
+    )
+    return tensor, buffer
