@@ -55,7 +55,9 @@ def _select_hc_mix_config(
         if num_rows <= 16:
             return _HCMixConfig(16, 16, num_ctas, 256, 4)
         if num_rows <= _SM120_FUSED_MIX_MAX_ROWS:
-            return _HCMixConfig(_SM120_FUSED_MIX_MAX_ROWS, 64, num_ctas, 128, 8)
+            return _HCMixConfig(
+                _SM120_FUSED_MIX_MAX_ROWS, 64, num_ctas, 128, 8
+            )
         return None
     if num_rows <= _FUSED_MIX_MAX_ROWS:
         return _HCMixConfig(
@@ -80,8 +82,6 @@ def _hc_mix_persistent_kernel(
     x_ptr,
     w_down_ptr,
     w_up_ptr,
-    w_down_scale_ptr,
-    w_up_scale_ptr,
     t_raw_ptr,
     out_ptr,
     counters_ptr,
@@ -97,7 +97,6 @@ def _hc_mix_persistent_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
-    FP8_WEIGHTS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -130,12 +129,7 @@ def _hc_mix_persistent_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        if FP8_WEIGHTS:
-            w = w.to(x_ptr.dtype.element_ty)
         acc = tl.dot(xt, tl.trans(w))
-        if FP8_WEIGHTS:
-            scale = tl.load(w_down_scale_ptr + n, mask=mask_n, other=0.0)
-            acc *= scale[None, :]
         tl.atomic_add(
             t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
             acc,
@@ -173,12 +167,7 @@ def _hc_mix_persistent_kernel(
                 mask=mask_gj[:, None] & mask_r[None, :],
                 other=0.0,
             )
-            if FP8_WEIGHTS:
-                w = w.to(x_ptr.dtype.element_ty)
             acc = tl.dot(t, tl.trans(w), acc)
-        if FP8_WEIGHTS:
-            scale = tl.load(w_up_scale_ptr + gj_flat, mask=mask_gj, other=0.0)
-            acc *= scale[None, :]
         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
         xg = tl.load(
             x_ptr
@@ -231,11 +220,7 @@ def _deterministic_inference() -> bool:
 
 
 def fused_hc_mix_supported(
-    hyper_input_normed: torch.Tensor,
-    w_down: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down_scale: torch.Tensor | None = None,
-    w_up_scale: torch.Tensor | None = None,
+    hyper_input_normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
 ) -> bool:
     # The persistent kernel accumulates the down projection with
     # device-scope atomics, so summation order varies across replays.
@@ -245,30 +230,10 @@ def fused_hc_mix_supported(
         return False
     device = hyper_input_normed.device
     props = torch.cuda.get_device_properties(device)
-    fp8_weights = (
-        w_down.dtype == torch.float8_e4m3fn and w_up.dtype == torch.float8_e4m3fn
-    )
-    scales_valid = (
-        w_down_scale is not None
-        and w_up_scale is not None
-        and w_down_scale.dtype == torch.float32
-        and w_up_scale.dtype == torch.float32
-        and w_down_scale.shape == (w_down.shape[0],)
-        and w_up_scale.shape == (w_up.shape[0],)
-        and w_down_scale.device == device
-        and w_up_scale.device == device
-        and w_down_scale.is_contiguous()
-        and w_up_scale.is_contiguous()
-    )
     return (
         hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-        and (
-            (
-                w_down.dtype == hyper_input_normed.dtype
-                and w_up.dtype == hyper_input_normed.dtype
-            )
-            or (fp8_weights and scales_valid and (props.major, props.minor) == (12, 0))
-        )
+        and w_down.dtype == hyper_input_normed.dtype
+        and w_up.dtype == hyper_input_normed.dtype
         and _select_hc_mix_config(
             hyper_input_normed.shape[0],
             (props.major, props.minor),
@@ -288,8 +253,6 @@ def fused_hc_mix(
     w_up: torch.Tensor,
     hc: int,
     hs: int,
-    w_down_scale: torch.Tensor | None = None,
-    w_up_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
@@ -300,19 +263,18 @@ def fused_hc_mix(
     )
     if config is None:
         raise ValueError(f"unsupported HC mix row count: {rows}")
-    t_raw = torch.empty((config.rows_pad, lowrank), dtype=torch.float32, device=device)
-    out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
+    t_raw = torch.empty(
+        (config.rows_pad, lowrank), dtype=torch.float32, device=device
+    )
+    out = torch.empty(
+        (rows, hs), dtype=hyper_input_normed.dtype, device=device
+    )
     if rows == 0:
         return out
-    fp8_weights = w_down.dtype == torch.float8_e4m3fn
-    if fp8_weights and (w_down_scale is None or w_up_scale is None):
-        raise ValueError("FP8 HC mix weights require per-output-channel scales")
     _hc_mix_persistent_kernel[(config.num_ctas,)](
         hyper_input_normed,
         w_down,
         w_up,
-        w_down if w_down_scale is None else w_down_scale,
-        w_up if w_up_scale is None else w_up_scale,
         t_raw,
         out,
         _get_counters(device),
@@ -328,7 +290,6 @@ def fused_hc_mix(
         BLOCK_K=config.block_k,
         BLOCK_J=32,
         BLOCK_R=64,
-        FP8_WEIGHTS=fp8_weights,
         num_warps=config.num_warps,
     )
     return out
