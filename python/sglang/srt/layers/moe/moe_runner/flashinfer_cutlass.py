@@ -29,6 +29,7 @@ from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.moe.nvfp4_moe_sm120 import Nvfp4MoeWorkspace
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
         FlashinferDispatchOutput,
@@ -59,6 +60,9 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    g1_alpha_up: Optional[torch.Tensor] = None
+    smallm_workspace: Optional["Nvfp4MoeWorkspace"] = None
+    smallm_expert_map: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -192,6 +196,55 @@ def _run_flashinfer_cutlass(
         dispatch_output, quant_info, runner_config
     )
 
+    workspace = quant_info.smallm_workspace
+    quant_scales = quant_info.quant_scales
+    use_smallm = (
+        quant_info.quant_type == "fp4"
+        and workspace is not None
+        and quant_info.smallm_expert_map is not None
+        and quant_info.g1_alpha_up is not None
+        and output is None
+        and not enable_alltoall
+        and x_sf is None
+        and x.dtype == torch.bfloat16
+        and topk_ids.dtype == torch.int32
+        and topk_weights.dtype == torch.float32
+        and x.is_contiguous()
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and 0 < x.shape[0] <= workspace.max_tokens
+        and x.shape[1] == workspace.hidden_size
+        and topk_ids.shape[1] == workspace.top_k
+        and runner_config.is_gated
+        and runner_config.activation in ("silu", "swiglu")
+        and runner_config.gemm1_alpha is None
+        and runner_config.gemm1_beta is None
+        and runner_config.gemm1_clamp_limit is None
+        and runner_config.swiglu_limit is None
+        and output_dtype == torch.bfloat16
+        and quant_scales is not None
+        and len(quant_scales) == 6
+    )
+    if use_smallm:
+        from sglang.kernels.ops.moe.nvfp4_moe_sm120 import nvfp4_moe_sm120
+
+        return nvfp4_moe_sm120(
+            x=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=quant_info.w13_weight,
+            w2_weight=quant_info.w2_weight,
+            w13_scale=quant_scales[1],
+            w2_scale=quant_scales[4],
+            input_scale_1=quant_scales[0],
+            input_scale_2=quant_scales[3],
+            g1_alpha=quant_scales[2],
+            g1_alpha_up=quant_info.g1_alpha_up,
+            g2_alpha=quant_scales[5],
+            expert_map=quant_info.smallm_expert_map,
+            workspace=workspace,
+        )
+
     if output is None:
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -205,7 +258,6 @@ def _run_flashinfer_cutlass(
 
     w13_weight = quant_info.w13_weight
     w2_weight = quant_info.w2_weight
-    quant_scales = quant_info.quant_scales
     if quant_info.quant_type == "fp4":
         w13_weight = w13_weight.view(torch.long)
         w2_weight = w2_weight.view(torch.long)

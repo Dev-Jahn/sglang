@@ -2594,34 +2594,35 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_weight = layer.w13_weight
             intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
             if intermediate_size_pad:
-                # padding gated activations will require to split w1 and w3
-                # and pad them individually
-                assert not layer.moe_runner_config.is_gated, (
-                    "The intermediate size required padding, "
-                    "but padding is also implemented for gated activations"
-                )
-
-                copy_or_rebind_param(
-                    layer,
-                    "w13_weight",
-                    torch.nn.functional.pad(
-                        w13_weight, (0, 0, 0, intermediate_size_pad)
-                    ),
-                )
-                copy_or_rebind_param(
-                    layer,
-                    "w2_weight",
-                    torch.nn.functional.pad(
-                        layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
-                    ),
-                )
-                copy_or_rebind_param(
-                    layer,
-                    "w2_weight_scale",
-                    torch.nn.functional.pad(
-                        layer.w2_weight_scale, (0, intermediate_size_pad // 16)
-                    ),
-                )
+                if layer.moe_runner_config.is_gated:
+                    assert self.enable_flashinfer_cutlass_moe and is_sm120_supported(), (
+                        "Unpadded gated NVFP4 weights require the SM120 "
+                        "FlashInfer CUTLASS path"
+                    )
+                else:
+                    copy_or_rebind_param(
+                        layer,
+                        "w13_weight",
+                        torch.nn.functional.pad(
+                            w13_weight, (0, 0, 0, intermediate_size_pad)
+                        ),
+                    )
+                    copy_or_rebind_param(
+                        layer,
+                        "w2_weight",
+                        torch.nn.functional.pad(
+                            layer.w2_weight,
+                            (0, intermediate_size_pad // 2, 0, 0),
+                        ),
+                    )
+                    copy_or_rebind_param(
+                        layer,
+                        "w2_weight_scale",
+                        torch.nn.functional.pad(
+                            layer.w2_weight_scale,
+                            (0, intermediate_size_pad // 16),
+                        ),
+                    )
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
@@ -2677,6 +2678,60 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
+
+        hidden_size = layer.w13_weight.shape[2] * 2
+        intermediate_size = layer.w2_weight.shape[2] * 2
+        top_k = layer.moe_runner_config.top_k
+        use_smallm = (
+            self.enable_flashinfer_cutlass_moe
+            and is_sm120_supported()
+            and not self.quant_config.use_per_token_activation
+            and layer.moe_runner_config.is_gated
+            and layer.moe_runner_config.activation in ("silu", "swiglu")
+            and hidden_size % 256 == 0
+            and intermediate_size % 64 == 0
+            and (2 * intermediate_size) % 128 == 0
+            and layer.num_local_experts <= 512
+            and top_k is not None
+        )
+        if use_smallm:
+            from sglang.kernels.ops.moe.nvfp4_moe_sm120 import (
+                prepare_nvfp4_moe_sm120,
+            )
+
+            layer.nvfp4_smallm_workspace = prepare_nvfp4_moe_sm120(
+                max_tokens=16,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=layer.w13_weight.device,
+            )
+            dispatcher = layer.dispatcher
+            global_experts = layer.num_experts
+            local_routed = getattr(
+                dispatcher, "num_local_routed_experts", layer.num_local_experts
+            )
+            local_shared = getattr(dispatcher, "num_local_shared_experts", 0)
+            expert_map = torch.full(
+                (global_experts,),
+                -1,
+                dtype=torch.int32,
+                device=layer.w13_weight.device,
+            )
+            local_start = layer.moe_ep_rank * local_routed
+            expert_map[local_start : local_start + local_routed] = torch.arange(
+                local_routed, dtype=torch.int32, device=expert_map.device
+            )
+            if local_shared:
+                expert_map[-local_shared:] = torch.arange(
+                    local_routed,
+                    local_routed + local_shared,
+                    dtype=torch.int32,
+                    device=expert_map.device,
+                )
+            layer.register_buffer(
+                "nvfp4_smallm_expert_map", expert_map, persistent=False
+            )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -2881,6 +2936,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
+                g1_alpha_up=layer.g1_alphas_up,
+                smallm_workspace=getattr(
+                    layer, "nvfp4_smallm_workspace", None
+                ),
+                smallm_expert_map=getattr(
+                    layer, "nvfp4_smallm_expert_map", None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
 
