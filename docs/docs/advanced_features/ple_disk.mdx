@@ -1,0 +1,115 @@
+---
+title: "Qwen3.8-Flash-Next PLE disk storage"
+metatags:
+    description: "Store Qwen3.8-Flash-Next PLE rows on local direct-I/O storage with exact host caches and io_uring reads."
+---
+
+Qwen3.8-Flash-Next checkpoints contain a large Qwen4-architecture n-gram PLE table. Use `--ple-storage disk` to keep its packed row image on local storage while SGLang holds selected exact rows in host memory. The implementation requires low-latency `O_DIRECT` storage. A local NVMe filesystem is recommended, although other local block-backed filesystems can provide the same interface with higher latency.
+
+The first load creates one fingerprinted image per PLE layer and tensor-parallel rank under `--ple-disk-dir`. Later loads reuse an image only when its module prefix, configuration, shard manifest, sampled row data, and weight scale match the checkpoint.
+
+Disk mode constructs the full PLE weight on the meta device, so startup does not allocate the table on the GPU before creating its disk image.
+
+## Prerequisites
+
+Before launching the server, provide:
+
+- Linux kernel 5.11 or later with `io_uring_setup`, `io_uring_enter`, and `io_uring_register` enabled
+- `sglang-kernel` 0.4.6.post2 or later with the packaged `qwen4_ple_disk_fetcher` helper; the helper checks `io_uring` support on the running kernel
+- A local filesystem that supports `O_DIRECT`
+- A storage device with a logical block size no larger than 4096 bytes
+- Access to `/sys/dev/block` so SGLang can verify the device logical block size
+- PLE rows stored as `float8_e4m3fn`; BF16 PLE checkpoints are rejected during argument resolution
+- Free space for the raw row file and packed image during the first build
+
+The packed image stores 25 160-byte rows in each 4 KiB page. Its 96-byte page tail makes it about 2.4% larger than the row payload. The first build holds the full raw row file and packed image at the same time, so reserve slightly more than twice the row payload. After a successful install, SGLang removes the raw file.
+
+On the measured dual RTX PRO 6000 TP2 host, first-build conversion of the two approximately 24.4 GiB rank images took 50.1 and 47.0 seconds. Storage throughput, checkpoint layout, and concurrent rank loading affect this time.
+
+## When to use disk storage
+
+Disk mode targets RAM-constrained, low-concurrency serving. In equal-commit NVFP4 TP2 tests with 512-token inputs and outputs, median TPOT was 1.9% higher at concurrency 1. With 32 prompts at concurrency 16, median output throughput was 9.0% lower and median TPOT was 7.5% higher. These tests used decode CUDA graphs, FlashInfer attention, Triton linear attention, and the FlashInfer CUTLASS FP4 and MoE backends on two RTX PRO 6000 GPUs. Use pinned storage when host RAM is available and high-concurrency throughput is the priority.
+
+## Launch a server
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.8-Flash-Next-FP8 \
+  --tp 4 \
+  --ple-storage disk \
+  --ple-disk-dir /mnt/local-nvme/qwen4-ple \
+  --ple-disk-hot-cache-gb 8 \
+  --ple-disk-dynamic-cache-gb 2
+```
+
+SGLang checks each 4 KiB image page against its stored CRC before using the rows. An incomplete install, older image format, or incompatible manifest produces an error that names the directory to delete before rebuilding.
+
+Disk mode keeps decode CUDA graphs enabled. It disables prefill CUDA graphs and sets both `--cuda-graph-backend-prefill disabled` and `--disable-prefill-cuda-graph`. An explicitly enabled prefill graph backend is rejected.
+
+Set `--ple-disk-stats-log-interval N` to log cumulative storage and cache counters every `N` model steps. The default `0` disables these logs.
+
+The hot and dynamic cache budgets are totals across all tensor-parallel ranks and all PLE layers. SGLang divides each budget evenly among the corresponding embedding instances. Each layer has its own readers, staging buffers, caches, and executors.
+
+The image fingerprint covers the sanitized model configuration, shard metadata, and up to 64 evenly spaced rows from each shard. A replace-in-place checkpoint edit outside those samples requires deletion of the old image directory. The model configuration can include its source path, so moving a checkpoint can produce a different fingerprint and rebuild the image.
+
+## Generate a static hot-row file
+
+The static cache starts empty unless you pass `--ple-disk-hot-frequency-file`. First launch the server once to build the image, then copy the fingerprint from its `manifest.json`. Tokenize your corpus into a headerless stream of little-endian signed 32-bit token IDs, with the model EOS token between documents. Create a metadata JSON file containing the PLE `multipliers`, `vocab_sizes`, `offsets`, `eos_token_id`, and `ngram_size` values. The current tool accepts `ngram_size: 3`. Run the simulator with the copied fingerprint, then relaunch the server with the generated file:
+
+```bash
+python scripts/ple_disk/hit_sim.py \
+  --tokens /mnt/local-nvme/ple-corpus.i32 \
+  --metadata /mnt/local-nvme/ple-metadata.json \
+  --work-dir /mnt/local-nvme/ple-counts \
+  --budget-gib 8 \
+  --tp-size 4 \
+  --fingerprint IMAGE_FINGERPRINT \
+  --output /mnt/local-nvme/ple-hot.bin
+```
+
+Pass the result to the server:
+
+```text
+--ple-disk-hot-frequency-file /mnt/local-nvme/ple-hot.bin
+```
+
+The file starts with one 4 KiB metadata page. It contains the `PLHOT001` magic, format version, image fingerprint, `uint32-global-row-id` dtype, TP size, padding divisor, total row count, and each rank's vocabulary range, offset, and count. Copy `IMAGE_FINGERPRINT` from the built image's `manifest.json`. The remaining bytes are concatenated little-endian `uint32` global row IDs for each rank, ordered by decreasing training-corpus frequency. SGLang validates the recorded rank geometry, reads the current rank's segment, and limits it to that embedding's share of `--ple-disk-hot-cache-gb` before sorting rows into the rank-select cache. Static-cache warmup reads selected pages through the direct-I/O reader. With the default budget, restarts can issue up to 8 GiB of random 4 KiB direct reads across all rank and layer instances before the server becomes ready.
+
+## Read queue settings
+
+`--ple-disk-max-read-pages` sets the page count for the decode `io_uring` and its staging area. Its automatic value is 1024 when the CUDA device uses the host page tables for pageable memory and 4096 on other CUDA devices. Set the flag directly when you need a smaller queue or memlock allocation.
+
+Each completion wait uses a 100 ms `io_uring` timeout. SGLang retries an idle completion wait up to 50 times, giving a read about 5 seconds to make progress before it returns a timeout. If the helper cannot account for submitted requests within that budget, it closes the ring to cancel outstanding work, marks the reader poisoned, and requires a server restart.
+
+`--ple-disk-prefill-read-pages` controls a separate prefill ring. SGLang clamps it to `--ple-disk-max-read-pages` and logs a warning when the requested value is larger.
+
+## Run in a container
+
+Docker's default seccomp profile does not allow the `io_uring_setup`, `io_uring_enter`, and `io_uring_register` system calls. Supply a custom seccomp profile that allows these calls, or use `--security-opt seccomp=unconfined` in a trusted environment. SGLang reports the blocked setup and exits. It does not change the storage mode automatically. Use `--ple-storage pinned` when the container policy cannot allow `io_uring`.
+
+The `io_uring` fixed-buffer registration counts against `RLIMIT_MEMLOCK`. Set the container memlock ulimit high enough for every rank and PLE layer:
+
+```text
+registered bytes per rank and PLE layer = 4096 * (max read pages + active prefill read pages)
+```
+
+The prefill term applies when `--ple-disk-prefill-buffer-tokens` is greater than zero. Leave room for other locked allocations made by the process. For Docker, `--ulimit memlock=-1` removes this limit; a finite limit at or above the required allocation also works. If registration returns `ENOMEM`, SGLang reports the attempted byte count and the flag that reduces it.
+
+Systems where `pageableMemoryAccessUsesHostPageTables` is true use an unregistered staging area, so the `io_uring` staging bytes do not consume the memlock budget.
+
+Every CUDA graph replay compares the recomputed lookup IDs with the IDs captured by the graph. Set `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL` above `1` only when measuring the synchronization cost; the first replay after each capture remains checked. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
+
+The hot and dynamic cache tiers are also CUDA-pinned host allocations. Their documented defaults total 10 GiB across ranks and layers. Prefill slots, future-ID staging, and transfer buffers add pinned allocations for each layer and rank. A retained transfer buffer is capped at 65,536 rows, exactly 10 MiB of pinned host memory plus its device buffer. Larger transfer buffers are released after the copy completes. Include these allocations in both host-RAM and memlock planning even on systems where CUDA registration is accounted separately from `RLIMIT_MEMLOCK`.
+
+## GB10 settings
+
+On NVIDIA GB10, start with `--mem-fraction-static 0.85` and `--max-running-requests 4`. This leaves a usable GDN state pool for Qwen4 while the PLE table uses disk storage. The automatic read-page limit is 1024 on GB10.
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.8-Flash-Next-FP8 \
+  --ple-storage disk \
+  --ple-disk-dir /mnt/local-nvme/qwen4-ple \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 4
+```
