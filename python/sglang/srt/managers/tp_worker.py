@@ -292,6 +292,7 @@ class BaseTpWorker(ABC):
             self.model_runner,
             return_hidden_states_before_norm=False,
         )
+        self.model_runner.prepare_model_batch(batch, forward_batch)
         output = self.model_runner.forward(forward_batch)
         return output.logits_output, output.can_run_graph
 
@@ -592,6 +593,7 @@ class TpModelWorker(BaseTpWorker):
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            self.model_runner.prepare_model_batch(batch, forward_batch)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -688,6 +690,7 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 return_hidden_states_before_norm=False,
             )
+            self.model_runner.prepare_model_batch(batch, forward_batch)
             batch.split_forward_batch = forward_batch
 
         out = self.model_runner.forward(
