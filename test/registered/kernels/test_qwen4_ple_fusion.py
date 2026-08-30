@@ -9,7 +9,7 @@ from sglang.kernels.ops.qwen4_ple import (
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-b200")
+register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 _EOS = 248044
@@ -120,3 +120,9 @@ def test_qwen4_ple_fused_kernels_are_bitwise_exact(num_tokens):
 def test_qwen4_ple_fusion_is_enabled_by_default(monkeypatch):
     monkeypatch.delenv("SGLANG_ENABLE_QWEN4_PLE_FUSION", raising=False)
     assert envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

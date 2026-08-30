@@ -3,11 +3,12 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union, cast
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.model_executor.model_hooks import StorageLifecycleHook
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -178,6 +179,8 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            if getattr(model, "supports_storage_lifecycle_hook", False):
+                cast(StorageLifecycleHook, model).prepare_weight_reload()
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 

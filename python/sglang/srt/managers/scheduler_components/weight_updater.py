@@ -6,7 +6,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
 
 import msgspec
 import torch
@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.model_hooks import StorageLifecycleHook
 
 logger = logging.getLogger(__name__)
 
@@ -232,9 +233,10 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
-            self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
-            )
+            model = self.tp_worker.model_runner.model
+            if getattr(model, "supports_storage_lifecycle_hook", False):
+                cast(StorageLifecycleHook, model).close()
+            self.stashed_model_static_state = _export_static_state(model)
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
@@ -266,6 +268,9 @@ class SchedulerWeightUpdaterManager:
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+            model = self.tp_worker.model_runner.model
+            if getattr(model, "supports_storage_lifecycle_hook", False):
+                cast(StorageLifecycleHook, model).resume_storage()
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
