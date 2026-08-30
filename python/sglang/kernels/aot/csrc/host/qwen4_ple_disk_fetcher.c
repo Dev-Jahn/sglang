@@ -233,6 +233,8 @@ static int poison_fetcher(struct fetcher* f) {
     f->cq_ptr = NULL;
     munmap(f->sq_ptr, f->sq_size);
     f->sq_ptr = NULL;
+    // The kernel keeps page references for in-flight requests after close starts
+    // cancellation. Their buffers remain valid until each request completes.
     close(ring_fd);
   }
   return -EUCLEAN;

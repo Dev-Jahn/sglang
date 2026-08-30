@@ -1396,16 +1396,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             replay_hook = None
-            if getattr(
-                self.model_runner.model, "supports_cuda_graph_replay_hook", False
-            ):
-                replay_hook = cast("CudaGraphReplayHook", self.model_runner.model)
-                padded_num_tokens = (
-                    self._replay_graph_key.size
-                    if self.ragged_verify_mode
-                    else self.bs * self.captured_req_width
-                )
-                try:
+            try:
+                if getattr(
+                    self.model_runner.model, "supports_cuda_graph_replay_hook", False
+                ):
+                    replay_hook = cast("CudaGraphReplayHook", self.model_runner.model)
+                    padded_num_tokens = (
+                        self._replay_graph_key.size
+                        if self.ragged_verify_mode
+                        else self.bs * self.captured_req_width
+                    )
                     replay_hook.prepare_cuda_graph_replay(
                         CudaGraphReplayInput(
                             padded_num_tokens=padded_num_tokens,
@@ -1426,34 +1426,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             runtime_forward_batch=forward_batch,
                         )
                     )
-                except BaseException:
-                    replay_hook.reset_cuda_graph_replay()
-                    raise
-            if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
-                logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
-                    "draft" if self.model_runner.is_draft_worker else "target",
-                    self._replay_graph_key.size,
-                    "num_tokens" if self.ragged_verify_mode else "bs",
-                    forward_batch.forward_mode.name,
-                    forward_batch.batch_size,
-                    (
-                        f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
-                        if self.ragged_verify_mode
-                        else ""
-                    ),
-                )
-            if shared_read_ends is SharedReadEnds.PRE_REPLAY:
-                self._publish_read_done(in_graph=False)
+                if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+                    logger.info(
+                        "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                        "draft" if self.model_runner.is_draft_worker else "target",
+                        self._replay_graph_key.size,
+                        "num_tokens" if self.ragged_verify_mode else "bs",
+                        forward_batch.forward_mode.name,
+                        forward_batch.batch_size,
+                        (
+                            f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
+                            if self.ragged_verify_mode
+                            else ""
+                        ),
+                    )
+                if shared_read_ends is SharedReadEnds.PRE_REPLAY:
+                    self._publish_read_done(in_graph=False)
 
-            if replay_hook is None:
-                output = self.backend.replay(self._replay_graph_key, forward_batch)
-            else:
-                try:
+                if replay_hook is None:
+                    output = self.backend.replay(self._replay_graph_key, forward_batch)
+                else:
                     replay_hook.wait_cuda_graph_replay()
                     output = self.backend.replay(self._replay_graph_key, forward_batch)
                     replay_hook.finish_cuda_graph_replay()
-                finally:
+            finally:
+                if replay_hook is not None:
                     replay_hook.reset_cuda_graph_replay()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

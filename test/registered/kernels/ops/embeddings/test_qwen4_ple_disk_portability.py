@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 import threading
+from collections import deque
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,16 +36,43 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
-def allow_cpu_allocations_without_cuda(monkeypatch):
+def replace_pinned_allocators_without_cuda(monkeypatch):
     if torch.cuda.is_available():
         return
-    real_empty = torch.empty
 
-    def cpu_empty(*args, **kwargs):
-        kwargs.pop("pin_memory", None)
-        return real_empty(*args, **kwargs)
+    def cpu_host_tensor(*args, pin_memory=True, **kwargs):
+        return torch.empty(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "empty", cpu_empty)
+    monkeypatch.setattr(disk, "_allocate_host_tensor", cpu_host_tensor)
+    monkeypatch.setattr(qwen4_exp_module, "_allocate_host_tensor", cpu_host_tensor)
+
+
+@pytest.mark.parametrize("rows", [4, 8])
+def test_gpu_mode_ngram_ids_match_the_pre_disk_stream(monkeypatch, rows):
+    expected = torch.arange(rows * 16, dtype=torch.long).view(rows, 16)
+    valid_tokens = torch.tensor([True] + [False] * (rows - 1))
+    batch = SimpleNamespace(
+        ngram_context=torch.arange(rows * 3, dtype=torch.long).view(rows, 3),
+        use_decode_fast_path=True,
+        valid_tokens=valid_tokens,
+        mode=ForwardMode.DECODE,
+    )
+    pool = SimpleNamespace(ple_window_cache=None)
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(module)
+    module._mask_invalid_ngram_ids = False
+    module._hash_contexts = lambda contexts, decode_sized=False: expected.clone()
+
+    actual = module.compute_ngram_ids(batch)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual[~valid_tokens], expected[~valid_tokens])
+
+    module._mask_invalid_ngram_ids = True
+    disk_ids = module.compute_ngram_ids(batch)
+    assert torch.equal(disk_ids[valid_tokens], expected[valid_tokens])
+    assert torch.all(disk_ids[~valid_tokens] == -1)
 
 
 def _fp8_rows(count: int) -> torch.Tensor:
@@ -260,7 +288,7 @@ def test_missing_helper_distinguishes_old_and_disabled_wheels(tmp_path, monkeypa
         disk._find_helper_library()
 
 
-def test_helper_accepts_target_post_release_development_wheel(tmp_path, monkeypatch):
+def test_helper_rejects_target_post_release_development_wheel(tmp_path, monkeypatch):
     package_dir = tmp_path / "sgl_kernel"
     package_dir.mkdir()
     helper = package_dir / "qwen4_ple_disk_fetcher.so"
@@ -270,6 +298,18 @@ def test_helper_accepts_target_post_release_development_wheel(tmp_path, monkeypa
     monkeypatch.setattr(
         disk, "_installed_sgl_kernel_version", lambda: "0.4.6.post2.dev0"
     )
+    with pytest.raises(RuntimeError, match="found 0.4.6.post2.dev0"):
+        disk._find_helper_library()
+
+
+def test_helper_accepts_a_higher_epoch_version(tmp_path, monkeypatch):
+    package_dir = tmp_path / "sgl_kernel"
+    package_dir.mkdir()
+    helper = package_dir / "qwen4_ple_disk_fetcher.so"
+    helper.touch()
+    spec = SimpleNamespace(submodule_search_locations=[str(package_dir)])
+    monkeypatch.setattr(disk.importlib.util, "find_spec", lambda name: spec)
+    monkeypatch.setattr(disk, "_installed_sgl_kernel_version", lambda: "1!0.4.6.post1")
     assert disk._find_helper_library() == helper
 
 
@@ -367,8 +407,8 @@ def test_offload_compatibility_writes_nothing_after_resolution():
 def test_unused_disk_options_warn_only_after_resolution(caplog):
     args = _server_args()
     with caplog.at_level("WARNING"):
-        args._handle_offload_compatibility()
         args._handle_offload_compatibility(resolved=True)
+        args._handle_offload_compatibility()
     assert caplog.text.count("are unused with --ple-storage") == 1
 
 
@@ -415,6 +455,16 @@ def test_disk_storage_rejects_an_unreadable_hot_file(tmp_path):
     )
     with pytest.raises(ValueError, match="readable file"):
         args._handle_offload_compatibility()
+
+
+def test_disk_storage_accepts_a_readable_hot_file_template(tmp_path):
+    (tmp_path / "hot-0.bin").touch()
+    args = _server_args(
+        ple_storage="disk",
+        ple_disk_dir=str(tmp_path),
+        ple_disk_hot_frequency_file=str(tmp_path / "hot-{layer}.bin"),
+    )
+    args._handle_offload_compatibility()
 
 
 def test_max_read_pages_rejects_io_uring_entry_overflow():
@@ -639,6 +689,11 @@ def test_transfer_buffers_keep_only_largest_shape_per_device():
     assert (
         third[0].untyped_storage().data_ptr() == second[0].untyped_storage().data_ptr()
     )
+
+
+def test_transfer_buffer_retains_the_configured_prefill_working_set():
+    retain_rows = qwen4_exp_module._ple_transfer_buffer_retain_rows(8192, 16)
+    assert retain_rows == 131072
 
 
 def test_rank_executor_initializes_its_cuda_device(monkeypatch):
@@ -974,6 +1029,10 @@ def test_graph_lookup_validation_defaults_to_every_replay():
     assert all(not layer._graph_lookup_validation_required(4) for _ in range(254))
     assert layer._graph_lookup_validation_required(4)
 
+    layer._graph_lookup_validation_interval = 0
+    with pytest.raises(ValueError, match="must be positive"):
+        layer._graph_lookup_validation_required(4)
+
 
 def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
@@ -1024,19 +1083,30 @@ def test_aborted_graph_replay_reset_discards_pending_validation(monkeypatch):
     assert layer._pending_graph_embedding_validation is None
 
 
-def test_graph_lookup_validation_checks_the_current_replay():
+def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
+    class ReadyEvent:
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", lambda: object())
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer._pending_graph_embedding_validation = None
-    layer._completed_graph_embedding_validation = None
+    layer._completed_graph_embedding_validation = deque()
     layer._pending_graph_lookup_validation = (
         2,
         torch.tensor([[3], [5]], dtype=torch.long),
     )
-    layer._completed_graph_lookup_validation = None
+    layer._completed_graph_lookup_validation = deque()
+    layer._graph_validation_free_slots = deque()
     layer._graph_lookup_id_buffers = {2: torch.tensor([[3], [7]], dtype=torch.long)}
 
     layer.finish_cuda_graph_replay()
+    assert len(layer._completed_graph_lookup_validation) == 1
     with pytest.raises(RuntimeError, match="lookup IDs differ"):
         layer.validate_cuda_graph_replay()
 
@@ -1193,6 +1263,43 @@ def test_hot_file_frequency_order_round_trips_through_rank_select_cache(tmp_path
         cache.rows.numpy()[slots[hit]],
         source_rows.view(torch.uint8).numpy()[expected_ids],
     )
+
+
+def test_hot_frequency_template_selects_two_ple_layer_files(tmp_path):
+    rows = _fp8_rows(25)
+    second_rows = rows.clone()
+    second_rows.view(torch.uint8)[0, 0] = 1
+    images = [
+        disk.build_test_image(tmp_path, layer_rows, module_prefix=f"ple.{layer}")
+        for layer, layer_rows in enumerate((rows, second_rows))
+    ]
+    assert images[0].header["fingerprint"] != images[1].header["fingerprint"]
+    template = str(tmp_path / "hot-{layer}.bin")
+
+    for layer, image in enumerate(images):
+        path = disk.resolve_hot_frequency_file(template, layer, len(images))
+        disk.write_hot_frequency_file(
+            path,
+            {0: np.array([layer], dtype=np.uint32)},
+            fingerprint=image.header["fingerprint"],
+            total_rows=25,
+            tp_size=1,
+            padding_divisor=1,
+        )
+
+    for layer, image in enumerate(images):
+        path = disk.resolve_hot_frequency_file(template, layer, len(images))
+        loaded = disk.read_hot_frequency_file(
+            path,
+            0,
+            expected_fingerprint=image.header["fingerprint"],
+        )
+        assert loaded.tolist() == [layer]
+
+
+def test_multiple_ple_layers_require_a_hot_frequency_template():
+    with pytest.raises(ValueError, match=r"contain \{layer\}"):
+        disk.resolve_hot_frequency_file("hot.bin", 0, 2)
 
 
 def test_hot_file_writer_requires_the_image_fingerprint(tmp_path):

@@ -137,7 +137,9 @@ class TestModelReplayHooks(CustomTestCase):
             batch_size=1,
         )
 
-        with mock.patch.object(mod, "device_timer_ctx", return_value=nullcontext()):
+        with mock.patch.object(
+            mod, "device_timer_ctx", return_value=nullcontext()
+        ), mock.patch.object(torch.cuda, "synchronize") as cuda_sync:
             output = runner.execute(forward_batch)
             output = runner.execute(forward_batch)
 
@@ -158,6 +160,7 @@ class TestModelReplayHooks(CustomTestCase):
             ],
         )
         self.assertEqual(state.validations, 1)
+        cuda_sync.assert_not_called()
         self.assertTrue(state.completed)
         self.assertIsInstance(prepared[0], CudaGraphReplayInput)
         self.assertEqual(prepared[0].padded_num_tokens, 2)
@@ -220,6 +223,23 @@ class TestModelReplayHooks(CustomTestCase):
                 runner.execute(forward_batch)
 
         self.assertEqual(events, ["prepare", "wait", "reset"])
+
+        events.clear()
+        runner.model_runner.model.wait_cuda_graph_replay = lambda: events.append("wait")
+        runner._resolve_shared_read_ends = (
+            lambda attn_backend, forward_mode: SharedReadEnds.PRE_REPLAY
+        )
+
+        def fail_publish(in_graph):
+            events.append("publish")
+            raise RuntimeError("injected publish error")
+
+        runner._publish_read_done = fail_publish
+        with mock.patch.object(mod, "device_timer_ctx", return_value=nullcontext()):
+            with self.assertRaisesRegex(RuntimeError, "injected publish error"):
+                runner.execute(forward_batch)
+
+        self.assertEqual(events, ["prepare", "publish", "reset"])
 
 
 def _make_fake_self(capture_bs):

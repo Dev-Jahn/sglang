@@ -107,8 +107,14 @@ BUILD_JOBS_FLAG="${BUILD_JOBS:-0}"
 NVCC_THREADS_FLAG="${NVCC_THREADS:-32}"
 GITHUB_ARTIFACTORY_FLAG="${GITHUB_ARTIFACTORY:-github.com}"
 RUN_TESTS_FLAG="${SGL_KERNEL_RUN_TESTS:-0}"
+DOCKER_TEST_FLAGS=()
+if [ "${RUN_TESTS_FLAG}" = "1" ]; then
+  # The native PLE test needs io_uring_setup inside the wheel build container.
+  DOCKER_TEST_FLAGS+=(--security-opt seccomp=unconfined)
+fi
 
 docker run --rm \
+  "${DOCKER_TEST_FLAGS[@]}" \
   --network=host \
   -v "$(pwd):/sgl-kernel" \
   -v "${CCACHE_HOST_DIR}:/ccache" \
@@ -157,6 +163,8 @@ export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} 
 echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"
 echo "GitHub mirror: GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"
 
+# Host and container builds see different source paths, so their CMake caches
+# need separate directories.
 BUILD_DIR=build-wheel
 ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir="${BUILD_DIR}" . --color=always --no-build-isolation
 if [ "${SGL_KERNEL_RUN_TESTS}" = "1" ]; then

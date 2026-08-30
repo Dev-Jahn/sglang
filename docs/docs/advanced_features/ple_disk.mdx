@@ -73,6 +73,8 @@ Pass the result to the server:
 --ple-disk-hot-frequency-file /mnt/local-nvme/ple-hot.bin
 ```
 
+Checkpoints with multiple PLE layers need one file per layer because each layer has different hash multipliers and an image-specific fingerprint. Generate each file with that layer's metadata and fingerprint, then put `{layer}` in the server path. The field expands to the zero-based PLE layer index, for example `/mnt/local-nvme/ple-hot-{layer}.bin`.
+
 The file starts with one 4 KiB metadata page. It contains the `PLHOT001` magic, format version, image fingerprint, `uint32-global-row-id` dtype, TP size, padding divisor, total row count, and each rank's vocabulary range, offset, and count. Copy `IMAGE_FINGERPRINT` from the built image's `manifest.json`. The remaining bytes are concatenated little-endian `uint32` global row IDs for each rank, ordered by decreasing training-corpus frequency. SGLang validates the recorded rank geometry, reads the current rank's segment, and limits it to that embedding's share of `--ple-disk-hot-cache-gb` before sorting rows into the rank-select cache. Static-cache warmup reads selected pages through the direct-I/O reader. With the default budget, restarts can issue up to 8 GiB of random 4 KiB direct reads across all rank and layer instances before the server becomes ready.
 
 ## Read queue settings
@@ -97,9 +99,9 @@ The prefill term applies when `--ple-disk-prefill-buffer-tokens` is greater than
 
 Systems where `pageableMemoryAccessUsesHostPageTables` is true use an unregistered staging area, so the `io_uring` staging bytes do not consume the memlock budget.
 
-Every CUDA graph replay compares the recomputed lookup IDs with the IDs captured by the graph. Set `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL` above `1` only when measuring the synchronization cost; the first replay after each capture remains checked. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
+Every CUDA graph replay compares the recomputed lookup IDs with the IDs captured by the graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL` must be positive; values above `1` sample later replays while the first replay after each capture remains checked. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
 
-The hot and dynamic cache tiers are also CUDA-pinned host allocations. Their documented defaults total 10 GiB across ranks and layers. Prefill slots, future-ID staging, and transfer buffers add pinned allocations for each layer and rank. A retained transfer buffer is capped at 65,536 rows, exactly 10 MiB of pinned host memory plus its device buffer. Larger transfer buffers are released after the copy completes. Include these allocations in both host-RAM and memlock planning even on systems where CUDA registration is accounted separately from `RLIMIT_MEMLOCK`.
+The hot and dynamic cache tiers are also CUDA-pinned host allocations. Their documented defaults total 10 GiB across ranks and layers. Prefill slots, future-ID staging, and transfer buffers add pinned allocations for each layer and rank. A retained transfer buffer is capped at the larger of 65,536 rows and `prefill buffer tokens * n-gram heads`. With the default 8192 tokens and 16 heads, this is 131,072 rows, or 20 MiB of pinned host memory plus its device buffer. Larger transfer buffers are released after the copy completes. Include these allocations in both host-RAM and memlock planning even on systems where CUDA registration is accounted separately from `RLIMIT_MEMLOCK`.
 
 ## GB10 settings
 

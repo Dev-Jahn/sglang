@@ -3,6 +3,7 @@
 import json
 import math
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
@@ -100,6 +101,16 @@ _PLE_EMBEDDING_ATTRIBUTES = (
     "num_org_embeddings_per_partition",
     "num_added_embeddings_per_partition",
 )
+
+
+def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
+    return torch.empty(*size, device="cpu", pin_memory=pin_memory, **kwargs)
+
+
+def _ple_transfer_buffer_retain_rows(
+    prefill_buffer_tokens: int, ngram_heads: int
+) -> int:
+    return max(65536, int(prefill_buffer_tokens) * int(ngram_heads))
 
 
 def _should_interleave_ple_table() -> bool:
@@ -522,6 +533,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.eos_token_id = int(config.eos_token_id)
         self.enable_ple_fusion = envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
         ple_storage = resolve_ple_storage(config, default="gpu")
+        self._mask_invalid_ngram_ids = ple_storage == "disk"
         if ple_storage == "disk":
             from sglang.srt.models.qwen4_ple_disk import ROW_BYTES
 
@@ -669,6 +681,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     def _hash_contexts(
         self, contexts: torch.Tensor, *, decode_sized: bool = False
     ) -> torch.Tensor:
+        # Keep the offline NumPy twin in qwen4_ple_hash.py aligned with this path.
+        # test_numpy_hash_matches_production_on_seeded_token_stream pins the pair.
         contexts = contexts.to(torch.long)
         if self.enable_ple_fusion and decode_sized:
             from sglang.kernels.ops.qwen4_ple import (
@@ -778,9 +792,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             contexts,
             decode_sized=batch.mode.is_decode() or batch.mode.is_target_verify(),
         )
-        return torch.where(
-            batch.valid_tokens.unsqueeze(-1), ngram_ids, ngram_ids.new_full((), -1)
-        )
+        if getattr(self, "_mask_invalid_ngram_ids", False):
+            return torch.where(
+                batch.valid_tokens.unsqueeze(-1),
+                ngram_ids,
+                ngram_ids.new_full((), -1),
+            )
+        return ngram_ids
 
 
 @triton.jit
@@ -932,6 +950,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         config,
         valid_vocab_size: int,
         module_prefix: str = "ple",
+        ple_layer_index: int = 0,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -957,13 +976,18 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
 
-        from sglang.srt.models.qwen4_ple_disk import PLEImageBuilder, config_digest
+        from sglang.srt.models.qwen4_ple_disk import (
+            PLEImageBuilder,
+            config_digest,
+            resolve_hot_frequency_file,
+        )
 
         parallel = get_parallel()
         rank = parallel.attn_tp_rank if self.use_attn_tp_group else parallel.tp_rank
         disk_dir = getattr(config, "ple_disk_dir", None)
         if not disk_dir:
             raise ValueError("Qwen4 PLE disk storage requires ple_disk_dir")
+        ple_layer_count = max(1, len(getattr(config, "ple_layer_ids", ())))
         self._builder_args = {
             "root": disk_dir,
             "config_sha256": config_digest(config),
@@ -974,18 +998,20 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
                 self.shard_indices.org_vocab_end_index, int(valid_vocab_size)
             ),
             "module_prefix": module_prefix,
-            "image_count": max(1, len(getattr(config, "ple_layer_ids", ()))),
+            "image_count": ple_layer_count,
         }
         self._image_builder = PLEImageBuilder(**self._builder_args)
         self._rank = rank
         self._module_prefix = module_prefix
-        cache_budget_divisor = self.tp_size * max(
-            1, len(getattr(config, "ple_layer_ids", ()))
-        )
+        cache_budget_divisor = self.tp_size * ple_layer_count
         self._hot_cache_gb = (
             float(getattr(config, "ple_disk_hot_cache_gb", 8.0)) / cache_budget_divisor
         )
-        self._hot_frequency_file = getattr(config, "ple_disk_hot_frequency_file", None)
+        self._hot_frequency_file = resolve_hot_frequency_file(
+            getattr(config, "ple_disk_hot_frequency_file", None),
+            ple_layer_index,
+            ple_layer_count,
+        )
         self._dynamic_cache_gb = (
             float(getattr(config, "ple_disk_dynamic_cache_gb", 0.0))
             / cache_budget_divisor
@@ -1029,7 +1055,9 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         self._prefill_submit_future: Optional[Future] = None
         self._completion_event = None
         self._transfer_buffers = {}
-        self._transfer_buffer_retain_rows = 65536
+        self._transfer_buffer_retain_rows = _ple_transfer_buffer_retain_rows(
+            self._prefill_buffer_tokens, self._ngram_heads
+        )
         self._active_transfer_device = None
         self._prefill_host_ids = None
         self._graph_generation = 0
@@ -1044,7 +1072,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             "dynamic_hits": 0,
             "prefill_hits": 0,
             "cold_pages": 0,
-            "coalesced_pages": 0,
+            "coalesced_rows": 0,
             "host_wait_us": 0.0,
             "ids_ready_wait_us": 0.0,
             "storage_fetch_us": 0.0,
@@ -1186,14 +1214,10 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         required = input_ids.numel()
         cached = self._transfer_buffers.get(key)
         if cached is None or cached[0] < required:
-            host_ids = torch.empty(
-                required, dtype=torch.long, device="cpu", pin_memory=True
-            )
-            raw_host = torch.empty(
+            host_ids = _allocate_host_tensor(required, dtype=torch.long)
+            raw_host = _allocate_host_tensor(
                 (required, self.embedding_dim),
                 dtype=torch.uint8,
-                device="cpu",
-                pin_memory=True,
             )
             raw_device = torch.empty(
                 (required, self.embedding_dim),
@@ -1256,9 +1280,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         required = input_ids.numel()
         host_ids = self._prefill_host_ids
         if host_ids is None or host_ids.numel() < required:
-            host_ids = torch.empty(
-                required, dtype=torch.long, device="cpu", pin_memory=True
-            )
+            host_ids = _allocate_host_tensor(required, dtype=torch.long)
             self._prefill_host_ids = host_ids
         host_ids = host_ids[:required].view(input_ids.shape)
         if stream is None:
@@ -1369,7 +1391,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         stats["dynamic_hits"] += fetch_stats.dynamic_hits
         stats["prefill_hits"] += fetch_stats.prefill_hits
         stats["cold_pages"] += fetch_stats.cold_pages
-        stats["coalesced_pages"] += fetch_stats.coalesced_pages
+        stats["coalesced_rows"] += fetch_stats.coalesced_rows
         stats["host_wait_us"] += wait_us
         stats["ids_ready_wait_us"] += ids_ready_wait_us
         stats["storage_fetch_us"] += storage_fetch_us
@@ -1512,6 +1534,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 config,
                 int(self.ple_embedding.ngram_heads_vocab_sizes.sum().item()),
                 module_prefix=prefix,
+                ple_layer_index=ple_layer_index,
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
@@ -1575,13 +1598,18 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_lookup_validation_interval = (
             envs.SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL.get()
         )
+        if self._graph_lookup_validation_interval <= 0:
+            raise ValueError(
+                "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be positive"
+            )
         self._graph_embedding_snapshot_buffers = {}
         self._pending_graph_embedding_validation = None
-        self._completed_graph_embedding_validation = None
+        self._completed_graph_embedding_validation = deque()
         self._graph_lookup_id_buffers = {}
         self._graph_lookup_validation_due = set()
         self._pending_graph_lookup_validation = None
-        self._completed_graph_lookup_validation = None
+        self._completed_graph_lookup_validation = deque()
+        self._graph_validation_free_slots = deque()
         self._graph_replay_steps = 0
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -1919,7 +1947,11 @@ class Qwen4ExpPLELayer(nn.Module):
     def _graph_lookup_validation_required(self, lookup_tokens: int) -> bool:
         self._graph_replay_steps += 1
         interval = self._graph_lookup_validation_interval
-        required = interval <= 1 or lookup_tokens in self._graph_lookup_validation_due
+        if interval <= 0:
+            raise ValueError(
+                "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be positive"
+            )
+        required = interval == 1 or lookup_tokens in self._graph_lookup_validation_due
         if interval > 1:
             required = required or self._graph_replay_steps % interval == 0
         if required:
@@ -1972,57 +2004,72 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def finish_cuda_graph_replay(self) -> None:
         if self._pending_graph_embedding_validation is not None:
-            if self._completed_graph_embedding_validation is not None:
-                raise RuntimeError("PLE graph staging validation was not reported")
             previous_tokens, expected_embeddings = (
                 self._pending_graph_embedding_validation
             )
             actual_embeddings = self._graph_embedding_snapshot_buffers[previous_tokens]
-            self._completed_graph_embedding_validation = (
+            self._record_graph_validation(
+                "_completed_graph_embedding_validation",
                 previous_tokens,
-                expected_embeddings,
                 actual_embeddings.ne(expected_embeddings),
             )
             self._pending_graph_embedding_validation = None
         if self._pending_graph_lookup_validation is not None:
-            if self._completed_graph_lookup_validation is not None:
-                raise RuntimeError("PLE graph lookup validation was not reported")
             previous_tokens, expected_ids = self._pending_graph_lookup_validation
             actual_ids = self._graph_lookup_id_buffers[previous_tokens]
-            self._completed_graph_lookup_validation = (
+            self._record_graph_validation(
+                "_completed_graph_lookup_validation",
                 previous_tokens,
-                expected_ids,
                 actual_ids.ne(expected_ids),
             )
             self._pending_graph_lookup_validation = None
 
+    def _record_graph_validation(
+        self, completed_attr: str, lookup_tokens: int, mismatch: torch.Tensor
+    ) -> None:
+        free_slots = getattr(self, "_graph_validation_free_slots", None)
+        if free_slots is None:
+            free_slots = deque()
+            self._graph_validation_free_slots = free_slots
+        if free_slots:
+            host_result, ready = free_slots.popleft()
+        else:
+            host_result = _allocate_host_tensor((1,), dtype=torch.bool)
+            ready = torch.cuda.Event()
+        host_result.copy_(mismatch.any().reshape(1), non_blocking=True)
+        ready.record(torch.cuda.current_stream())
+        completed = getattr(self, completed_attr, None)
+        if completed is None:
+            completed = deque()
+            setattr(self, completed_attr, completed)
+        completed.append((lookup_tokens, host_result, ready))
+
+    def _consume_graph_validation(
+        self, completed_attr: str, error_message: str
+    ) -> None:
+        completed = getattr(self, completed_attr, None)
+        if not completed:
+            return
+        while completed and completed[0][2].query():
+            _, host_result, ready = completed.popleft()
+            mismatch = bool(host_result.numpy()[0])
+            free_slots = getattr(self, "_graph_validation_free_slots", None)
+            if free_slots is None:
+                free_slots = deque()
+                self._graph_validation_free_slots = free_slots
+            free_slots.append((host_result, ready))
+            if mismatch:
+                raise RuntimeError(error_message)
+
     def validate_cuda_graph_replay(self) -> None:
-        if self._completed_graph_embedding_validation is not None:
-            previous_tokens, expected_embeddings, mismatch = (
-                self._completed_graph_embedding_validation
-            )
-            actual_embeddings = self._graph_embedding_snapshot_buffers[previous_tokens]
-            if mismatch.any().item():
-                index = mismatch.nonzero()[0].tolist()
-                raise RuntimeError(
-                    "PLE graph staging differs at consumption at "
-                    f"{index}: {actual_embeddings[tuple(index)].item()} != "
-                    f"{expected_embeddings[tuple(index)].item()}"
-                )
-            self._completed_graph_embedding_validation = None
-        if self._completed_graph_lookup_validation is not None:
-            previous_tokens, expected_ids, mismatch = (
-                self._completed_graph_lookup_validation
-            )
-            actual_ids = self._graph_lookup_id_buffers[previous_tokens]
-            if mismatch.any().item():
-                index = mismatch.nonzero()[0].tolist()
-                raise RuntimeError(
-                    "PLE graph lookup IDs differ from disk staging at "
-                    f"{index}: {actual_ids[tuple(index)].item()} != "
-                    f"{expected_ids[tuple(index)].item()}"
-                )
-            self._completed_graph_lookup_validation = None
+        self._consume_graph_validation(
+            "_completed_graph_embedding_validation",
+            "PLE graph staging differs at consumption",
+        )
+        self._consume_graph_validation(
+            "_completed_graph_lookup_validation",
+            "PLE graph lookup IDs differ from disk staging",
+        )
 
     def wait_cuda_graph_replay(self) -> None:
         offloaded_embedding = self.ple_embedding.ngram_embedding
@@ -2645,6 +2692,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         ]
         if not disk_layers:
             return
+        # Replay batch construction updates the shared PLE window cache. The graph
+        # does not read it, and the following eager forward installs its own batch.
         batch = _prepare_ple_batch(
             replay.input_ids,
             replay.runtime_forward_batch,

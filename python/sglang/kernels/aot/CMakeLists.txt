@@ -192,6 +192,7 @@ if(SGL_KERNEL_CAN_BUILD_PLE_DISK_FETCHER)
     add_library(qwen4_ple_disk_fetcher SHARED
         "csrc/host/qwen4_ple_disk_fetcher.c"
     )
+    target_compile_features(qwen4_ple_disk_fetcher PRIVATE c_std_11)
     target_compile_options(qwen4_ple_disk_fetcher PRIVATE
         -Wall
         -Wextra
@@ -208,6 +209,7 @@ if(SGL_KERNEL_CAN_BUILD_PLE_DISK_FETCHER)
             "csrc/host/test_qwen4_ple_disk_fetcher.c"
             "csrc/host/qwen4_ple_disk_fetcher.c"
         )
+        target_compile_features(test_qwen4_ple_disk_fetcher PRIVATE c_std_11)
         target_compile_definitions(test_qwen4_ple_disk_fetcher PRIVATE PLE_FETCHER_TESTING=1)
         target_compile_options(test_qwen4_ple_disk_fetcher PRIVATE
             -Wall

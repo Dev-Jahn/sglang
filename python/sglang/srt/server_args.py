@@ -2639,7 +2639,8 @@ class ServerArgs:
     ] = 8.0
     ple_disk_hot_frequency_file: A[
         Optional[str],
-        "Binary top-row file exported by scripts/ple_disk/hit_sim.py.",
+        "Binary top-row file exported by scripts/ple_disk/hit_sim.py. Use "
+        "{layer} in the path for checkpoints with multiple PLE layers.",
         NS("exec.offload"),
     ] = None
     ple_disk_dynamic_cache_gb: A[
@@ -3666,7 +3667,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
-        self._handle_offload_compatibility(resolved=True)
+        self._handle_offload_compatibility()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3834,7 +3835,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
-        self._handle_offload_compatibility()
+        self._handle_offload_compatibility(resolved=True)
 
     def _validate_ple_disk_args(self):
         if self.ple_disk_hot_cache_gb < 0:
@@ -3874,7 +3875,13 @@ class ServerArgs:
                         f"--ple-disk-dir cannot be created under {parent}: {image_root}"
                     )
             if self.ple_disk_hot_frequency_file:
-                hot_file = Path(self.ple_disk_hot_frequency_file)
+                hot_path = self.ple_disk_hot_frequency_file
+                hot_file = Path(hot_path.replace("{layer}", "0"))
+                if "{" in str(hot_file) or "}" in str(hot_file):
+                    raise ValueError(
+                        "--ple-disk-hot-frequency-file supports only the {layer} "
+                        "template field"
+                    )
                 if not hot_file.is_file() or not os.access(hot_file, os.R_OK):
                     raise ValueError(
                         "--ple-disk-hot-frequency-file must be a readable file: "

@@ -1,6 +1,7 @@
 import errno
 import os
 import threading
+from collections import deque
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -8,9 +9,11 @@ import numpy as np
 import pytest
 import torch
 from torch import nn
+from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
     VocabParallelEmbeddingShardIndices,
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
@@ -145,6 +148,56 @@ def _source_embedding(rows: int):
         num_added_embeddings_per_partition=0,
         weight_scale=torch.tensor([0.25], dtype=torch.bfloat16, device="cuda"),
     )
+
+
+@pytest.mark.parametrize("padded_tokens", [4, 8])
+def test_gpu_storage_gather_keeps_padded_slot_ids_in_range(padded_tokens, monkeypatch):
+    from sglang.srt.layers import vocab_parallel_embedding as vocab_module
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    total_rows = 512
+    source = _source_embedding(total_rows)
+    source.weight = nn.Parameter(
+        torch.arange(total_rows * ROW_BYTES, dtype=torch.bfloat16, device="cuda").view(
+            total_rows, ROW_BYTES
+        ),
+        requires_grad=False,
+    )
+    source.output_dtype = torch.bfloat16
+    embedding = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+    nn.Module.__init__(embedding)
+    for name, value in vars(source).items():
+        setattr(embedding, name, value)
+    monkeypatch.setattr(
+        vocab_module, "get_tp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setenv("SGLANG_ENABLE_ASYNC_ASSERT", "1")
+
+    expected_ids = torch.arange(
+        padded_tokens * 16, dtype=torch.long, device="cuda"
+    ).view(padded_tokens, 16)
+    batch = SimpleNamespace(
+        ngram_context=torch.arange(
+            padded_tokens * 3, dtype=torch.long, device="cuda"
+        ).view(padded_tokens, 3),
+        use_decode_fast_path=True,
+        valid_tokens=torch.tensor(
+            [True] + [False] * (padded_tokens - 1), device="cuda"
+        ),
+        mode=ForwardMode.DECODE,
+    )
+    pool = SimpleNamespace(ple_window_cache=None)
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._mask_invalid_ngram_ids = False
+    module._hash_contexts = lambda contexts, decode_sized=False: expected_ids.clone()
+
+    lookup_ids = module.compute_ngram_ids(batch)
+    assert torch.equal(lookup_ids, expected_ids)
+    actual = embedding(lookup_ids)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, embedding.weight[lookup_ids], rtol=0, atol=0)
 
 
 def test_disk_image_matches_exact_fp8_gather_across_hot_and_cold_rows(tmp_path):
@@ -532,7 +585,7 @@ def test_disk_fetch_coalesces_pages_across_batch_and_drafts(tmp_path):
         assert stats.rows_requested == 6
         assert stats.static_hits == 0
         assert stats.cold_pages == 1
-        assert stats.coalesced_pages == 5
+        assert stats.coalesced_rows == 5
     finally:
         fetcher.close()
 
@@ -781,7 +834,9 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     layer._graph_lookup_validation_interval = 1
     layer._graph_lookup_validation_due = set()
     layer._validate_graph_staging = False
-    layer._completed_graph_lookup_validation = None
+    layer._completed_graph_lookup_validation = deque()
+    layer._completed_graph_embedding_validation = deque()
+    layer._graph_validation_free_slots = deque()
     captured_ids = torch.zeros((lookup_tokens, heads), dtype=torch.long, device=device)
     layer._graph_lookup_id_buffers = {lookup_tokens: captured_ids}
     captured_rows = torch.zeros(
@@ -797,20 +852,8 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     with torch.cuda.graph(graph):
         captured_ids.copy_(replay_ids)
         captured_rows.copy_(replay_rows)
-    expected_ids = captured_ids.clone()
-    expected_rows = captured_rows.clone()
     layer._pending_graph_lookup_validation = None
-    layer._completed_graph_lookup_validation = (
-        lookup_tokens,
-        expected_ids,
-        captured_ids.ne(expected_ids),
-    )
     layer._pending_graph_embedding_validation = None
-    layer._completed_graph_embedding_validation = (
-        lookup_tokens,
-        expected_rows,
-        captured_rows.ne(expected_rows),
-    )
 
     pool = SimpleNamespace(
         ple_window_cache=None,
@@ -881,14 +924,48 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
 
     assert layer._pending_graph_lookup_validation is None
     assert layer._pending_graph_embedding_validation is None
-    assert layer._completed_graph_lookup_validation is not None
-    assert layer._completed_graph_embedding_validation is not None
+    assert len(layer._completed_graph_lookup_validation) == 1
+    assert len(layer._completed_graph_embedding_validation) == 1
+
+    torch.cuda.current_stream().synchronize()
 
     model.prepare_cuda_graph_replay(replay)
 
-    assert layer._completed_graph_lookup_validation is None
-    assert layer._completed_graph_embedding_validation is None
+    assert not layer._completed_graph_lookup_validation
+    assert not layer._completed_graph_embedding_validation
     model.reset_cuda_graph_replay()
+
+
+def test_graph_lookup_validation_records_an_async_host_result():
+    layer = qwen4_exp_module.Qwen4ExpPLELayer.__new__(qwen4_exp_module.Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    lookup_ids = torch.arange(32, dtype=torch.long, device="cuda").view(2, 16)
+    layer._pending_graph_lookup_validation = (2, lookup_ids.clone())
+    layer._completed_graph_lookup_validation = deque()
+    layer._pending_graph_embedding_validation = None
+    layer._completed_graph_embedding_validation = deque()
+    layer._graph_validation_free_slots = deque()
+    layer._graph_lookup_id_buffers = {2: lookup_ids}
+
+    with profile(activities=[ProfilerActivity.CPU]) as finish_profile:
+        layer.finish_cuda_graph_replay()
+    assert len(layer._completed_graph_lookup_validation) == 1
+
+    layer._completed_graph_lookup_validation[0][2].synchronize()
+    with profile(activities=[ProfilerActivity.CPU]) as consume_profile:
+        layer.validate_cuda_graph_replay()
+
+    operation_names = {event.key for event in finish_profile.key_averages()} | {
+        event.key for event in consume_profile.key_averages()
+    }
+    forbidden = {
+        "aten::item",
+        "aten::_local_scalar_dense",
+        "cudaDeviceSynchronize",
+        "cudaStreamSynchronize",
+    }
+    assert operation_names.isdisjoint(forbidden)
+    assert not layer._completed_graph_lookup_validation
 
 
 if __name__ == "__main__":

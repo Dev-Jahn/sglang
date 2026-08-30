@@ -51,6 +51,31 @@ FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
 IORING_MAX_ENTRIES = 32768
 
 
+def resolve_hot_frequency_file(
+    path: Optional[str], ple_layer_index: int, ple_layer_count: int
+) -> Optional[str]:
+    if not path:
+        return None
+    ple_layer_index = int(ple_layer_index)
+    ple_layer_count = max(1, int(ple_layer_count))
+    if not 0 <= ple_layer_index < ple_layer_count:
+        raise ValueError(
+            f"PLE layer index {ple_layer_index} is outside [0, {ple_layer_count})"
+        )
+    if "{layer}" in path:
+        return path.replace("{layer}", str(ple_layer_index))
+    if ple_layer_count > 1:
+        raise ValueError(
+            "--ple-disk-hot-frequency-file must contain {layer} when the "
+            "checkpoint has more than one PLE layer"
+        )
+    return path
+
+
+def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
+    return torch.empty(*size, pin_memory=pin_memory, **kwargs)
+
+
 def _current_cuda_device() -> int:
     return int(torch.cuda.current_device())
 
@@ -313,7 +338,7 @@ class PLEFetchStats:
     dynamic_hits: int = 0
     prefill_hits: int = 0
     cold_pages: int = 0
-    coalesced_pages: int = 0
+    coalesced_rows: int = 0
 
 
 def open_ple_image(
@@ -689,6 +714,8 @@ class PLEImageBuilder:
             finally:
                 os.close(crc_fd)
 
+            # Every rank derives this document from the complete shard manifest.
+            # Concurrent rank writes therefore install the same payload.
             manifest_doc = {
                 "fingerprint": fingerprint,
                 "config_sha256": self.config_sha256,
@@ -957,9 +984,7 @@ class RankSelectHotCache:
         self.rank_prefix = np.empty(words + 1, dtype=np.uint32)
         self.rank_prefix[0] = 0
         np.cumsum(counts, dtype=np.uint32, out=self.rank_prefix[1:])
-        self.rows = torch.empty(
-            (local.size, ROW_BYTES), dtype=torch.uint8, pin_memory=True
-        )
+        self.rows = _allocate_host_tensor((local.size, ROW_BYTES), dtype=torch.uint8)
         if local.size:
             self._load_rows(image, local, reader)
 
@@ -1069,8 +1094,8 @@ class WTinyLFURowCache:
         self.tags = np.full((self.num_sets, self._WAYS), -1, dtype=np.int64)
         self.recency = np.zeros((self.num_sets, self._WAYS), dtype=np.uint64)
         self._versions = np.zeros(self.num_sets, dtype=np.uint64)
-        self.rows = torch.empty(
-            (self.num_slots, ROW_BYTES), dtype=torch.uint8, pin_memory=True
+        self.rows = _allocate_host_tensor(
+            (self.num_slots, ROW_BYTES), dtype=torch.uint8
         )
         sketch_target = max(1024, min(1 << 20, max(1, self.capacity // 8)))
         self.sketch_width = 1 << (sketch_target - 1).bit_length()
@@ -1142,7 +1167,9 @@ class WTinyLFURowCache:
         for attempt in range(self._LOOKUP_MAX_RETRIES):
             sets = self._set_indices(ids[pending])
             # These numpy version and tag operations retain the GIL. An odd
-            # version marks a set while its cached row is being updated.
+            # version marks a set while its cached row is being updated. A
+            # free-threaded Python build needs acquire and release atomics for
+            # these version and tag accesses.
             before = self._versions[sets].copy()
             ready = (before & np.uint64(1)) == 0
             candidates = self.tags[sets].copy()
@@ -1326,22 +1353,15 @@ def _find_helper_library() -> Path:
     installed = _installed_sgl_kernel_version()
     try:
         required = Version(REQUIRED_SGL_KERNEL_VERSION)
-        found = Version(installed) if installed is not None else None
-        old_wheel = found is None or (
-            found.release < required.release
-            or (
-                found.release == required.release
-                and (found.post if found.post is not None else -1)
-                < (required.post if required.post is not None else -1)
-            )
-        )
+        installed_version = Version(installed) if installed is not None else None
+        old_wheel = installed_version is None or installed_version < required
     except InvalidVersion:
         old_wheel = True
     if old_wheel:
-        found = installed or "no installed distribution"
+        found_text = installed or "no installed distribution"
         raise RuntimeError(
             "PLE disk storage requires sglang-kernel >= "
-            f"{REQUIRED_SGL_KERNEL_VERSION}; found {found}. Install the matching "
+            f"{REQUIRED_SGL_KERNEL_VERSION}; found {found_text}. Install the matching "
             "sglang-kernel wheel"
         )
     for location in locations:
@@ -1388,7 +1408,7 @@ class DirectPageReader:
                 f"{image.path} reports {logical_block_size} bytes"
             )
         self.alignment = PAGE_BYTES
-        self._staging_allocation = torch.empty(
+        self._staging_allocation = _allocate_host_tensor(
             staging_bytes + self.alignment - 1,
             dtype=torch.uint8,
             pin_memory=self.register_buffer,
@@ -1628,10 +1648,9 @@ class DiskRowFetcher:
                             "sequence": 0,
                             "count": 0,
                             "ids": np.empty(self._prefill_max_rows, dtype=np.int64),
-                            "rows": torch.empty(
+                            "rows": _allocate_host_tensor(
                                 (self._prefill_max_rows, ROW_BYTES),
                                 dtype=torch.uint8,
-                                pin_memory=True,
                             ),
                         }
                     )
@@ -1846,7 +1865,7 @@ class DiskRowFetcher:
         ids = np.asarray(global_ids, dtype=np.int64)
         expected_shape = (*ids.shape, ROW_BYTES)
         if out is None:
-            output = torch.empty(expected_shape, dtype=torch.uint8, pin_memory=True)
+            output = _allocate_host_tensor(expected_shape, dtype=torch.uint8)
         else:
             output = out
             if (
@@ -1898,13 +1917,13 @@ class DiskRowFetcher:
         cold_positions = dynamic_positions[~dynamic_hits]
         cold_local = dynamic_local[~dynamic_hits]
         cold_pages = 0
-        coalesced_pages = 0
+        coalesced_rows = 0
         if cold_positions.size:
             page_ids = cold_local // ROWS_PER_PAGE
             within = cold_local % ROWS_PER_PAGE
             unique, inverse = np.unique(page_ids, return_inverse=True)
             cold_pages = int(unique.size)
-            coalesced_pages = int(cold_positions.size - unique.size)
+            coalesced_rows = int(cold_positions.size - unique.size)
             reader = self.prefill_reader if priority == "prefill" else self.reader
             row_bytes = np.arange(ROW_BYTES)[None, :]
             inverse_order = np.argsort(inverse, kind="stable")
@@ -1928,7 +1947,7 @@ class DiskRowFetcher:
             dynamic_hits=int(np.count_nonzero(dynamic_hits)),
             prefill_hits=int(np.count_nonzero(prefill_hits)),
             cold_pages=cold_pages,
-            coalesced_pages=coalesced_pages,
+            coalesced_rows=coalesced_rows,
         )
         return output
 
