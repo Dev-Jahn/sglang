@@ -25,9 +25,19 @@ server is constructed.
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.model_executor.forward_batch_info import (
+    CudaGraphReplayInput,
+    ForwardMode,
+    PPProxyTensors,
+)
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -40,6 +50,176 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
+
+
+class TestModelReplayHooks(CustomTestCase):
+    def test_disabled_model_batch_hook_does_not_reach_body(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.model = SimpleNamespace(
+            supports_model_batch_hook=False,
+            prepare_model_batch=lambda *args: self.fail("hook body was reached"),
+        )
+        runner.prepare_model_batch(object(), object())
+
+    def test_execute_finishes_replay_validation_before_reset(self):
+        events = []
+        prepared = []
+        state = SimpleNamespace(pending=False, completed=False, validations=0)
+
+        def prepare(replay):
+            validate()
+            events.append("prepare")
+            prepared.append(replay)
+            state.pending = True
+
+        def wait():
+            events.append("wait")
+
+        def reset():
+            events.append("reset")
+            state.pending = False
+
+        def finish():
+            events.append("finish")
+            if state.pending:
+                state.pending = False
+                state.completed = True
+
+        def validate():
+            if state.completed:
+                events.append("validate")
+                state.completed = False
+                state.validations += 1
+
+        backend = SimpleNamespace(
+            replay_session=nullcontext,
+            replay=lambda key, batch: (
+                events.append("replay") or PPProxyTensors({"hidden": torch.arange(2)})
+            ),
+        )
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            device_timer=None,
+            model=SimpleNamespace(
+                supports_cuda_graph_replay_hook=True,
+                prepare_cuda_graph_replay=prepare,
+                wait_cuda_graph_replay=wait,
+                finish_cuda_graph_replay=finish,
+                validate_cuda_graph_replay=validate,
+                reset_cuda_graph_replay=reset,
+            ),
+            spec_algorithm="spec",
+            is_draft_worker=False,
+        )
+        runner.backend = backend
+        runner.load_batch = lambda forward_batch, pp_proxy_tensors: None
+        runner._replay_attn_backend = lambda: object()
+        runner._resolve_shared_read_ends = (
+            lambda attn_backend, forward_mode: SharedReadEnds.UNKNOWN
+        )
+        runner.ragged_verify_mode = False
+        runner.bs = 2
+        runner.raw_bs = 1
+        runner.raw_num_token = 1
+        runner.captured_req_width = 1
+        runner.seq_len_fill_value = 3
+        runner.capture_forward_mode = ForwardMode.DECODE
+        runner._replay_graph_key = SimpleNamespace(size=2)
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.tensor([10, 0]),
+            req_pool_indices=torch.tensor([7, 0]),
+            seq_lens=torch.tensor([4, 3]),
+            out_cache_loc=torch.tensor([20, 0]),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_sum=4,
+            batch_size=1,
+        )
+
+        with mock.patch.object(mod, "device_timer_ctx", return_value=nullcontext()):
+            output = runner.execute(forward_batch)
+            output = runner.execute(forward_batch)
+
+        self.assertEqual(
+            events,
+            [
+                "prepare",
+                "wait",
+                "replay",
+                "finish",
+                "reset",
+                "validate",
+                "prepare",
+                "wait",
+                "replay",
+                "finish",
+                "reset",
+            ],
+        )
+        self.assertEqual(state.validations, 1)
+        self.assertTrue(state.completed)
+        self.assertIsInstance(prepared[0], CudaGraphReplayInput)
+        self.assertEqual(prepared[0].padded_num_tokens, 2)
+        self.assertEqual(prepared[0].seq_lens_sum, 7)
+        self.assertIs(prepared[0].runtime_forward_batch, forward_batch)
+        self.assertEqual(output.tensors["hidden"].tolist(), [0, 1])
+
+    def test_execute_resets_replay_hook_when_wait_fails(self):
+        events = []
+
+        def fail_wait():
+            events.append("wait")
+            raise OSError("injected storage error")
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            device_timer=None,
+            model=SimpleNamespace(
+                supports_cuda_graph_replay_hook=True,
+                prepare_cuda_graph_replay=lambda replay: events.append("prepare"),
+                wait_cuda_graph_replay=fail_wait,
+                finish_cuda_graph_replay=lambda: events.append("finish"),
+                validate_cuda_graph_replay=lambda: events.append("validate"),
+                reset_cuda_graph_replay=lambda: events.append("reset"),
+            ),
+            spec_algorithm=None,
+            is_draft_worker=False,
+        )
+        runner.backend = SimpleNamespace(
+            replay_session=nullcontext,
+            replay=lambda key, batch: events.append("replay"),
+        )
+        runner.load_batch = lambda forward_batch, pp_proxy_tensors: None
+        runner._replay_attn_backend = lambda: object()
+        runner._resolve_shared_read_ends = (
+            lambda attn_backend, forward_mode: SharedReadEnds.UNKNOWN
+        )
+        runner.ragged_verify_mode = False
+        runner.bs = 1
+        runner.raw_bs = 1
+        runner.raw_num_token = 1
+        runner.captured_req_width = 1
+        runner.seq_len_fill_value = 1
+        runner.capture_forward_mode = ForwardMode.DECODE
+        runner._replay_graph_key = SimpleNamespace(size=1)
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.tensor([10]),
+            req_pool_indices=torch.tensor([7]),
+            seq_lens=torch.tensor([4]),
+            out_cache_loc=torch.tensor([20]),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_sum=4,
+            batch_size=1,
+        )
+
+        with mock.patch.object(mod, "device_timer_ctx", return_value=nullcontext()):
+            with self.assertRaisesRegex(OSError, "injected storage error"):
+                runner.execute(forward_batch)
+
+        self.assertEqual(events, ["prepare", "wait", "reset"])
 
 
 def _make_fake_self(capture_bs):

@@ -75,12 +75,13 @@ def test_cuda_graph_prewarm_delegates_to_the_language_model(monkeypatch):
     prewarm.assert_called_once_with(runner, capture_decode_cuda_graph=True)
 
 
-def test_cuda_graph_prewarm_is_required_for_ple_offload(monkeypatch):
+@pytest.mark.parametrize("ple_storage", ["pinned", "disk"])
+def test_cuda_graph_prewarm_is_required_for_ple_offload(monkeypatch, ple_storage):
     runner = SimpleNamespace(
         device="cuda",
         model=object(),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(ple_offload_embedding=True)
+            hf_text_config=SimpleNamespace(ple_storage=ple_storage)
         ),
         server_args=SimpleNamespace(
             cuda_graph_config=SimpleNamespace(
