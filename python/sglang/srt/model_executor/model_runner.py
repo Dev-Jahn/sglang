@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Protocol, Union, cast
 
 import torch
 import torch.distributed as dist
@@ -94,6 +94,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    CudaGraphReplayInput,
     ForwardBatch,
     PPProxyTensors,
 )
@@ -279,6 +280,26 @@ def resolve_draft_attention_backend(
     if not is_draft_worker:
         return None
     return draft_attention_backend or server_args.speculative_draft_attention_backend
+
+
+class ModelBatchHook(Protocol):
+    supports_model_batch_hook: bool
+
+    def prepare_model_batch(
+        self, schedule_batch: Any, forward_batch: ForwardBatch
+    ) -> None: ...
+
+
+class CudaGraphReplayHook(Protocol):
+    supports_cuda_graph_replay_hook: bool
+
+    def prepare_cuda_graph_replay(self, replay: CudaGraphReplayInput) -> None: ...
+
+    def wait_cuda_graph_replay(self) -> None: ...
+
+    def finish_cuda_graph_replay(self) -> None: ...
+
+    def reset_cuda_graph_replay(self) -> None: ...
 
 
 class ModelRunner:
@@ -1406,6 +1427,14 @@ class ModelRunner:
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
         return forward_batch
+
+    def prepare_model_batch(
+        self, schedule_batch: Any, forward_batch: ForwardBatch
+    ) -> None:
+        if not getattr(self.model, "supports_model_batch_hook", False):
+            return
+        hook = cast(ModelBatchHook, self.model)
+        hook.prepare_model_batch(schedule_batch, forward_batch)
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

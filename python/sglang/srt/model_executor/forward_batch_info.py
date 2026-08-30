@@ -372,6 +372,21 @@ class NgramEmbeddingInfo:
         )
 
 
+@dataclass(frozen=True)
+class CudaGraphReplayInput:
+    """Static graph buffers and runtime metadata exposed to model replay hooks."""
+
+    padded_num_tokens: int
+    input_ids: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_sum: Optional[int]
+    out_cache_loc: torch.Tensor
+    forward_mode: ForwardMode
+    spec_algorithm: Any
+    runtime_forward_batch: Any
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""

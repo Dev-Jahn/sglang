@@ -30,7 +30,7 @@ import inspect
 import logging
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
@@ -62,6 +62,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CudaGraphReplayInput,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
@@ -124,7 +125,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import CudaGraphReplayHook, ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -1394,6 +1395,40 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            replay_hook = None
+            if getattr(
+                self.model_runner.model, "supports_cuda_graph_replay_hook", False
+            ):
+                replay_hook = cast("CudaGraphReplayHook", self.model_runner.model)
+                padded_num_tokens = (
+                    self._replay_graph_key.size
+                    if self.ragged_verify_mode
+                    else self.bs * self.captured_req_width
+                )
+                try:
+                    replay_hook.prepare_cuda_graph_replay(
+                        CudaGraphReplayInput(
+                            padded_num_tokens=padded_num_tokens,
+                            input_ids=self.buffers.input_ids[:padded_num_tokens],
+                            req_pool_indices=self.buffers.req_pool_indices[: self.bs],
+                            seq_lens=self.buffers.seq_lens[: self.bs],
+                            seq_lens_sum=(
+                                None
+                                if forward_batch.seq_lens_sum is None
+                                else forward_batch.seq_lens_sum
+                                + (self.bs - self.raw_bs) * self.seq_len_fill_value
+                            ),
+                            out_cache_loc=self.buffers.out_cache_loc[
+                                :padded_num_tokens
+                            ],
+                            forward_mode=self.capture_forward_mode,
+                            spec_algorithm=self.model_runner.spec_algorithm,
+                            runtime_forward_batch=forward_batch,
+                        )
+                    )
+                except BaseException:
+                    replay_hook.reset_cuda_graph_replay()
+                    raise
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
@@ -1411,7 +1446,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if replay_hook is None:
+                output = self.backend.replay(self._replay_graph_key, forward_batch)
+            else:
+                try:
+                    replay_hook.wait_cuda_graph_replay()
+                    output = self.backend.replay(self._replay_graph_key, forward_batch)
+                    replay_hook.finish_cuda_graph_replay()
+                finally:
+                    replay_hook.reset_cuda_graph_replay()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

@@ -79,7 +79,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
-                    "ple_offload_embedding",
+                    "ple_storage",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
@@ -332,31 +332,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_control_arch_keeps_pristine_dtype(self):
         sa = self._construct("LlamaForCausalLM", "llama")
         self.assertEqual(sa.dtype, "auto")
-        self.assertIsNone(sa.ple_offload_embedding)
+        self.assertIsNone(sa.ple_storage)
         declared = {f for _s, d in sa._resolved_overrides for f in d}
         self.assertNotIn("dtype", declared)  # no arch declaration for Llama
         # publish still materializes the whitelisted leaf with the pristine
         # value: readers only ever read flags.
         self.assertEqual(self._publish(sa).dtype, "auto")
 
-    def test_qwen4_ple_offload_default(self):
+    def test_qwen4_ple_storage_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        with patch.object(overrides_module, "is_cuda", return_value=True):
+        with patch.object(overrides_module, "is_cuda", return_value=True), patch(
+            "sglang.srt.server_args.is_cuda", return_value=True
+        ):
             for kwargs, expected in (
-                ({}, True),
-                ({"dtype": "float16"}, False),
-                ({"ple_offload_embedding": False}, False),
-                ({"ple_offload_embedding": False, "cpu_offload_gb": 1}, False),
+                ({}, "pinned"),
+                ({"dtype": "float16"}, "gpu"),
+                ({"ple_storage": "gpu"}, "gpu"),
+                ({"ple_storage": "gpu", "cpu_offload_gb": 1}, "gpu"),
             ):
                 with self.subTest(kwargs=kwargs):
                     self.assertEqual(
-                        self._construct(*qwen4, **kwargs).ple_offload_embedding,
+                        self._construct(*qwen4, **kwargs).ple_storage,
                         expected,
                     )
             with self.assertRaisesRegex(ValueError, "cannot be combined"):
                 self._construct(*qwen4, cpu_offload_gb=1)
-        with patch.object(overrides_module, "is_cuda", return_value=False):
-            self.assertFalse(self._construct(*qwen4).ple_offload_embedding)
+        with patch.object(overrides_module, "is_cuda", return_value=False), patch(
+            "sglang.srt.server_args.is_cuda", return_value=True
+        ):
+            self.assertEqual(self._construct(*qwen4).ple_storage, "gpu")
+
+    def test_qwen4_disk_storage_rejects_bf16_ple_before_model_load(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        image_dir = tempfile.mkdtemp(prefix="qwen4_disk_images_")
+        self.addCleanup(shutil.rmtree, image_dir, ignore_errors=True)
+        with self.assertRaisesRegex(ValueError, "requires float8_e4m3fn PLE rows"):
+            self._construct(
+                *qwen4,
+                ple_storage="disk",
+                ple_disk_dir=image_dir,
+            )
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")

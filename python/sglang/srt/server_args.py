@@ -29,6 +29,7 @@ import socket
 import tempfile
 import uuid
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
@@ -2612,17 +2613,64 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
-    ple_offload_embedding: A[
-        Optional[bool],
+    ple_storage: A[
+        Optional[str],
         Arg(
-            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
-            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
-            "--no-ple-offload-embedding to disable.",
-            action=argparse.BooleanOptionalAction,
+            help="Storage for Qwen4 PLE rows. 'pinned' keeps the full table in "
+            "pinned host RAM; 'disk' uses an exact hot-row cache plus O_DIRECT "
+            "io_uring reads; 'gpu' uses the normal device embedding. When "
+            "unset, BF16 Qwen4 CUDA models select pinned storage.",
+            choices=["gpu", "pinned", "disk"],
             resolvable=True,
         ),
         NS("exec.offload"),
     ] = None
+    ple_disk_dir: A[
+        Optional[str],
+        "Directory containing fingerprinted per-TP-rank PLE disk images. SGLang "
+        "creates it for a first build; a complete existing image may be read-only.",
+        NS("exec.offload"),
+    ] = None
+    ple_disk_hot_cache_gb: A[
+        float,
+        "Maximum GiB of exact static PLE rows to pin across all TP ranks and "
+        "PLE layers in disk mode.",
+        NS("exec.offload"),
+    ] = 8.0
+    ple_disk_hot_frequency_file: A[
+        Optional[str],
+        "Binary top-row file exported by scripts/ple_disk/hit_sim.py.",
+        NS("exec.offload"),
+    ] = None
+    ple_disk_dynamic_cache_gb: A[
+        float,
+        "GiB of exact rows managed by asynchronous W-TinyLFU admission across "
+        "all TP ranks and PLE layers.",
+        NS("exec.offload"),
+    ] = 2.0
+    ple_disk_prefill_buffer_tokens: A[
+        int,
+        "Maximum prompt tokens held in each of two exact PLE prefill buffers. "
+        "Each token reserves one row for every PLE n-gram head.",
+        NS("exec.offload"),
+    ] = 8192
+    ple_disk_prefill_read_pages: A[
+        int,
+        "Maximum pages per prefill io_uring submission; decode uses a separate "
+        "ring. Values above --ple-disk-max-read-pages are clamped.",
+        NS("exec.offload"),
+    ] = 128
+    ple_disk_max_read_pages: A[
+        Optional[int],
+        "Maximum pages registered by the PLE disk decode io_uring. Defaults to "
+        "1024 when the CUDA device uses host page tables and 4096 otherwise.",
+        NS("exec.offload"),
+    ] = None
+    ple_disk_stats_log_interval: A[
+        int,
+        "Log cumulative PLE disk per-step counters every N steps; zero disables it.",
+        NS("exec.offload"),
+    ] = 0
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -3618,7 +3666,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
-        self._handle_offload_compatibility()
+        self._handle_offload_compatibility(resolved=True)
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3788,14 +3836,93 @@ class ServerArgs:
         materialize_declarations(self)
         self._handle_offload_compatibility()
 
-    def _handle_offload_compatibility(self):
-        if self.ple_offload_embedding and (
+    def _validate_ple_disk_args(self):
+        if self.ple_disk_hot_cache_gb < 0:
+            raise ValueError("--ple-disk-hot-cache-gb must be non-negative")
+        if self.ple_disk_dynamic_cache_gb < 0:
+            raise ValueError("--ple-disk-dynamic-cache-gb must be non-negative")
+        if self.ple_disk_prefill_buffer_tokens < 0:
+            raise ValueError("--ple-disk-prefill-buffer-tokens must be non-negative")
+        if self.ple_disk_prefill_read_pages <= 0:
+            raise ValueError("--ple-disk-prefill-read-pages must be positive")
+        if (
+            self.ple_disk_max_read_pages is not None
+            and not 1 <= self.ple_disk_max_read_pages <= 32768
+        ):
+            raise ValueError("--ple-disk-max-read-pages must be between 1 and 32768")
+        if self.ple_disk_stats_log_interval < 0:
+            raise ValueError("--ple-disk-stats-log-interval must be non-negative")
+
+    def _handle_offload_compatibility(self, *, resolved=False):
+        self._validate_ple_disk_args()
+        storage = self.ple_storage
+        changed_disk_options = []
+        if storage == "disk":
+            if not self.ple_disk_dir:
+                raise ValueError("--ple-storage disk requires --ple-disk-dir")
+            image_root = Path(self.ple_disk_dir)
+            if image_root.exists() and not image_root.is_dir():
+                raise ValueError(f"--ple-disk-dir must name a directory: {image_root}")
+            if image_root.exists() and not os.access(image_root, os.X_OK):
+                raise ValueError(f"--ple-disk-dir is not searchable: {image_root}")
+            if not image_root.exists():
+                parent = image_root.parent
+                while not parent.exists() and parent != parent.parent:
+                    parent = parent.parent
+                if not parent.is_dir() or not os.access(parent, os.W_OK | os.X_OK):
+                    raise ValueError(
+                        f"--ple-disk-dir cannot be created under {parent}: {image_root}"
+                    )
+            if self.ple_disk_hot_frequency_file:
+                hot_file = Path(self.ple_disk_hot_frequency_file)
+                if not hot_file.is_file() or not os.access(hot_file, os.R_OK):
+                    raise ValueError(
+                        "--ple-disk-hot-frequency-file must be a readable file: "
+                        f"{hot_file}"
+                    )
+        else:
+            defaults = {
+                field.name: field.default for field in dataclasses.fields(ServerArgs)
+            }
+            if self.ple_disk_dir:
+                changed_disk_options.append("--ple-disk-dir")
+            if self.ple_disk_hot_frequency_file:
+                changed_disk_options.append("--ple-disk-hot-frequency-file")
+            if self.ple_disk_hot_cache_gb != defaults["ple_disk_hot_cache_gb"]:
+                changed_disk_options.append("--ple-disk-hot-cache-gb")
+            if self.ple_disk_dynamic_cache_gb != defaults["ple_disk_dynamic_cache_gb"]:
+                changed_disk_options.append("--ple-disk-dynamic-cache-gb")
+            if (
+                self.ple_disk_prefill_buffer_tokens
+                != defaults["ple_disk_prefill_buffer_tokens"]
+            ):
+                changed_disk_options.append("--ple-disk-prefill-buffer-tokens")
+            if (
+                self.ple_disk_prefill_read_pages
+                != defaults["ple_disk_prefill_read_pages"]
+            ):
+                changed_disk_options.append("--ple-disk-prefill-read-pages")
+            if self.ple_disk_max_read_pages != defaults["ple_disk_max_read_pages"]:
+                changed_disk_options.append("--ple-disk-max-read-pages")
+            if (
+                self.ple_disk_stats_log_interval
+                != defaults["ple_disk_stats_log_interval"]
+            ):
+                changed_disk_options.append("--ple-disk-stats-log-interval")
+        if resolved and storage != "disk" and changed_disk_options:
+            logger.warning(
+                "%s are unused with --ple-storage %s",
+                ", ".join(changed_disk_options),
+                storage or "gpu",
+            )
+        if storage in ("pinned", "disk") and (
             self.cpu_offload_gb > 0 or self.offload_group_size > 0
         ):
+            option = f"--ple-storage {storage}"
             raise ValueError(
-                "--ple-offload-embedding cannot be combined with "
+                f"{option} cannot be combined with "
                 "--cpu-offload-gb or --offload-group-size: generic layer offload "
-                "would stage the pinned PLE embedding back to the device."
+                "would stage the PLE embedding back to the device."
             )
 
     def _handle_moe_runner_backend_alias(self):
@@ -4452,6 +4579,19 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
+        if self.ple_storage == "disk":
+            if self.cuda_graph_backend_prefill not in (None, Backend.DISABLED):
+                raise ValueError(
+                    "--ple-storage disk is incompatible with an enabled "
+                    "--cuda-graph-backend-prefill; set it to disabled"
+                )
+            logger.info(
+                "Qwen4 PLE disk mode keeps decode CUDA graphs and disables "
+                "prefill CUDA graphs by setting --cuda-graph-backend-prefill "
+                "disabled and --disable-prefill-cuda-graph"
+            )
+            self.cuda_graph_backend_prefill = Backend.DISABLED
+            self.disable_prefill_cuda_graph = True
         self._parse_cuda_graph_config()
         # Reads the resolved per-phase backends; must precede the compat rules
         # below and _handle_gpu_memory_settings, which key off enable_symm_mem.

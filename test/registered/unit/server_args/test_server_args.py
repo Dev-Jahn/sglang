@@ -45,7 +45,7 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+    def test_ple_pinned_storage_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
             {"offload_group_size": 1},
@@ -53,14 +53,25 @@ class TestPrepareServerArgs(CustomTestCase):
             with (
                 self.subTest(generic_offload=generic_offload),
                 self.assertRaisesRegex(
-                    ValueError, "ple-offload-embedding cannot be combined"
+                    ValueError, "--ple-storage pinned cannot be combined"
                 ),
             ):
                 ServerArgs(
                     model_path="dummy",
-                    ple_offload_embedding=True,
+                    ple_storage="pinned",
                     **generic_offload,
                 )
+
+    def test_ple_disk_rejects_enabled_prefill_cuda_graph(self):
+        with tempfile.TemporaryDirectory() as disk_dir:
+            args = ServerArgs(
+                model_path="dummy",
+                ple_storage="disk",
+                ple_disk_dir=disk_dir,
+                cuda_graph_backend_prefill=Backend.FULL,
+            )
+            with self.assertRaisesRegex(ValueError, "cuda-graph-backend-prefill"):
+                args._handle_cuda_graph_config()
 
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")

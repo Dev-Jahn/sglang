@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.qwen4_exp import resolve_ple_storage
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -281,14 +282,35 @@ def load_model_with_memory_saver(
     if not is_draft_worker:
         architectures = model_config.hf_config.architectures or []
         is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
-        if server_args.ple_offload_embedding and not is_qwen4_exp:
+        ple_storage = resolve_ple_storage(server_args)
+        if ple_storage not in (None, "gpu") and not is_qwen4_exp:
             raise ValueError(
-                "--ple-offload-embedding only supports "
+                f"--ple-storage {ple_storage} only supports "
                 "Qwen4ExpForConditionalGeneration"
             )
         if is_qwen4_exp:
-            model_config.hf_text_config.ple_offload_embedding = (
-                server_args.ple_offload_embedding
+            model_config.hf_text_config.ple_storage = ple_storage
+            model_config.hf_text_config.ple_disk_dir = server_args.ple_disk_dir
+            model_config.hf_text_config.ple_disk_hot_cache_gb = (
+                server_args.ple_disk_hot_cache_gb
+            )
+            model_config.hf_text_config.ple_disk_hot_frequency_file = (
+                server_args.ple_disk_hot_frequency_file
+            )
+            model_config.hf_text_config.ple_disk_dynamic_cache_gb = (
+                server_args.ple_disk_dynamic_cache_gb
+            )
+            model_config.hf_text_config.ple_disk_prefill_buffer_tokens = (
+                server_args.ple_disk_prefill_buffer_tokens
+            )
+            model_config.hf_text_config.ple_disk_prefill_read_pages = (
+                server_args.ple_disk_prefill_read_pages
+            )
+            model_config.hf_text_config.ple_disk_max_read_pages = (
+                server_args.ple_disk_max_read_pages
+            )
+            model_config.hf_text_config.ple_disk_stats_log_interval = (
+                server_args.ple_disk_stats_log_interval
             )
 
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
@@ -339,7 +361,11 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
-    if not is_draft_worker and server_args.ple_offload_embedding and device == "cuda":
+    if (
+        not is_draft_worker
+        and resolve_ple_storage(server_args, default="gpu") != "gpu"
+        and device == "cuda"
+    ):
         current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.

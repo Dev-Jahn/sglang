@@ -77,7 +77,8 @@ def _prewarm_model_cuda_graphs(
     hf_text_config = getattr(
         getattr(model_runner, "model_config", None), "hf_text_config", None
     )
-    ple_offload_enabled = bool(getattr(hf_text_config, "ple_offload_embedding", False))
+    ple_storage = getattr(hf_text_config, "ple_storage", None)
+    ple_offload_enabled = ple_storage in ("pinned", "disk")
     if prewarm is None:
         if ple_offload_enabled:
             raise RuntimeError(

@@ -1360,15 +1360,28 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     neither that nor --disable-radix-cache holds (the QSA pool then fails
     fast at boot).
     """
+    from sglang.srt.configs.qwen4_exp import resolve_ple_storage
+
     overrides: Dict[str, Any] = {}
-    if server_args.ple_offload_embedding is None:
+    ple_storage = resolve_ple_storage(server_args)
+    if ple_storage is None:
         import torch
 
-        overrides["ple_offload_embedding"] = (
+        use_pinned = (
             is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
         )
+        overrides["ple_storage"] = "pinned" if use_pinned else "gpu"
 
     text_config = getattr(hf_config, "text_config", hf_config)
+    if (
+        ple_storage == "disk"
+        and getattr(text_config, "ple_embedding_dtype", None) != "float8_e4m3fn"
+        and get_quantization_config(hf_config) != "fp8"
+    ):
+        raise ValueError(
+            "--ple-storage disk requires float8_e4m3fn PLE rows; set "
+            'text_config.ple_embedding_dtype="float8_e4m3fn"'
+        )
     if (
         getattr(text_config, "num_experts", None) is not None
         and server_args.moe_dense_tp_size == 1

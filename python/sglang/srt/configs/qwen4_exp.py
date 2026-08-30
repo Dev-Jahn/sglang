@@ -4,6 +4,11 @@ from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 
 
+def resolve_ple_storage(config, default=None):
+    storage = getattr(config, "ple_storage", None)
+    return storage if storage is not None else default
+
+
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen4_exp"
     base_config_key = "vision_config"
@@ -28,7 +33,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         heads_per_ngram=8,
         ngram_vocab_size_base=20000000,
         make_ngram_vocab_size_divisible_by=128,
-        ple_offload_embedding=False,
+        ple_storage=None,
         ple_embedding_dtype=None,
         index_share_for_mtp_iteration=True,
         rope_parameters=None,
@@ -69,7 +74,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.heads_per_ngram = heads_per_ngram
         self.ngram_vocab_size_base = ngram_vocab_size_base
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
-        self.ple_offload_embedding = ple_offload_embedding
+        self.ple_storage = ple_storage
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
         # MTP draft decode steps reuse the draft-extend indexer selection
