@@ -60,6 +60,7 @@ echo "BUILD_JOBS:     ${BUILD_JOBS:-auto}"
 echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
+echo "SGL_KERNEL_RUN_TESTS: ${SGL_KERNEL_RUN_TESTS:-0}"
 echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
 echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
 echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
@@ -105,6 +106,7 @@ CCACHE_FLAG="${USE_CCACHE:-1}"
 BUILD_JOBS_FLAG="${BUILD_JOBS:-0}"
 NVCC_THREADS_FLAG="${NVCC_THREADS:-32}"
 GITHUB_ARTIFACTORY_FLAG="${GITHUB_ARTIFACTORY:-github.com}"
+RUN_TESTS_FLAG="${SGL_KERNEL_RUN_TESTS:-0}"
 
 docker run --rm \
   --network=host \
@@ -113,6 +115,7 @@ docker run --rm \
   -w /sgl-kernel \
   -e ARCH="${ARCH}" \
   -e GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY_FLAG}" \
+  -e SGL_KERNEL_RUN_TESTS="${RUN_TESTS_FLAG}" \
   "${DEPS_TAG}" \
   bash -c '
 set -eux
@@ -147,11 +150,18 @@ else
   export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk "{print (\$1 < \$2) ? \$1 : \$2}")
 fi
 
+if [ "${SGL_KERNEL_RUN_TESTS}" = "1" ]; then
+  export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_BUILD_TESTS=ON"
+fi
 export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"
 echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"
 echo "GitHub mirror: GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"
 
-${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation
+BUILD_DIR=build-wheel
+${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir="${BUILD_DIR}" . --color=always --no-build-isolation
+if [ "${SGL_KERNEL_RUN_TESTS}" = "1" ]; then
+  ctest --test-dir "${BUILD_DIR}" --output-on-failure
+fi
 PYTHON=${PYTHON_ROOT_PATH}/bin/python ./rename_wheels.sh
 
 if [ "${USE_CCACHE}" = "1" ]; then

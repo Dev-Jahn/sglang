@@ -80,6 +80,7 @@ jobs:
         env:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
+          SGL_KERNEL_RUN_TESTS: 1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -181,6 +182,7 @@ jobs:
         env:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
+          SGL_KERNEL_RUN_TESTS: 1
 
       - name: Strip +cu130 local version for PyPI upload
         working-directory: python/sglang/kernels/aot

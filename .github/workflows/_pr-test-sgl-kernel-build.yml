@@ -103,6 +103,7 @@ jobs:
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
         env:
           USE_CCACHE: 1
+          SGL_KERNEL_RUN_TESTS: 1
 
       - name: Verify wheel artifacts
         run: |

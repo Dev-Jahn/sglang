@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
-project(sgl-kernel LANGUAGES CXX CUDA)
+project(sgl-kernel LANGUAGES C CXX CUDA)
 
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
@@ -177,6 +177,54 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+
+# Host-only helper used by Qwen4 PLE disk storage. It stays separate from the
+# PyTorch extension so ctypes can load it without a Python or CUDA ABI.
+option(SGL_KERNEL_BUILD_TESTS "Build sgl-kernel native tests" OFF)
+set(SGL_KERNEL_CAN_BUILD_PLE_DISK_FETCHER OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(SGL_KERNEL_CAN_BUILD_PLE_DISK_FETCHER ON)
+else()
+    message(STATUS "Skipping qwen4_ple_disk_fetcher: Linux is required")
+endif()
+
+if(SGL_KERNEL_CAN_BUILD_PLE_DISK_FETCHER)
+    add_library(qwen4_ple_disk_fetcher SHARED
+        "csrc/host/qwen4_ple_disk_fetcher.c"
+    )
+    target_compile_options(qwen4_ple_disk_fetcher PRIVATE
+        -Wall
+        -Wextra
+    )
+    install(TARGETS qwen4_ple_disk_fetcher LIBRARY DESTINATION sgl_kernel)
+
+    set(SGL_KERNEL_PLE_DISK_BUILD_MARKER "${CMAKE_CURRENT_BINARY_DIR}/qwen4_ple_disk_fetcher.build")
+    file(WRITE "${SGL_KERNEL_PLE_DISK_BUILD_MARKER}" "enabled\n")
+    install(FILES "${SGL_KERNEL_PLE_DISK_BUILD_MARKER}" DESTINATION sgl_kernel)
+
+    if(SGL_KERNEL_BUILD_TESTS)
+        enable_testing()
+        add_executable(test_qwen4_ple_disk_fetcher
+            "csrc/host/test_qwen4_ple_disk_fetcher.c"
+            "csrc/host/qwen4_ple_disk_fetcher.c"
+        )
+        target_compile_definitions(test_qwen4_ple_disk_fetcher PRIVATE PLE_FETCHER_TESTING=1)
+        target_compile_options(test_qwen4_ple_disk_fetcher PRIVATE
+            -Wall
+            -Wextra
+        )
+        add_test(NAME qwen4_ple_disk_fetcher
+            COMMAND test_qwen4_ple_disk_fetcher
+        )
+        set_tests_properties(qwen4_ple_disk_fetcher PROPERTIES
+            SKIP_RETURN_CODE 77
+        )
+    endif()
+else()
+    set(SGL_KERNEL_PLE_DISK_BUILD_MARKER "${CMAKE_CURRENT_BINARY_DIR}/qwen4_ple_disk_fetcher.build")
+    file(WRITE "${SGL_KERNEL_PLE_DISK_BUILD_MARKER}" "disabled\n")
+    install(FILES "${SGL_KERNEL_PLE_DISK_BUILD_MARKER}" DESTINATION sgl_kernel)
+endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS

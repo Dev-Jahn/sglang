@@ -62,7 +62,7 @@ repos:
     rev: v20.1.7
     hooks:
     - id: clang-format
-      types_or: [c++, cuda]
+      types_or: [c, c++, cuda]
       args: [--style=file, --verbose]
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.0
