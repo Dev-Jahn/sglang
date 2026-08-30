@@ -1,11 +1,13 @@
 import ctypes
 import errno
+import gc
 import importlib.util
 import json
 import os
 import struct
 import sys
 import threading
+import weakref
 from collections import deque
 from concurrent.futures import Future
 from pathlib import Path
@@ -14,7 +16,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-
 from sglang.srt import server_args as server_args_module
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
@@ -332,6 +333,40 @@ def test_poisoned_fetcher_error_requires_restart(tmp_path, monkeypatch):
             reader.read(np.array([0], dtype=np.int64))
     finally:
         reader.close()
+
+
+def test_poisoned_reader_retains_staging_until_native_close(
+    tmp_path, monkeypatch, caplog
+):
+    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    library = _patch_fetcher_library(
+        monkeypatch,
+        image,
+        read_results=(-disk.FETCHER_ERR_POISONED,),
+    )
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    library.ring_open = True
+    reader = disk.DirectPageReader(image, max_pages=1)
+    staging = weakref.ref(reader._staging_allocation)
+    observed = []
+
+    def destroy(handle):
+        observed.append(library.ring_open and staging() is not None)
+        library.ring_open = False
+        return 0
+
+    library.ple_fetcher_destroy = _FakeFunction(destroy)
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="poisoned"):
+        reader.read(np.array([0], dtype=np.int64))
+    assert "retained 8191 staging bytes" in caplog.text
+
+    del reader
+    gc.collect()
+    assert observed == [True]
+    assert library.ring_open is False
+    assert staging() is None
 
 
 def test_fetcher_error_reports_page_and_short_read_size(tmp_path, monkeypatch):
@@ -802,13 +837,16 @@ def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
             ids,
             physical_tokens,
         ),
+        _hash_contexts=lambda contexts: (_ for _ in ()).throw(
+            AssertionError("capture must not hash eager look-ahead contexts")
+        ),
     )
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = ngram_embedding
     layer._prefetch_stream = object()
     layer._prefetch_state = None
-    layer._future_lookup_contexts = None
+    layer._future_lookup_contexts = torch.ones((3, 3), dtype=torch.long)
     layer._graph_lookup_id_buffers = {}
     layer._graph_lookup_validation_due = set()
     layer._is_capturing = lambda: True
@@ -823,6 +861,7 @@ def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
     )
     layer.start_prefetch(batch, forward_batch)
     assert layer._prefetch_state[0].shape == (4, 16, 10)
+    assert layer._future_lookup_contexts is None
     captured_ids[0, 0] = -1
     assert layer._graph_lookup_id_buffers[4].data_ptr() == captured_ids.data_ptr()
     assert layer._graph_lookup_id_buffers[4][0, 0].item() == -1
@@ -868,11 +907,8 @@ def test_graph_replay_prepares_shared_batch_once(monkeypatch):
         padded_num_tokens=2,
         input_ids=torch.arange(2),
         req_pool_indices=torch.arange(2),
-        seq_lens=torch.ones(2),
-        seq_lens_sum=2,
         out_cache_loc=torch.ones(2),
         forward_mode=ForwardMode.DECODE,
-        spec_algorithm=None,
         runtime_forward_batch=forward_batch,
     )
 
@@ -927,11 +963,8 @@ def test_graph_replay_prepare_rolls_back_every_disk_layer(monkeypatch):
         padded_num_tokens=1,
         input_ids=torch.zeros(1, dtype=torch.long),
         req_pool_indices=torch.zeros(1, dtype=torch.long),
-        seq_lens=torch.ones(1, dtype=torch.long),
-        seq_lens_sum=1,
         out_cache_loc=torch.ones(1, dtype=torch.long),
         forward_mode=ForwardMode.DECODE,
-        spec_algorithm=None,
         runtime_forward_batch=SimpleNamespace(),
     )
 
@@ -967,6 +1000,34 @@ def test_failed_embedding_future_does_not_block_the_next_graph_step(monkeypatch)
         torch.zeros((1, 4), dtype=torch.bfloat16),
     )
     assert generation == 1
+
+
+def test_eager_forward_exception_resets_prefetch_before_the_next_forward():
+    completed = Future()
+    completed.set_result((SimpleNamespace(synchronize=lambda: None),))
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._future = completed
+    embedding._active_graph_generation = 3
+    layer = SimpleNamespace(reset_eager_prefetch=embedding.reset_eager_step)
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model._ple_layers = lambda: iter([layer])
+
+    def fail(*args, **kwargs):
+        raise OSError("injected mid-forward failure")
+
+    model._forward_impl = fail
+    with pytest.raises(OSError, match="mid-forward"):
+        model.forward(None, None, None)
+    assert embedding._future is None
+    assert embedding._active_graph_generation is None
+
+    expected = object()
+    model._forward_impl = lambda *args, **kwargs: (
+        expected if embedding._future is None else None
+    )
+    assert model.forward(None, None, None) is expected
 
 
 def test_layer_wait_resets_graph_state_after_fetch_failure():
@@ -1141,11 +1202,8 @@ def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):
         padded_num_tokens=2,
         input_ids=torch.arange(2),
         req_pool_indices=torch.arange(2, dtype=torch.int32),
-        seq_lens=runtime.seq_lens,
-        seq_lens_sum=runtime.seq_lens_sum,
         out_cache_loc=torch.ones(2, dtype=torch.int64),
         forward_mode=ForwardMode.DECODE,
-        spec_algorithm=None,
         runtime_forward_batch=runtime,
     )
     pool = SimpleNamespace(
@@ -1302,6 +1360,14 @@ def test_multiple_ple_layers_require_a_hot_frequency_template():
         disk.resolve_hot_frequency_file("hot.bin", 0, 2)
 
 
+def test_hot_frequency_template_requires_each_resolved_layer_file(tmp_path):
+    template = str(tmp_path / "hot-{layer}.bin")
+    (tmp_path / "hot-0.bin").touch()
+
+    with pytest.raises(ValueError, match=rf"layer 1.*{tmp_path / 'hot-1.bin'}"):
+        disk.resolve_hot_frequency_file(template, 1, 2, require_exists=True)
+
+
 def test_hot_file_writer_requires_the_image_fingerprint(tmp_path):
     path = tmp_path / "hot.bin"
     with pytest.raises(ValueError, match="require an image fingerprint"):
@@ -1330,6 +1396,25 @@ def test_hot_file_rejects_a_rank_range_past_eof(tmp_path):
     with path.open("r+b") as handle:
         handle.write(disk._write_metadata_page(disk.HOT_MAGIC, header))
     with pytest.raises(ValueError, match="file size"):
+        disk.read_hot_frequency_file(path, 0, expected_fingerprint="image")
+
+
+def test_hot_file_rejects_a_missing_rank_entry_with_its_path(tmp_path):
+    path = tmp_path / "hot-rank.bin"
+    disk.write_hot_frequency_file(
+        path,
+        {0: np.array([1], dtype=np.uint32)},
+        fingerprint="image",
+        total_rows=4,
+        tp_size=1,
+        padding_divisor=1,
+    )
+    header = disk._read_metadata_page(path, disk.HOT_MAGIC)
+    header["ranks"] = []
+    with path.open("r+b") as handle:
+        handle.write(disk._write_metadata_page(disk.HOT_MAGIC, header))
+
+    with pytest.raises(ValueError, match=rf"{path}.*rank 0.*regenerate"):
         disk.read_hot_frequency_file(path, 0, expected_fingerprint="image")
 
 
@@ -1367,6 +1452,10 @@ def test_direct_reader_closes_fd_when_native_destroy_fails(tmp_path, monkeypatch
     reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: -errno.EBUSY)
     with pytest.raises(OSError, match="shutdown failed"):
         reader.close()
+    os.fstat(fd)
+    assert reader.handle is not None
+    reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: 0)
+    reader.close()
     with pytest.raises(OSError) as exc_info:
         os.fstat(fd)
     assert exc_info.value.errno == errno.EBADF
@@ -1489,7 +1578,9 @@ def test_prefill_disable_waits_for_the_teardown_owner(monkeypatch):
     fetcher._prefill_slots = [{"state": "ready", "count": 1}]
     fetcher.prefill_reader = BlockingReader()
     fetcher._prefill_executor = SimpleNamespace(
-        shutdown=lambda wait: executor_calls.append(wait)
+        shutdown=lambda wait, cancel_futures=False: executor_calls.append(
+            (wait, cancel_futures)
+        )
     )
     monkeypatch.setattr(disk.logger, "error", lambda *args, **kwargs: None)
 
@@ -1510,7 +1601,7 @@ def test_prefill_disable_waits_for_the_teardown_owner(monkeypatch):
     assert not owner.is_alive()
     assert not waiter.is_alive()
     assert waiter_done.is_set()
-    assert executor_calls == [False]
+    assert executor_calls == [(False, True)]
 
 
 def test_prefill_submission_uses_the_executor_selected_with_its_slot():
@@ -1689,11 +1780,11 @@ def test_hit_sim_selects_accessed_rows_and_splits_tp_ranks(tmp_path, monkeypatch
 
 
 def test_image_builder_reserves_space_for_all_tp_ranks(tmp_path, monkeypatch):
-    per_rank = 25 * disk.ROW_BYTES + 2 * disk.PAGE_BYTES
+    all_ranks = 25 * disk.ROW_BYTES + 4 * disk.PAGE_BYTES
     monkeypatch.setattr(
         disk.shutil,
         "disk_usage",
-        lambda path: SimpleNamespace(free=per_rank + 1),
+        lambda path: SimpleNamespace(free=all_ranks - 1),
     )
     with pytest.raises(OSError, match="all 2 tensor-parallel ranks"):
         disk.PLEImageBuilder(tmp_path, "space", 0, 2, 0, 25)
@@ -1719,8 +1810,58 @@ def test_image_builder_reserves_space_for_all_ple_layers(tmp_path, monkeypatch):
 
 
 def test_config_digest_rejects_non_json_values():
+    assert disk.config_digest({"unrelated": object()}) == disk.config_digest({})
     with pytest.raises(ValueError, match="not JSON-serializable"):
-        disk.config_digest({"opaque": object()})
+        disk.config_digest({"ngram_size": object()})
+
+
+def test_cache_budget_divisor_accounts_for_attention_dp_replication(monkeypatch):
+    monkeypatch.setattr(qwen4_exp_module, "get_attention_dp_size", lambda: 4)
+    assert (
+        qwen4_exp_module._ple_cache_budget_divisor(2, 3, use_attn_tp_group=True) == 24
+    )
+    assert (
+        qwen4_exp_module._ple_cache_budget_divisor(8, 3, use_attn_tp_group=False) == 24
+    )
+
+
+def test_image_fingerprint_uses_only_explicit_identity_fields():
+    config = {
+        "model_type": "qwen4_exp_text",
+        "vocab_size": 100,
+        "seed": 1234,
+        "ple_layer_ids": [2],
+        "ple_embed_dim": 2560,
+        "ngram_size": 3,
+        "heads_per_ngram": 8,
+        "ngram_vocab_size_base": 20_000_000,
+        "make_ngram_vocab_size_divisible_by": 128,
+        "ple_embedding_dtype": "float8_e4m3fn",
+    }
+    digest = disk.config_digest(config)
+    assert digest == disk.config_digest({**config, "unrelated_server_arg": 9})
+    assert digest != disk.config_digest({**config, "ngram_size": 4})
+
+    manifest = [{"name": "weight", "sample_sha256": "a"}]
+    identity = {
+        "config_sha256": digest,
+        "tp_size": 2,
+        "padded_vocab_size": 320_000_128,
+        "valid_vocab_size": 320_000_016,
+        "dtype": "float8_e4m3fn",
+        "module_prefix": "model.layers.1.ple.ple_embedding.ngram_embedding",
+        "manifest": manifest,
+    }
+    fingerprint = disk.checkpoint_fingerprint(**identity)
+    for name, value in (
+        ("config_sha256", "different"),
+        ("tp_size", 4),
+        ("padded_vocab_size", 320_000_256),
+        ("valid_vocab_size", 320_000_017),
+        ("dtype", "float8_e5m2"),
+        ("module_prefix", "model.layers.2.ple.ple_embedding.ngram_embedding"),
+    ):
+        assert fingerprint != disk.checkpoint_fingerprint(**{**identity, name: value})
 
 
 def test_prefill_priority_requires_its_own_reader(tmp_path, monkeypatch):
@@ -1733,6 +1874,39 @@ def test_prefill_priority_requires_its_own_reader(tmp_path, monkeypatch):
     try:
         with pytest.raises(RuntimeError, match="prefill reader"):
             fetcher.fetch(np.array([0]), priority="prefill", use_prefill=False)
+    finally:
+        fetcher.close()
+        assert fetcher.hot is None
+
+
+def test_fetch_clears_only_rows_outside_the_local_shard(tmp_path, monkeypatch):
+    rows = _fp8_rows(25)
+    image = disk.build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    fetcher = disk.DiskRowFetcher(image, hot_cache_gb=0, max_pages=1)
+
+    class Output:
+        def __init__(self):
+            self.values = np.full((2, disk.ROW_BYTES), 77, dtype=np.uint8)
+            self.shape = self.values.shape
+            self.dtype = torch.uint8
+            self.device = SimpleNamespace(type="cpu")
+
+        def is_contiguous(self):
+            return True
+
+        def numpy(self):
+            return self.values
+
+    output = Output()
+    try:
+        returned = fetcher.fetch(np.array([-1, 0]), out=output)
+        assert returned is output
+        assert not output.values[0].any()
+        assert np.array_equal(output.values[1], rows.view(torch.uint8).numpy()[0])
     finally:
         fetcher.close()
 
@@ -1748,7 +1922,7 @@ def test_dynamic_cache_reports_a_full_admission_queue(monkeypatch, caplog):
     assert "dropped 1 admission batches" in caplog.text
 
 
-def test_dynamic_cache_lookup_does_not_wait_for_admission_batch_lock():
+def test_dynamic_cache_lookup_waits_for_admission_batch_lock():
     cache = disk.WTinyLFURowCache(capacity_rows=8)
     row = np.arange(disk.ROW_BYTES, dtype=np.uint8)
     cache._insert(3, row)
@@ -1766,7 +1940,7 @@ def test_dynamic_cache_lookup_does_not_wait_for_admission_batch_lock():
     thread = threading.Thread(target=lookup)
     thread.start()
     try:
-        assert finished.wait(1.0)
+        assert not finished.wait(0.1)
     finally:
         cache._lock.release()
         thread.join(timeout=1.0)
@@ -1774,24 +1948,20 @@ def test_dynamic_cache_lookup_does_not_wait_for_admission_batch_lock():
     assert np.array_equal(output[0], row)
 
 
-def test_dynamic_cache_lookup_bounds_retries_on_a_stalled_set(monkeypatch):
-    cache = disk.WTinyLFURowCache(capacity_rows=8)
-    output = np.full((1, disk.ROW_BYTES), 0xA5, dtype=np.uint8)
-    set_index = int(cache._set_indices(np.array([3], dtype=np.int64))[0])
-    cache._versions[set_index] = np.uint64(1)
-    yields = []
-    monkeypatch.setattr(disk.time, "sleep", lambda seconds: yields.append(seconds))
+def test_dynamic_cache_budget_includes_rows_and_metadata():
+    budget_bytes = 8 * (disk.ROW_BYTES + 16) + 4 * 1024
+    cache = disk.WTinyLFURowCache(budget_gb=budget_bytes / (1 << 30))
     try:
-        hit = cache.lookup_into(
-            np.array([3], dtype=np.int64), output, record_hits=False
+        allocated = (
+            cache.rows.numel()
+            + cache.tags.nbytes
+            + cache.recency.nbytes
+            + cache.sketch.nbytes
         )
+        assert cache.capacity == 8
+        assert allocated <= budget_bytes
     finally:
-        cache._versions[set_index] = np.uint64(2)
         cache.close()
-
-    assert hit.tolist() == [False]
-    assert np.all(output == 0xA5)
-    assert len(yields) == cache._LOOKUP_MAX_RETRIES - 1
 
 
 def test_dynamic_cache_worker_failure_is_reported_and_close_is_bounded(

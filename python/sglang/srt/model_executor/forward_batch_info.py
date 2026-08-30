@@ -35,7 +35,6 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
-
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
@@ -379,11 +378,8 @@ class CudaGraphReplayInput:
     padded_num_tokens: int
     input_ids: torch.Tensor
     req_pool_indices: torch.Tensor
-    seq_lens: torch.Tensor
-    seq_lens_sum: Optional[int]
     out_cache_loc: torch.Tensor
     forward_mode: ForwardMode
-    spec_algorithm: Any
     runtime_forward_batch: Any
 
 

@@ -52,7 +52,11 @@ IORING_MAX_ENTRIES = 32768
 
 
 def resolve_hot_frequency_file(
-    path: Optional[str], ple_layer_index: int, ple_layer_count: int
+    path: Optional[str],
+    ple_layer_index: int,
+    ple_layer_count: int,
+    *,
+    require_exists: bool = False,
 ) -> Optional[str]:
     if not path:
         return None
@@ -63,13 +67,22 @@ def resolve_hot_frequency_file(
             f"PLE layer index {ple_layer_index} is outside [0, {ple_layer_count})"
         )
     if "{layer}" in path:
-        return path.replace("{layer}", str(ple_layer_index))
-    if ple_layer_count > 1:
+        resolved = path.replace("{layer}", str(ple_layer_index))
+    elif ple_layer_count > 1:
         raise ValueError(
             "--ple-disk-hot-frequency-file must contain {layer} when the "
             "checkpoint has more than one PLE layer"
         )
-    return path
+    else:
+        resolved = path
+    if require_exists and (
+        not Path(resolved).is_file() or not os.access(resolved, os.R_OK)
+    ):
+        raise ValueError(
+            "PLE hot-frequency file for layer "
+            f"{ple_layer_index} is not readable: {resolved}"
+        )
+    return resolved
 
 
 def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
@@ -225,34 +238,26 @@ def _validate_manifest_ranges(manifest: list[dict], vocab_end: int, path: Path) 
         )
 
 
-def _sanitize_config(value):
-    ignored = {
-        "ple_storage",
-        "ple_disk_dir",
-        "ple_disk_hot_cache_gb",
-        "ple_disk_hot_frequency_file",
-        "ple_disk_stats_log_interval",
-        "ple_disk_dynamic_cache_gb",
-        "ple_disk_prefill_buffer_tokens",
-        "ple_disk_prefill_read_pages",
-        "ple_disk_max_read_pages",
-    }
-    if isinstance(value, dict):
-        return {
-            key: _sanitize_config(item)
-            for key, item in sorted(value.items())
-            if key not in ignored
-        }
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_config(item) for item in value]
-    return value
+_PLE_IMAGE_CONFIG_FIELDS = (
+    "model_type",
+    "vocab_size",
+    "seed",
+    "ple_layer_ids",
+    "ple_embed_dim",
+    "ngram_size",
+    "heads_per_ngram",
+    "ngram_vocab_size_base",
+    "make_ngram_vocab_size_divisible_by",
+    "ple_embedding_dtype",
+)
 
 
 def config_digest(config) -> str:
     raw = config.to_dict() if hasattr(config, "to_dict") else dict(config)
+    selected = {name: raw.get(name) for name in _PLE_IMAGE_CONFIG_FIELDS}
     try:
         payload = json.dumps(
-            _sanitize_config(raw),
+            selected,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
@@ -264,9 +269,24 @@ def config_digest(config) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def checkpoint_fingerprint(config_sha256: str, manifest: Iterable[Mapping]) -> str:
+def checkpoint_fingerprint(
+    *,
+    config_sha256: str,
+    tp_size: int,
+    padded_vocab_size: int,
+    valid_vocab_size: int,
+    dtype: str,
+    module_prefix: str,
+    manifest: Iterable[Mapping],
+) -> str:
     payload = {
+        "format_version": FORMAT_VERSION,
         "config_sha256": config_sha256,
+        "tp_size": int(tp_size),
+        "vocab_range": [0, int(valid_vocab_size)],
+        "padded_vocab_size": int(padded_vocab_size),
+        "dtype": str(dtype),
+        "module_prefix": str(module_prefix),
         "shards": sorted(
             (dict(item) for item in manifest), key=lambda item: item["name"]
         ),
@@ -430,6 +450,9 @@ class PLEImageBuilder:
         *,
         module_prefix: str = "ple",
         image_count: int = 1,
+        padded_vocab_size: Optional[int] = None,
+        valid_vocab_size: Optional[int] = None,
+        dtype: str = "float8_e4m3fn",
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -440,8 +463,18 @@ class PLEImageBuilder:
         self.vocab_end = int(vocab_end)
         self.module_prefix = str(module_prefix)
         self.image_count = int(image_count)
+        default_padded_vocab = (
+            (int(vocab_end) + self.tp_size - 1) // self.tp_size * self.tp_size
+        )
+        self.padded_vocab_size = int(padded_vocab_size or default_padded_vocab)
+        self.valid_vocab_size = int(valid_vocab_size or vocab_end)
+        self.dtype = str(dtype)
         if self.image_count <= 0:
             raise ValueError("image_count must be positive")
+        if self.padded_vocab_size % self.tp_size:
+            raise ValueError("padded PLE vocabulary must be divisible by TP size")
+        if not 0 < self.valid_vocab_size <= self.padded_vocab_size:
+            raise ValueError("valid PLE vocabulary must fit in the padded vocabulary")
         self.num_rows = self.vocab_end - self.vocab_start
         self.manifest: list[dict] = []
         self.intervals: list[tuple[int, int]] = []
@@ -450,9 +483,15 @@ class PLEImageBuilder:
         self._reuse = self._find_reuse_candidate()
         self._expected_manifest = None
         if self._reuse is None:
-            num_pages = (self.num_rows + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
-            per_rank_bytes = self.num_rows * ROW_BYTES + (num_pages + 1) * PAGE_BYTES
-            required_bytes = per_rank_bytes * self.tp_size * self.image_count
+            rows_per_rank = self.padded_vocab_size // self.tp_size
+            required_bytes = 0
+            for rank in range(self.tp_size):
+                rank_start = rank * rows_per_rank
+                rank_end = min(self.valid_vocab_size, rank_start + rows_per_rank)
+                rank_rows = max(0, rank_end - rank_start)
+                rank_pages = (rank_rows + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
+                required_bytes += rank_rows * ROW_BYTES + (rank_pages + 1) * PAGE_BYTES
+            required_bytes *= self.image_count
             free_bytes = shutil.disk_usage(self.root).free
             if free_bytes < required_bytes:
                 raise OSError(
@@ -486,6 +525,8 @@ class PLEImageBuilder:
                 and int(header.get("tp_size", -1)) == self.tp_size
                 and int(header.get("vocab_start", -1)) == self.vocab_start
                 and int(header.get("vocab_end", -1)) == self.vocab_end
+                and int(header.get("padded_vocab_size", -1)) == self.padded_vocab_size
+                and int(header.get("valid_vocab_size", -1)) == self.valid_vocab_size
                 and header.get("module_prefix") == self.module_prefix
             ):
                 try:
@@ -603,7 +644,15 @@ class PLEImageBuilder:
     def _finalize(self, weight_scale: float) -> tuple[PLEImage, bool, dict]:
         self._validate_coverage()
         manifest = sorted(self.manifest, key=lambda item: item["name"])
-        fingerprint = checkpoint_fingerprint(self.config_sha256, manifest)
+        fingerprint = checkpoint_fingerprint(
+            config_sha256=self.config_sha256,
+            tp_size=self.tp_size,
+            padded_vocab_size=self.padded_vocab_size,
+            valid_vocab_size=self.valid_vocab_size,
+            dtype=self.dtype,
+            module_prefix=self.module_prefix,
+            manifest=manifest,
+        )
         if self._reuse is not None:
             expected = sorted(self._expected_manifest, key=lambda item: item["name"])
             if expected != manifest:
@@ -649,8 +698,10 @@ class PLEImageBuilder:
             "tp_size": self.tp_size,
             "vocab_start": self.vocab_start,
             "vocab_end": self.vocab_end,
+            "padded_vocab_size": self.padded_vocab_size,
+            "valid_vocab_size": self.valid_vocab_size,
             "row_bytes": ROW_BYTES,
-            "dtype": "float8_e4m3fn",
+            "dtype": self.dtype,
             "weight_scale": float(weight_scale),
             "page_bytes": PAGE_BYTES,
             "rows_per_page": ROWS_PER_PAGE,
@@ -907,7 +958,10 @@ def read_hot_frequency_file(
         (row for row in header.get("ranks", []) if int(row["rank"]) == rank), None
     )
     if entry is None:
-        return np.empty(0, dtype=np.uint32)
+        raise ValueError(
+            f"PLE hot-frequency file {path} has no entry for rank {rank}; "
+            "delete and regenerate it"
+        )
     if expected_vocab_start is not None and int(entry.get("vocab_start", -1)) != int(
         expected_vocab_start
     ):
@@ -1065,7 +1119,6 @@ class WTinyLFURowCache:
 
     _WAYS = 8
     _SKETCH_DEPTH = 4
-    _LOOKUP_MAX_RETRIES = 8
     _HASH_MIX = np.array(
         [
             0x9E3779B185EBCA87,
@@ -1076,6 +1129,29 @@ class WTinyLFURowCache:
         dtype=np.uint64,
     )
 
+    @classmethod
+    def _sketch_width_for_slots(cls, slots: int) -> int:
+        if slots <= 0:
+            return 0
+        target = max(1024, min(1 << 20, max(1, slots // 8)))
+        return 1 << (target - 1).bit_length()
+
+    @classmethod
+    def _sets_for_budget(cls, budget_bytes: int) -> int:
+        upper = max(0, budget_bytes) // (cls._WAYS * (ROW_BYTES + 16))
+        lower = 0
+        while lower < upper:
+            candidate = (lower + upper + 1) // 2
+            slots = candidate * cls._WAYS
+            allocated = slots * (
+                ROW_BYTES + 16
+            ) + cls._SKETCH_DEPTH * cls._sketch_width_for_slots(slots)
+            if allocated <= budget_bytes:
+                lower = candidate
+            else:
+                upper = candidate - 1
+        return lower
+
     def __init__(
         self,
         budget_gb: float = 0.0,
@@ -1083,22 +1159,19 @@ class WTinyLFURowCache:
         capacity_rows: Optional[int] = None,
         queue_batches: int = 64,
     ) -> None:
-        requested = (
-            int(capacity_rows)
-            if capacity_rows is not None
-            else int(float(budget_gb) * (1 << 30) // ROW_BYTES)
-        )
-        self.num_sets = max(0, requested) // self._WAYS
+        if capacity_rows is not None:
+            self.num_sets = max(0, int(capacity_rows)) // self._WAYS
+        else:
+            budget_bytes = int(float(budget_gb) * (1 << 30))
+            self.num_sets = self._sets_for_budget(budget_bytes)
         self.num_slots = self.num_sets * self._WAYS
         self.capacity = self.num_slots
         self.tags = np.full((self.num_sets, self._WAYS), -1, dtype=np.int64)
         self.recency = np.zeros((self.num_sets, self._WAYS), dtype=np.uint64)
-        self._versions = np.zeros(self.num_sets, dtype=np.uint64)
         self.rows = _allocate_host_tensor(
             (self.num_slots, ROW_BYTES), dtype=torch.uint8
         )
-        sketch_target = max(1024, min(1 << 20, max(1, self.capacity // 8)))
-        self.sketch_width = 1 << (sketch_target - 1).bit_length()
+        self.sketch_width = self._sketch_width_for_slots(self.capacity)
         self.sketch = np.zeros((self._SKETCH_DEPTH, self.sketch_width), dtype=np.uint8)
         self._clock = 0
         self._sample_count = 0
@@ -1162,32 +1235,17 @@ class WTinyLFURowCache:
         hit = np.zeros(ids.size, dtype=np.bool_)
         if not self.capacity or not ids.size:
             return hit
-        pending = np.arange(ids.size)
         cached_rows = self.rows.numpy()
-        for attempt in range(self._LOOKUP_MAX_RETRIES):
-            sets = self._set_indices(ids[pending])
-            # These numpy version and tag operations retain the GIL. An odd
-            # version marks a set while its cached row is being updated. A
-            # free-threaded Python build needs acquire and release atomics for
-            # these version and tag accesses.
-            before = self._versions[sets].copy()
-            ready = (before & np.uint64(1)) == 0
+        with self._lock:
+            sets = self._set_indices(ids)
             candidates = self.tags[sets].copy()
-            matches = candidates == ids[pending, None]
-            matched = matches.any(axis=1)
-            if np.any(ready & matched):
-                selected = np.flatnonzero(ready & matched)
+            matches = candidates == ids[:, None]
+            hit = matches.any(axis=1)
+            if np.any(hit):
+                selected = np.flatnonzero(hit)
                 ways = matches[selected].argmax(axis=1)
                 slots = sets[selected] * self._WAYS + ways
-                output[pending[selected]] = cached_rows[slots]
-            after = self._versions[sets]
-            stable = ready & (before == after)
-            hit[pending[stable]] = matched[stable]
-            pending = pending[~stable]
-            if not pending.size:
-                break
-            if attempt + 1 < self._LOOKUP_MAX_RETRIES:
-                time.sleep(0)
+                output[selected] = cached_rows[slots]
         if record_hits and np.any(hit):
             self.record(ids[hit], None)
         return hit
@@ -1222,52 +1280,48 @@ class WTinyLFURowCache:
 
     def _insert(self, row_id: int, exact_row: np.ndarray) -> None:
         set_index = int(self._set_indices(np.array([row_id]))[0])
-        self._versions[set_index] = np.uint64(int(self._versions[set_index]) + 1)
-        try:
-            tags = self.tags[set_index]
-            existing = np.flatnonzero(tags == row_id)
-            self._clock += 1
-            if existing.size:
-                self.recency[set_index, int(existing[0])] = self._clock
-                return
+        tags = self.tags[set_index]
+        existing = np.flatnonzero(tags == row_id)
+        self._clock += 1
+        if existing.size:
+            self.recency[set_index, int(existing[0])] = self._clock
+            return
 
-            # One of eight ways is the admission window. A smaller canonical
-            # window cannot be represented by this fixed eight-way layout.
-            window_way = 0
-            candidate_id = int(tags[window_way])
-            candidate_row = None
-            if candidate_id >= 0:
-                slot = set_index * self._WAYS + window_way
-                candidate_row = self.rows.numpy()[slot].copy()
-            tags[window_way] = row_id
-            self.rows[set_index * self._WAYS + window_way].copy_(
-                torch.from_numpy(exact_row)
-            )
-            self.recency[set_index, window_way] = self._clock
-            if candidate_id < 0:
-                return
+        # One of eight ways is the admission window. A smaller canonical
+        # window cannot be represented by this fixed eight-way layout.
+        window_way = 0
+        candidate_id = int(tags[window_way])
+        candidate_row = None
+        if candidate_id >= 0:
+            slot = set_index * self._WAYS + window_way
+            candidate_row = self.rows.numpy()[slot].copy()
+        tags[window_way] = row_id
+        self.rows[set_index * self._WAYS + window_way].copy_(
+            torch.from_numpy(exact_row)
+        )
+        self.recency[set_index, window_way] = self._clock
+        if candidate_id < 0:
+            return
 
-            main_tags = tags[1:]
-            empty = np.flatnonzero(main_tags < 0)
-            if empty.size:
-                victim_way = int(empty[0]) + 1
-            else:
-                frequencies = np.array(
-                    [self._frequency(int(tag)) for tag in main_tags], dtype=np.int32
-                )
-                minimum = frequencies.min()
-                tied = np.flatnonzero(frequencies == minimum) + 1
-                victim_way = int(tied[np.argmin(self.recency[set_index, tied])])
-                victim_id = int(tags[victim_way])
-                if self._frequency(candidate_id) < self._frequency(victim_id):
-                    return
-            tags[victim_way] = candidate_id
-            self.rows[set_index * self._WAYS + victim_way].copy_(
-                torch.from_numpy(candidate_row)
+        main_tags = tags[1:]
+        empty = np.flatnonzero(main_tags < 0)
+        if empty.size:
+            victim_way = int(empty[0]) + 1
+        else:
+            frequencies = np.array(
+                [self._frequency(int(tag)) for tag in main_tags], dtype=np.int32
             )
-            self.recency[set_index, victim_way] = self._clock
-        finally:
-            self._versions[set_index] = np.uint64(int(self._versions[set_index]) + 1)
+            minimum = frequencies.min()
+            tied = np.flatnonzero(frequencies == minimum) + 1
+            victim_way = int(tied[np.argmin(self.recency[set_index, tied])])
+            victim_id = int(tags[victim_way])
+            if self._frequency(candidate_id) < self._frequency(victim_id):
+                return
+        tags[victim_way] = candidate_id
+        self.rows[set_index * self._WAYS + victim_way].copy_(
+            torch.from_numpy(candidate_row)
+        )
+        self.recency[set_index, victim_way] = self._clock
 
     def _admission_loop(self) -> None:
         while True:
@@ -1366,9 +1420,9 @@ def _find_helper_library() -> Path:
         )
     for location in locations:
         package_dir = Path(location)
-        candidates = sorted(package_dir.glob("qwen4_ple_disk_fetcher*.so"))
-        if candidates:
-            return candidates[0]
+        helper = package_dir / "qwen4_ple_disk_fetcher.so"
+        if helper.is_file():
+            return helper
     markers = [
         package_dir / "qwen4_ple_disk_fetcher.build"
         for package_dir in map(Path, locations)
@@ -1420,6 +1474,8 @@ class DirectPageReader:
         self.result = np.empty((self.max_pages, PAGE_BYTES), dtype=np.uint8)
         self.offsets = np.empty(self.max_pages, dtype=np.uint64)
         self._read_lock = threading.Lock()
+        self._poisoned = False
+        self._poisoned_staging = None
         if self.staging.data_ptr() & (self.alignment - 1):
             raise RuntimeError("PLE registered staging buffer is not O_DIRECT aligned")
         self.lib = ctypes.CDLL(str(_find_helper_library()), use_errno=True)
@@ -1520,6 +1576,16 @@ class DirectPageReader:
             )
             if rc:
                 if -rc == FETCHER_ERR_POISONED:
+                    if not self._poisoned:
+                        self._poisoned = True
+                        self._poisoned_staging = self._staging_allocation
+                        logger.error(
+                            "PLE disk fetcher retained %d staging bytes after "
+                            "poisoning (max_pages=%d); the allocation will be "
+                            "released when the reader closes",
+                            self._staging_allocation.numel(),
+                            self.max_pages,
+                        )
                     raise RuntimeError(
                         "PLE disk fetcher is poisoned after an I/O drain failure; "
                         "restart the fetcher by restarting the server"
@@ -1568,17 +1634,16 @@ class DirectPageReader:
         with self._read_lock:
             if getattr(self, "handle", None):
                 rc = self.lib.ple_fetcher_destroy(self.handle)
+                if rc:
+                    raise OSError(
+                        -rc,
+                        "PLE disk fetcher shutdown failed: " f"{os.strerror(-rc)}",
+                    )
                 self.handle = None
-                try:
-                    if rc:
-                        raise OSError(
-                            -rc,
-                            "PLE disk fetcher shutdown failed: " f"{os.strerror(-rc)}",
-                        )
-                finally:
-                    if self.fd is not None:
-                        os.close(self.fd)
-                        self.fd = None
+                if self.fd is not None:
+                    os.close(self.fd)
+                    self.fd = None
+                self._poisoned_staging = None
             elif getattr(self, "fd", None) is not None:
                 os.close(self.fd)
                 self.fd = None
@@ -1720,20 +1785,21 @@ class DiskRowFetcher:
         ids = ids[np.sort(first_positions)]
         if not ids.size:
             return False
-        if ids.size > self._prefill_max_rows:
-            dropped = ids.size - self._prefill_max_rows
-            self._prefill_truncated_submissions += 1
-            count = self._prefill_truncated_submissions
-            if count == 1 or count & (count - 1) == 0:
-                logger.warning(
-                    "PLE prefill look-ahead omitted %d rows because its token "
-                    "buffer is too small; occurrence=%d",
-                    dropped,
-                    count,
-                )
+        dropped = max(0, ids.size - self._prefill_max_rows)
+        if dropped:
             ids = ids[: self._prefill_max_rows]
         ids = np.sort(ids)
         with self._prefill_lock:
+            if dropped:
+                self._prefill_truncated_submissions += 1
+                count = self._prefill_truncated_submissions
+                if count == 1 or count & (count - 1) == 0:
+                    logger.warning(
+                        "PLE prefill look-ahead omitted %d rows because its token "
+                        "buffer is too small; occurrence=%d",
+                        dropped,
+                        count,
+                    )
             executor = self._prefill_executor
             if not self._prefill_slots or self._prefill_disabled or executor is None:
                 return False
@@ -1767,7 +1833,7 @@ class DiskRowFetcher:
         return True
 
     def _prefill_done(self, future: Future) -> None:
-        error = future.exception()
+        error = None if future.cancelled() else future.exception()
         if error is not None:
             self._disable_prefill(error)
         with self._prefill_lock:
@@ -1801,10 +1867,10 @@ class DiskRowFetcher:
                 "will continue through the CRC-checked decode reader",
                 exc_info=(type(error), error, error.__traceback__),
             )
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
             if reader is not None:
                 reader.close()
-            if executor is not None:
-                executor.shutdown(wait=False)
         finally:
             disable_done.set()
 
@@ -1878,16 +1944,16 @@ class DiskRowFetcher:
                     "PLE fetch output must be contiguous CPU uint8 with shape "
                     f"{expected_shape}"
                 )
-        output.zero_()
         flat_ids = ids.reshape(-1)
         owned = (flat_ids >= self.image.vocab_start) & (flat_ids < self.image.vocab_end)
+        out_np = output.numpy().reshape(-1, ROW_BYTES)
+        out_np[~owned] = 0
         positions = np.flatnonzero(owned)
         if not positions.size:
             self.last_fetch_stats = PLEFetchStats()
             return output
         local = flat_ids[positions] - self.image.vocab_start
         hit, slots = self.hot.lookup(local)
-        out_np = output.numpy().reshape(-1, ROW_BYTES)
         if np.any(hit):
             out_np[positions[hit]] = self.hot.rows.numpy()[slots[hit]]
         pending_positions = positions[~hit]
@@ -1965,6 +2031,7 @@ class DiskRowFetcher:
                 )
             executor.shutdown(wait=True)
             self._prefill_executor = None
+        self.hot = None
         dynamic = getattr(self, "dynamic", None)
         if dynamic is not None:
             dynamic.close()

@@ -189,6 +189,21 @@ int main(void) {
     close(file_fd);
     return 1;
   }
+  if (!ple_fetcher_test_ring_open(fetcher)) {
+    fprintf(stderr, "poisoned fetcher closed its ring before destroy\n");
+    ple_fetcher_destroy(fetcher);
+    free(buffer);
+    close(file_fd);
+    return 1;
+  }
+  rc = ple_fetcher_read(fetcher, NULL, 0, buffer, 2 * PAGE_BYTES);
+  if (rc != -EUCLEAN) {
+    fprintf(stderr, "poisoned empty read returned %d instead of %d\n", rc, -EUCLEAN);
+    ple_fetcher_destroy(fetcher);
+    free(buffer);
+    close(file_fd);
+    return 1;
+  }
 
   ple_fetcher_destroy(fetcher);
   free(buffer);

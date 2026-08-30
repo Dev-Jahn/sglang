@@ -24,7 +24,6 @@ from typing import Any, Optional, Protocol, Union, cast
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -1429,12 +1428,15 @@ class ModelRunner:
         return forward_batch
 
     def prepare_model_batch(
-        self, schedule_batch: Any, forward_batch: ForwardBatch
+        self, schedule_batch: Optional[Any], forward_batch: ForwardBatch
     ) -> None:
         if not getattr(self.model, "supports_model_batch_hook", False):
             return
+        if getattr(forward_batch, "_model_batch_hook_prepared", False):
+            return
         hook = cast(ModelBatchHook, self.model)
         hook.prepare_model_batch(schedule_batch, forward_batch)
+        forward_batch._model_batch_hook_prepared = True
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

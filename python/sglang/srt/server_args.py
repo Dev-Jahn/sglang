@@ -2614,7 +2614,7 @@ class ServerArgs:
         NS("exec.mamba"),
     ] = None
     ple_storage: A[
-        Optional[str],
+        Optional[Literal["gpu", "pinned", "disk"]],
         Arg(
             help="Storage for Qwen4 PLE rows. 'pinned' keeps the full table in "
             "pinned host RAM; 'disk' uses an exact hot-row cache plus O_DIRECT "

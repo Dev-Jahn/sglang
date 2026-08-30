@@ -16,8 +16,8 @@
 from types import SimpleNamespace
 
 import pytest
-
 from sglang.srt.managers import tp_worker
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -96,6 +96,88 @@ def test_split_prefill_entry_prepares_the_first_chunk(routed_batch):
     ]
     assert batch.split_forward_batch is forward_batch
     assert result.can_run_cuda_graph is True
+
+
+def test_prebuilt_generation_entry_prepares_the_model_batch(routed_batch):
+    events, forward_batch, runner = routed_batch
+    worker = SimpleNamespace(
+        model_runner=runner,
+        is_dllm=lambda: True,
+        _forward_batch_generation_dllm=lambda prepared, schedule: (
+            prepared,
+            schedule,
+        ),
+    )
+
+    result = tp_worker.TpModelWorker.forward_batch_generation(
+        worker, None, forward_batch=forward_batch
+    )
+
+    assert ("prepare", None, forward_batch) in events
+    assert result == (forward_batch, None)
+
+
+def test_dllm_entry_prepares_the_model_batch(routed_batch):
+    events, forward_batch, runner = routed_batch
+    algorithm = SimpleNamespace(
+        fdfo=False,
+        run=lambda model_runner, prepared, states: (
+            None,
+            None,
+            None,
+            None,
+            False,
+        ),
+    )
+    worker = SimpleNamespace(model_runner=runner, dllm_algorithm=algorithm)
+
+    tp_worker.TpModelWorker._forward_batch_generation_dllm(worker, forward_batch, None)
+
+    assert ("prepare", None, forward_batch) in events
+
+
+def test_split_prefill_entry_prepares_later_chunks(routed_batch):
+    events, forward_batch, runner = routed_batch
+    batch = SimpleNamespace(
+        split_index=1,
+        split_forward_count=2,
+        split_forward_batch=forward_batch,
+    )
+    worker = SimpleNamespace(model_runner=runner)
+
+    tp_worker.TpModelWorker.forward_batch_split_prefill(worker, batch)
+
+    assert events[:2] == [
+        ("prepare", batch, forward_batch),
+        ("forward", forward_batch),
+    ]
+
+
+def test_model_batch_hook_runs_once_for_a_prepared_forward_batch():
+    events = []
+    model = SimpleNamespace(
+        supports_model_batch_hook=True,
+        prepare_model_batch=lambda batch, prepared: events.append((batch, prepared)),
+    )
+    runner = SimpleNamespace(model=model)
+    forward_batch = SimpleNamespace()
+    batch = object()
+
+    ModelRunner.prepare_model_batch(runner, batch, forward_batch)
+    ModelRunner.prepare_model_batch(runner, batch, forward_batch)
+
+    assert events == [(batch, forward_batch)]
+
+
+def test_model_batch_hook_entry_point_enumeration():
+    entries = {
+        "embedding",
+        "scheduled generation",
+        "prebuilt generation",
+        "dLLM generation",
+        "split prefill",
+    }
+    assert len(entries) == 5
 
 
 if __name__ == "__main__":

@@ -192,6 +192,7 @@ if(SGL_KERNEL_CAN_BUILD_PLE_DISK_FETCHER)
     add_library(qwen4_ple_disk_fetcher SHARED
         "csrc/host/qwen4_ple_disk_fetcher.c"
     )
+    set_target_properties(qwen4_ple_disk_fetcher PROPERTIES PREFIX "")
     target_compile_features(qwen4_ple_disk_fetcher PRIVATE c_std_11)
     target_compile_options(qwen4_ple_disk_fetcher PRIVATE
         -Wall

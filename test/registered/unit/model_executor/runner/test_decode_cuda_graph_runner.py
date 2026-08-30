@@ -30,7 +30,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import (
     CudaGraphReplayInput,
@@ -164,7 +163,6 @@ class TestModelReplayHooks(CustomTestCase):
         self.assertTrue(state.completed)
         self.assertIsInstance(prepared[0], CudaGraphReplayInput)
         self.assertEqual(prepared[0].padded_num_tokens, 2)
-        self.assertEqual(prepared[0].seq_lens_sum, 7)
         self.assertIs(prepared[0].runtime_forward_batch, forward_batch)
         self.assertEqual(output.tensors["hidden"].tolist(), [0, 1])
 

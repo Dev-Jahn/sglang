@@ -34,8 +34,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
-from torch.profiler import ProfilerActivity, profile
-
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
@@ -114,6 +112,7 @@ from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
 )
+from torch.profiler import ProfilerActivity, profile
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -1411,18 +1410,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             padded_num_tokens=padded_num_tokens,
                             input_ids=self.buffers.input_ids[:padded_num_tokens],
                             req_pool_indices=self.buffers.req_pool_indices[: self.bs],
-                            seq_lens=self.buffers.seq_lens[: self.bs],
-                            seq_lens_sum=(
-                                None
-                                if forward_batch.seq_lens_sum is None
-                                else forward_batch.seq_lens_sum
-                                + (self.bs - self.raw_bs) * self.seq_len_fill_value
-                            ),
                             out_cache_loc=self.buffers.out_cache_loc[
                                 :padded_num_tokens
                             ],
                             forward_mode=self.capture_forward_mode,
-                            spec_algorithm=self.model_runner.spec_algorithm,
                             runtime_forward_batch=forward_batch,
                         )
                     )

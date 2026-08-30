@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import (
     Qwen4ExpConfig,
@@ -79,6 +77,7 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm120_supported, is_sm121, logger
 from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
+from torch import nn
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -941,6 +940,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return self.reduce(self.gather(input_ids))
 
 
+def _ple_cache_budget_divisor(
+    tp_size: int, ple_layer_count: int, *, use_attn_tp_group: bool
+) -> int:
+    replication = get_attention_dp_size() if use_attn_tp_group else 1
+    return int(tp_size) * int(ple_layer_count) * int(replication)
+
+
 class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
     """TP-local exact FP8 PLE image with asynchronous host-driven fetches."""
 
@@ -959,8 +965,8 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             )
         if embedding.weight.dtype != torch.float8_e4m3fn:
             raise TypeError(
-                "PLE disk storage requires float8_e4m3fn rows; set "
-                'text_config.ple_embedding_dtype="float8_e4m3fn"'
+                "--ple-storage disk requires a checkpoint with float8_e4m3fn "
+                "PLE rows; use the FP8 or NVFP4 checkpoint"
             )
         if embedding.num_added_embeddings:
             raise NotImplementedError("PLE disk storage does not support added rows")
@@ -999,11 +1005,18 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             ),
             "module_prefix": module_prefix,
             "image_count": ple_layer_count,
+            "padded_vocab_size": self.num_embeddings_padded,
+            "valid_vocab_size": int(valid_vocab_size),
+            "dtype": "float8_e4m3fn",
         }
         self._image_builder = PLEImageBuilder(**self._builder_args)
         self._rank = rank
         self._module_prefix = module_prefix
-        cache_budget_divisor = self.tp_size * ple_layer_count
+        cache_budget_divisor = _ple_cache_budget_divisor(
+            self.tp_size,
+            ple_layer_count,
+            use_attn_tp_group=self.use_attn_tp_group,
+        )
         self._hot_cache_gb = (
             float(getattr(config, "ple_disk_hot_cache_gb", 8.0)) / cache_budget_divisor
         )
@@ -1011,6 +1024,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             getattr(config, "ple_disk_hot_frequency_file", None),
             ple_layer_index,
             ple_layer_count,
+            require_exists=True,
         )
         self._dynamic_cache_gb = (
             float(getattr(config, "ple_disk_dynamic_cache_gb", 0.0))
@@ -1456,6 +1470,12 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         self._active_graph_generation = None
 
     def reset_graph_step(self) -> None:
+        self._reset_pending_fetch("PLE disk graph fetch failed")
+
+    def reset_eager_step(self) -> None:
+        self._reset_pending_fetch("PLE disk eager fetch failed during reset")
+
+    def _reset_pending_fetch(self, failure_message: str) -> None:
         future = getattr(self, "_future", None)
         try:
             if future is not None:
@@ -1464,7 +1484,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
                     completion = result[0]
                     completion.synchronize()
                 except BaseException:
-                    logger.warning("PLE disk graph fetch failed", exc_info=True)
+                    logger.warning(failure_message, exc_info=True)
         finally:
             self._future = None
             self._active_graph_generation = None
@@ -1493,6 +1513,14 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             return
         if self._executor is None:
             self._executor = self._new_executor()
+        logger.info(
+            "Reloading the Qwen4 PLE static cache during storage resume "
+            "(rank=%d module=%s budget_gib=%.3f hot_file=%s)",
+            self._rank,
+            self._module_prefix,
+            self._hot_cache_gb,
+            self._hot_frequency_file or "none",
+        )
         self._open_fetcher()
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1765,7 +1793,6 @@ class Qwen4ExpPLELayer(nn.Module):
             or lookup_tokens <= 0
         ):
             return
-        self.reset_cuda_graph_capture_buffers()
         buffer = self._graph_prefetch_buffer
         if buffer is not None:
             if buffer.shape[0] < lookup_tokens:
@@ -1897,7 +1924,11 @@ class Qwen4ExpPLELayer(nn.Module):
         future_lookup_ids = None
         future_contexts = self._future_lookup_contexts
         self._future_lookup_contexts = None
-        if future_contexts is not None and future_contexts.numel():
+        if (
+            not capturing_disk
+            and future_contexts is not None
+            and future_contexts.numel()
+        ):
             future_lookup_ids = self.ple_embedding._hash_contexts(future_contexts)
         prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
@@ -2108,6 +2139,17 @@ class Qwen4ExpPLELayer(nn.Module):
             self._graph_replay_prefetch_buffer = None
             self._pending_graph_lookup_validation = None
             self._pending_graph_embedding_validation = None
+
+    def reset_eager_prefetch(self) -> None:
+        if self._is_capturing():
+            return
+        offloaded_embedding = self.ple_embedding.ngram_embedding
+        try:
+            if isinstance(offloaded_embedding, Qwen4ExpDiskEmbedding):
+                offloaded_embedding.reset_eager_step()
+        finally:
+            self._prefetch_state = None
+            self._future_lookup_contexts = None
 
     def _consume_prefetched_embeddings(
         self, forward_batch: ForwardBatch
@@ -2655,7 +2697,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 row_start = 0
                 for req in schedule_batch.reqs:
                     extend_range = req.extend_range
-                    if extend_range is None or remaining <= 0:
+                    if remaining <= 0:
+                        break
+                    if extend_range is None:
                         continue
                     tokens = req.origin_input_ids
                     start = int(extend_range.end)
@@ -2862,6 +2906,30 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
 
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        try:
+            return self._forward_impl(
+                input_ids,
+                positions,
+                forward_batch,
+                inputs_embeds=inputs_embeds,
+            )
+        except BaseException:
+            for ple in self._ple_layers():
+                try:
+                    ple.reset_eager_prefetch()
+                except BaseException:
+                    logger.warning(
+                        "Qwen4 PLE eager prefetch reset failed", exc_info=True
+                    )
+            raise
+
+    def _forward_impl(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,

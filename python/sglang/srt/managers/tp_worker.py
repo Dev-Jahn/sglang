@@ -20,7 +20,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -552,6 +551,7 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
+        self.model_runner.prepare_model_batch(batch, forward_batch)
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
@@ -600,6 +600,7 @@ class TpModelWorker(BaseTpWorker):
             assert (
                 capture_hidden_mode is None
             ), "capture_hidden_mode override requires a ScheduleBatch input"
+            self.model_runner.prepare_model_batch(None, forward_batch)
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -690,8 +691,9 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 return_hidden_states_before_norm=False,
             )
-            self.model_runner.prepare_model_batch(batch, forward_batch)
             batch.split_forward_batch = forward_batch
+
+        self.model_runner.prepare_model_batch(batch, batch.split_forward_batch)
 
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count

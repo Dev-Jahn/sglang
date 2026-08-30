@@ -8,9 +8,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from torch import nn
-from torch.profiler import ProfilerActivity, profile
-
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -33,6 +30,8 @@ from sglang.srt.models.qwen4_ple_disk import (
     write_hot_frequency_file,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from torch import nn
+from torch.profiler import ProfilerActivity, profile
 
 register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
 
@@ -881,11 +880,8 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
         padded_num_tokens=lookup_tokens,
         input_ids=torch.tensor([17, 0, 0, 0], dtype=torch.long, device=device),
         req_pool_indices=torch.tensor([7, 0, 0, 0], dtype=torch.long, device=device),
-        seq_lens=torch.tensor([9, 1, 1, 1], dtype=torch.long, device=device),
-        seq_lens_sum=12,
         out_cache_loc=torch.tensor([20, 0, 0, 0], dtype=torch.long, device=device),
         forward_mode=ForwardMode.DECODE,
-        spec_algorithm=None,
         runtime_forward_batch=runtime,
     )
     model = Qwen4ExpModel.__new__(Qwen4ExpModel)

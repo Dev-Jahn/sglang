@@ -188,9 +188,11 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result) {
     struct io_uring_cqe* cqe = &f->cqes[head & *f->cq_mask];
     if (cqe->res != 4096 && *result == 0) {
       *result = cqe->res < 0 ? cqe->res : -EIO;
-      f->has_last_error = 1;
-      f->last_error_index = (unsigned)cqe->user_data;
-      f->last_error_result = cqe->res;
+      if (!f->has_last_error) {
+        f->has_last_error = 1;
+        f->last_error_index = (unsigned)cqe->user_data;
+        f->last_error_result = cqe->res;
+      }
     }
     ++head;
     ++completed;
@@ -222,21 +224,6 @@ static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned
 
 static int poison_fetcher(struct fetcher* f) {
   __atomic_store_n(&f->poisoned, 1, __ATOMIC_RELEASE);
-  if (f->ring_fd >= 0) {
-    int ring_fd = f->ring_fd;
-    f->ring_fd = -1;
-    munmap(f->sqes_ptr, f->sqes_size);
-    f->sqes_ptr = NULL;
-    if (!f->single_mmap) {
-      munmap(f->cq_ptr, f->cq_size);
-    }
-    f->cq_ptr = NULL;
-    munmap(f->sq_ptr, f->sq_size);
-    f->sq_ptr = NULL;
-    // The kernel keeps page references for in-flight requests after close starts
-    // cancellation. Their buffers remain valid until each request completes.
-    close(ring_fd);
-  }
   return -EUCLEAN;
 }
 
@@ -270,13 +257,13 @@ static int finish_read(struct fetcher* f, int result) {
 int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void* buffer, size_t buffer_bytes) {
   struct fetcher* f = opaque;
   if (!f || !buffer || count > f->max_pages || ((uintptr_t)buffer & 4095)) return -EINVAL;
+  if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return -EUCLEAN;
   if (count == 0) return 0;
   if (!offsets) return -EINVAL;
   size_t required_bytes = (size_t)count * 4096;
   if (buffer_bytes < required_bytes) return -EFAULT;
   if (f->fixed_buffer && (buffer != f->registered_buffer || required_bytes > f->registered_buffer_bytes))
     return -EFAULT;
-  if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return -EUCLEAN;
   int expected_state = 0;
   if (!__atomic_compare_exchange_n(&f->state, &expected_state, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
     return expected_state == 2 ? -EBADF : -EBUSY;
@@ -415,5 +402,10 @@ void ple_fetcher_test_successful_empty_wakes(unsigned wakes) {
 
 void ple_fetcher_test_completion_on_last_wake(int enabled) {
   ple_test_completion_on_last_wake = !!enabled;
+}
+
+int ple_fetcher_test_ring_open(void* opaque) {
+  struct fetcher* f = opaque;
+  return f && f->ring_fd >= 0;
 }
 #endif
