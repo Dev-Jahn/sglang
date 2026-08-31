@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     _kvcache = None
+    padding_slot = 0
 
     @abc.abstractmethod
     def __init__(

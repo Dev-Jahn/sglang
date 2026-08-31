@@ -1435,11 +1435,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                     self._publish_read_done(in_graph=False)
 
-                if replay_hook is None:
-                    output = self.backend.replay(self._replay_graph_key, forward_batch)
-                else:
+                if replay_hook is not None:
                     replay_hook.wait_cuda_graph_replay()
-                    output = self.backend.replay(self._replay_graph_key, forward_batch)
+                output = self.backend.replay(self._replay_graph_key, forward_batch)
+                if replay_hook is not None:
                     replay_hook.finish_cuda_graph_replay()
             finally:
                 if replay_hook is not None:

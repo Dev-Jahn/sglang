@@ -5,6 +5,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import queue
 import runpy
 import struct
 import sys
@@ -35,6 +36,7 @@ from sglang.srt.models.qwen4_ple_hash import (
     hash_contexts_numpy,
     hash_token_stream_numpy,
 )
+from sglang.srt.utils.ple_disk import IORING_MAX_ENTRIES
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -277,6 +279,8 @@ def _server_args(**overrides):
         "ple_disk_stats_log_interval": 0,
         "cpu_offload_gb": 0.0,
         "offload_group_size": 0,
+        "pp_size": 1,
+        "dllm_algorithm": None,
     }
     values.update(overrides)
     args = object.__new__(server_args_module.ServerArgs)
@@ -610,7 +614,7 @@ def test_max_read_pages_rejects_io_uring_entry_overflow():
         args._handle_offload_compatibility()
 
 
-@pytest.mark.parametrize("max_pages", [0, disk.IORING_MAX_ENTRIES + 1])
+@pytest.mark.parametrize("max_pages", [0, IORING_MAX_ENTRIES + 1])
 def test_direct_reader_rejects_invalid_io_uring_entry_count(tmp_path, max_pages):
     image = disk.build_test_image(tmp_path, _fp8_rows(1))
     with pytest.raises(ValueError, match="ple-disk-max-read-pages must be between"):
@@ -644,6 +648,38 @@ def test_read_abi_passes_the_staging_buffer_length(tmp_path, monkeypatch):
         assert library.read_buffer_bytes == reader.staging.numel()
     finally:
         reader.close()
+
+
+def test_installed_fetcher_create_rejects_an_invalid_buffer():
+    spec = importlib.util.find_spec("sgl_kernel")
+    locations = list(spec.submodule_search_locations or ()) if spec is not None else []
+    helper = next(
+        (
+            Path(location) / "qwen4_ple_disk_fetcher.so"
+            for location in locations
+            if (Path(location) / "qwen4_ple_disk_fetcher.so").is_file()
+        ),
+        None,
+    )
+    if helper is None:
+        pytest.skip("installed wheel has no qwen4_ple_disk_fetcher.so")
+
+    library = ctypes.CDLL(str(helper), use_errno=True)
+    library.ple_fetcher_create.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    library.ple_fetcher_create.restype = ctypes.c_void_p
+    failure_stage = ctypes.c_int(-1)
+    ctypes.set_errno(0)
+    handle = library.ple_fetcher_create(-1, None, 0, 1, 0, ctypes.byref(failure_stage))
+    assert not handle
+    assert ctypes.get_errno() == errno.EINVAL
+    assert failure_stage.value == 0
 
 
 def test_memlock_error_names_limit_bytes_and_flag(tmp_path, monkeypatch):
@@ -747,6 +783,55 @@ def test_manifest_from_newer_install_rejects_older_image(tmp_path):
         disk.PLEImageBuilder(tmp_path, "torn-install", 0, 1, 0, 25)
 
 
+def test_manifest_source_identity_controls_reuse(tmp_path):
+    source = tmp_path / "checkpoint.safetensors"
+    source.write_bytes(b"checkpoint-v1")
+    rows = _fp8_rows(25)
+
+    def set_source_identity(tensor):
+        stat = source.stat()
+        tensor._sglang_checkpoint_source = {
+            "file": source.name,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        return tensor
+
+    first = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
+    first.add_shard("shard", set_source_identity(rows), 0, 25)
+    _, reused, _ = first.finalize(0.5)
+    assert not reused
+
+    same = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
+    same.add_shard("shard", set_source_identity(rows), 0, 25)
+    _, reused, _ = same.finalize(0.5)
+    assert reused
+
+    stat = source.stat()
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    touched = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
+    touched.add_shard("shard", set_source_identity(rows), 0, 25)
+    with pytest.raises(ValueError, match="manifest mismatch.*delete"):
+        touched.finalize(0.5)
+
+
+def test_safetensors_loader_attaches_source_identity(tmp_path):
+    import safetensors.torch
+
+    from sglang.srt.model_loader.weight_utils import safetensors_weights_iterator
+
+    source = tmp_path / "checkpoint.safetensors"
+    safetensors.torch.save_file({"weight": torch.arange(4)}, source)
+    name, tensor = next(safetensors_weights_iterator([str(source)]))
+    stat = source.stat()
+    assert name == "weight"
+    assert tensor._sglang_checkpoint_source == {
+        "file": source.name,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
 @pytest.mark.parametrize("failure_call", [2, 3])
 def test_finalize_crash_before_image_install_is_recoverable(
     tmp_path, monkeypatch, failure_call
@@ -805,6 +890,27 @@ def test_builder_cleans_raw_temporary_after_later_shard_validation_error(tmp_pat
     with pytest.raises(TypeError, match="float8_e4m3fn"):
         builder.add_shard("second", rows[25:].to(torch.bfloat16), 25, 50)
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_builder_error_closes_once(tmp_path, monkeypatch):
+    builder = disk.PLEImageBuilder(tmp_path, "write-error", 0, 1, 0, 25)
+    close_calls = 0
+    real_close = builder.close
+
+    def counted_close():
+        nonlocal close_calls
+        close_calls += 1
+        real_close()
+
+    monkeypatch.setattr(builder, "close", counted_close)
+    monkeypatch.setattr(
+        disk.os,
+        "pwrite",
+        lambda *args: (_ for _ in ()).throw(OSError(errno.EIO, "injected")),
+    )
+    with pytest.raises(OSError, match="injected"):
+        builder.add_shard("shard", _fp8_rows(25), 0, 25)
+    assert close_calls == 1
 
 
 def test_transfer_buffers_keep_only_largest_shape_per_device():
@@ -1939,8 +2045,119 @@ def test_hit_sim_selects_accessed_rows_and_splits_tp_ranks(tmp_path, monkeypatch
         )
 
 
+def test_hit_sim_counting_uses_bincount_per_head(tmp_path, monkeypatch):
+    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
+    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_count", script)
+    hit_sim = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(hit_sim)
+    metadata = PLEMetadata(
+        multipliers=np.array([3, 5, 7], dtype=np.int64),
+        vocab_sizes=np.array([4, 3], dtype=np.int64),
+        offsets=np.array([0, 4], dtype=np.int64),
+        eos_token_id=2,
+    )
+    token_path = tmp_path / "tokens.i32"
+    np.array([1, 2, 3, 1], dtype="<i4").tofile(token_path)
+    counts = hit_sim.open_counts(tmp_path / "counts", metadata)
+    calls = []
+    real_bincount = np.bincount
+
+    def counted_bincount(*args, **kwargs):
+        calls.append(1)
+        return real_bincount(*args, **kwargs)
+
+    monkeypatch.setattr(hit_sim.np, "bincount", counted_bincount)
+    hit_sim.count_rows(token_path, metadata, counts, chunk_tokens=2)
+    assert len(calls) == len(counts) * 2
+    assert sum(int(array.sum()) for array in counts) == 8
+
+
+def test_hit_sim_selection_is_independent_of_peak_frequency(monkeypatch):
+    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
+    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_peak", script)
+    hit_sim = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(hit_sim)
+    metadata = PLEMetadata(
+        multipliers=np.array([3, 5, 7], dtype=np.int64),
+        vocab_sizes=np.array([4, 3], dtype=np.int64),
+        offsets=np.array([0, 4], dtype=np.int64),
+        eos_token_id=2,
+    )
+    counts = [
+        np.array([10**12, 7, 7, 1], dtype=np.uint64),
+        np.array([8, 7, 0], dtype=np.uint64),
+    ]
+    monkeypatch.setattr(
+        hit_sim.np,
+        "zeros",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("selection allocated by peak frequency")
+        ),
+    )
+    ids, frequencies = hit_sim.select_rows(counts, metadata, capacity=4)
+    assert ids.tolist() == [0, 4, 1, 2]
+    assert frequencies.tolist() == [10**12, 8, 7, 7]
+
+
+def test_hit_sim_selection_matches_the_previous_ordering():
+    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
+    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_order", script)
+    hit_sim = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(hit_sim)
+    metadata = PLEMetadata(
+        multipliers=np.array([3, 5, 7], dtype=np.int64),
+        vocab_sizes=np.array([5, 4], dtype=np.int64),
+        offsets=np.array([0, 5], dtype=np.int64),
+        eos_token_id=2,
+    )
+    counts = [
+        np.array([0, 3, 9, 3, 1], dtype=np.uint64),
+        np.array([3, 7, 0, 3], dtype=np.uint64),
+    ]
+
+    def previous_selection(capacity):
+        maximum = max(int(array.max()) for array in counts)
+        histogram = np.zeros(maximum + 1, dtype=np.int64)
+        for array in counts:
+            local = np.bincount(
+                np.asarray(array, dtype=np.int64), minlength=maximum + 1
+            )
+            histogram[: local.size] += local
+        selected_above = 0
+        threshold = 0
+        for frequency in range(maximum, 0, -1):
+            if selected_above + int(histogram[frequency]) >= capacity:
+                threshold = frequency
+                break
+            selected_above += int(histogram[frequency])
+        tie_remaining = capacity - selected_above
+        ids = []
+        frequencies = []
+        for array, offset in zip(counts, metadata.offsets):
+            local_ids = np.flatnonzero(array > threshold)
+            if tie_remaining:
+                tied = np.flatnonzero(array == threshold)
+                take = min(tie_remaining, tied.size)
+                local_ids = np.concatenate((local_ids, tied[:take]))
+                tie_remaining -= take
+            ids.append((local_ids + int(offset)).astype(np.uint32))
+            frequencies.append(np.asarray(array[local_ids], dtype=np.uint64))
+        global_ids = np.concatenate(ids)
+        global_frequencies = np.concatenate(frequencies)
+        order = np.lexsort((global_ids, np.bitwise_not(global_frequencies)))
+        return global_ids[order], global_frequencies[order]
+
+    expected_ids, expected_frequencies = previous_selection(5)
+    actual_ids, actual_frequencies = hit_sim.select_rows(counts, metadata, 5)
+    assert np.array_equal(actual_ids, expected_ids)
+    assert np.array_equal(actual_frequencies, expected_frequencies)
+
+
 def test_image_builder_reserves_space_for_all_tp_ranks(tmp_path, monkeypatch):
-    all_ranks = 25 * disk.ROW_BYTES + 4 * disk.PAGE_BYTES
+    all_ranks = 25 * disk.ROW_BYTES + 4 * disk.PAGE_BYTES + 2 * (16 + 4)
     monkeypatch.setattr(
         disk.shutil,
         "disk_usage",
@@ -2108,6 +2325,58 @@ def test_dynamic_cache_lookup_waits_for_admission_batch_lock():
     assert np.array_equal(output[0], row)
 
 
+def test_dynamic_cache_admission_bounds_each_lock_acquisition():
+    cache = disk.WTinyLFURowCache.__new__(disk.WTinyLFURowCache)
+    cache._queue = queue.Queue()
+    cache._queue.put((np.arange(145, dtype=np.int64), None))
+    cache._queue.put(None)
+    cache._pending_condition = threading.Condition()
+    cache._pending_batches = 1
+    cache._worker_error = None
+
+    class TrackingLock:
+        def __init__(self):
+            self.current = 0
+            self.work = []
+
+        def __enter__(self):
+            self.current = 0
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.work.append(self.current)
+
+    lock = TrackingLock()
+    cache._lock = lock
+    cache._increment = lambda row_id: setattr(lock, "current", lock.current + 1)
+    cache._admission_loop()
+    assert len(lock.work) > 1
+    assert max(lock.work) <= 64
+
+
+def test_dynamic_cache_record_checks_closed_under_the_condition():
+    cache = disk.WTinyLFURowCache.__new__(disk.WTinyLFURowCache)
+    cache.capacity = 1
+    cache._closed = False
+    cache._pending_batches = 0
+    cache._queue = queue.Queue()
+
+    class ClosingCondition:
+        def __enter__(self):
+            cache._closed = True
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+        def notify_all(self):
+            pass
+
+    cache._pending_condition = ClosingCondition()
+    cache.record(np.array([1]), None)
+    assert cache._pending_batches == 0
+    assert cache._queue.empty()
+
+
 def test_dynamic_cache_budget_includes_rows_and_metadata():
     budget_bytes = 8 * (disk.ROW_BYTES + 16) + 4 * 1024
     cache = disk.WTinyLFURowCache(budget_gb=budget_bytes / (1 << 30))
@@ -2172,6 +2441,75 @@ def test_disk_embedding_close_releases_fetcher_builder_and_executor():
     embedding.close()
     assert closed == ["Closeable", "Closeable", "Executor"]
     assert embedding._transfer_buffers == {}
+
+
+def test_disk_embedding_close_continues_after_fetcher_error():
+    events = []
+
+    class Closeable:
+        def __init__(self, name, error=None):
+            self.name = name
+            self.error = error
+
+        def close(self):
+            events.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+    class Executor:
+        def shutdown(self, wait=True):
+            events.append("executor")
+
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._future = None
+    embedding._prefill_submit_future = None
+    embedding._fetcher = Closeable("fetcher", RuntimeError("fetcher close"))
+    embedding._image_builder = Closeable("builder")
+    embedding._executor = Executor()
+    embedding._transfer_buffers = {"device": object()}
+    embedding._active_transfer_device = object()
+    embedding._prefill_host_ids = object()
+    embedding._active_graph_generation = object()
+
+    with pytest.raises(RuntimeError, match="fetcher close"):
+        embedding.close()
+    embedding.close()
+    assert events == ["fetcher", "builder", "executor"]
+    assert embedding._fetcher is None
+    assert embedding._image_builder is None
+    assert embedding._executor is None
+    assert embedding._transfer_buffers == {}
+
+
+def test_disk_fetcher_close_continues_after_dynamic_cache_error():
+    events = []
+
+    class Closeable:
+        def __init__(self, name, error=None):
+            self.name = name
+            self.error = error
+
+        def close(self):
+            events.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+    fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
+    fetcher._closed = False
+    fetcher._prefill_executor = None
+    fetcher.hot = object()
+    fetcher.dynamic = Closeable("dynamic", RuntimeError("dynamic close"))
+    fetcher.prefill_reader = Closeable("prefill")
+    fetcher.reader = Closeable("decode")
+
+    with pytest.raises(RuntimeError, match="dynamic close"):
+        fetcher.close()
+    fetcher.close()
+    assert events == ["dynamic", "prefill", "decode"]
+    assert fetcher.dynamic is None
+    assert fetcher.prefill_reader is None
+    assert fetcher.reader is None
 
 
 def test_weight_reload_without_ple_rows_keeps_the_live_image():

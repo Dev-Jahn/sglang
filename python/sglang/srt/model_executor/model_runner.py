@@ -833,6 +833,10 @@ class ModelRunner:
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        if getattr(self.server_args, "ple_storage", "gpu") == "disk":
+            assert (
+                self.token_to_kv_pool_allocator.padding_slot == 0
+            ), "Qwen4 PLE disk masking requires KV cache padding slot 0"
         self.memory_pool_config = result.memory_pool_config
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens

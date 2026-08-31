@@ -46,6 +46,8 @@ import numpy as np
 import torch
 from packaging.version import InvalidVersion, Version
 
+from sglang.srt.utils.ple_disk import validate_max_read_pages
+
 logger = logging.getLogger(__name__)
 
 PAGE_BYTES = 4096
@@ -61,20 +63,9 @@ CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 FETCHER_FAILURE_SETUP = 1
 FETCHER_FAILURE_REGISTER_BUFFER = 2
 FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
-IORING_MAX_ENTRIES = 32768
 _METADATA_HEADER = struct.Struct("<8sI")
 _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 _RETAINED_POISONED_STAGING = []
-
-
-def validate_max_read_pages(value: int) -> int:
-    value = int(value)
-    if not 1 <= value <= IORING_MAX_ENTRIES:
-        raise ValueError(
-            "--ple-disk-max-read-pages must be between 1 and "
-            f"{IORING_MAX_ENTRIES}, got {value}"
-        )
-    return value
 
 
 def resolve_hot_frequency_file(
@@ -242,6 +233,15 @@ def _read_metadata_page(path: Path, expected_magic: bytes) -> dict:
 def _validate_manifest_ranges(manifest: list[dict], vocab_end: int, path: Path) -> None:
     ranges = []
     for item in manifest:
+        if not {
+            "source_file",
+            "source_file_size",
+            "source_file_mtime_ns",
+        }.issubset(item):
+            raise ValueError(
+                f"PLE image manifest {path} lacks checkpoint source identity; "
+                "rebuild it"
+            )
         if "row_start" not in item or "row_end" not in item:
             raise ValueError(
                 f"PLE image manifest {path} lacks shard row ranges; rebuild it"
@@ -518,7 +518,12 @@ class PLEImageBuilder:
                 rank_end = min(self.valid_vocab_size, rank_start + rows_per_rank)
                 rank_rows = max(0, rank_end - rank_start)
                 rank_pages = (rank_rows + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
-                required_bytes += rank_rows * ROW_BYTES + (rank_pages + 1) * PAGE_BYTES
+                required_bytes += (
+                    rank_rows * ROW_BYTES
+                    + (rank_pages + 1) * PAGE_BYTES
+                    + 16
+                    + 4 * rank_pages
+                )
             required_bytes *= self.image_count
             free_bytes = shutil.disk_usage(self.root).free
             if free_bytes < required_bytes:
@@ -610,6 +615,7 @@ class PLEImageBuilder:
                 f"PLE disk storage requires float8_e4m3fn checkpoint rows, got "
                 f"{loaded_weight.dtype} for {name}"
             )
+        source = getattr(loaded_weight, "_sglang_checkpoint_source", None) or {}
         item = {
             "name": name,
             "rows": int(loaded_weight.shape[0]),
@@ -618,6 +624,9 @@ class PLEImageBuilder:
             "row_start": int(row_start),
             "row_end": int(row_end),
             "sample_sha256": _sample_row_payload(loaded_weight),
+            "source_file": str(source.get("file", name)),
+            "source_file_size": int(source.get("size", loaded_weight.nbytes)),
+            "source_file_mtime_ns": int(source.get("mtime_ns", 0)),
         }
         self.manifest.append(item)
         ov_start = max(int(row_start), self.vocab_start)
@@ -640,16 +649,12 @@ class PLEImageBuilder:
         view = memoryview(raw).cast("B")
         offset = (ov_start - self.vocab_start) * ROW_BYTES
         written = 0
-        try:
-            fd = self._ensure_raw()
-            while written < len(view):
-                count = os.pwrite(fd, view[written:], offset + written)
-                if count <= 0:
-                    raise IOError("short write while materializing PLE row image")
-                written += count
-        except BaseException:
-            self.close()
-            raise
+        fd = self._ensure_raw()
+        while written < len(view):
+            count = os.pwrite(fd, view[written:], offset + written)
+            if count <= 0:
+                raise IOError("short write while materializing PLE row image")
+            written += count
 
     def _validate_coverage(self) -> None:
         merged = []
@@ -899,6 +904,11 @@ def write_hot_frequency_file(
     tp_size: int,
     padding_divisor: int,
 ) -> None:
+    """Write row ids in decreasing frequency order for each TP rank.
+
+    The runtime truncates each rank array by position when its cache budget is
+    smaller than the file, so callers must preserve this ordering.
+    """
     if not fingerprint:
         raise ValueError("PLE hot-frequency files require an image fingerprint")
     total_rows = int(total_rows)
@@ -1279,7 +1289,7 @@ class WTinyLFURowCache:
         return hit
 
     def record(self, local_ids: np.ndarray, exact_rows: Optional[np.ndarray]) -> None:
-        if not self.capacity or self._closed:
+        if not self.capacity:
             return
         ids = np.asarray(local_ids, dtype=np.int64).reshape(-1).copy()
         rows = (
@@ -1288,23 +1298,24 @@ class WTinyLFURowCache:
             else np.asarray(exact_rows, dtype=np.uint8).reshape(-1, ROW_BYTES).copy()
         )
         with self._pending_condition:
-            self._pending_batches += 1
-        try:
-            self._queue.put_nowait((ids, rows))
-        except queue.Full:
-            with self._pending_condition:
-                self._pending_batches -= 1
-                if self._pending_batches == 0:
-                    self._pending_condition.notify_all()
-            with self._lock:
-                self._dropped_batches += 1
-                dropped = self._dropped_batches
-            if dropped == 1 or dropped & (dropped - 1) == 0:
-                logger.warning(
-                    "PLE disk dynamic cache dropped %d admission batches because "
-                    "its queue was full",
-                    dropped,
-                )
+            if self._closed:
+                return
+            try:
+                self._queue.put_nowait((ids, rows))
+            except queue.Full:
+                pass
+            else:
+                self._pending_batches += 1
+                return
+        with self._lock:
+            self._dropped_batches += 1
+            dropped = self._dropped_batches
+        if dropped == 1 or dropped & (dropped - 1) == 0:
+            logger.warning(
+                "PLE disk dynamic cache dropped %d admission batches because "
+                "its queue was full",
+                dropped,
+            )
 
     def _insert(self, row_id: int, exact_row: np.ndarray) -> None:
         set_index = int(self._set_indices(np.array([row_id]))[0])
@@ -1358,12 +1369,15 @@ class WTinyLFURowCache:
                 if item is None:
                     return
                 ids, rows = item
-                with self._lock:
-                    for index, row_id in enumerate(ids):
-                        value = int(row_id)
-                        self._increment(value)
-                        if rows is not None:
-                            self._insert(value, rows[index])
+                for begin in range(0, ids.size, 64):
+                    end = min(begin + 64, ids.size)
+                    with self._lock:
+                        for index in range(begin, end):
+                            row_id = ids[index]
+                            value = int(row_id)
+                            self._increment(value)
+                            if rows is not None:
+                                self._insert(value, rows[index])
             except BaseException as exc:
                 with self._lock:
                     if self._worker_error is None:
@@ -1378,33 +1392,49 @@ class WTinyLFURowCache:
                             self._pending_condition.notify_all()
 
     def flush(self, timeout: float = 5.0) -> None:
-        if self.capacity and not self._closed:
-            deadline = time.monotonic() + timeout
-            with self._pending_condition:
-                while self._pending_batches:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            "PLE disk dynamic cache admission did not drain within "
-                            f"{timeout:.1f}s"
-                        )
-                    self._pending_condition.wait(remaining)
-            with self._lock:
-                worker_error = self._worker_error
-            if worker_error is not None:
-                raise RuntimeError(
-                    "PLE disk dynamic cache admission failed"
-                ) from worker_error
+        if not self.capacity:
+            return
+        deadline = time.monotonic() + timeout
+        with self._pending_condition:
+            if self._closed:
+                return
+            while self._pending_batches:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "PLE disk dynamic cache admission did not drain within "
+                        f"{timeout:.1f}s"
+                    )
+                self._pending_condition.wait(remaining)
+        with self._lock:
+            worker_error = self._worker_error
+        if worker_error is not None:
+            raise RuntimeError(
+                "PLE disk dynamic cache admission failed"
+            ) from worker_error
 
     def close(self) -> None:
-        if not self.capacity or self._closed:
+        if not self.capacity:
             return
         error = None
-        try:
-            self.flush()
-        except BaseException as exc:
-            error = exc
-        self._closed = True
+        with self._pending_condition:
+            if self._closed:
+                return
+            self._closed = True
+            deadline = time.monotonic() + 5.0
+            while self._pending_batches:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = TimeoutError(
+                        "PLE disk dynamic cache admission did not drain within 5.0s"
+                    )
+                    break
+                self._pending_condition.wait(remaining)
+        with self._lock:
+            worker_error = self._worker_error
+        if worker_error is not None and error is None:
+            error = RuntimeError("PLE disk dynamic cache admission failed")
+            error.__cause__ = worker_error
         try:
             self._queue.put(None, timeout=1.0)
         except queue.Full as exc:
@@ -2081,26 +2111,40 @@ class DiskRowFetcher:
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        executor = getattr(self, "_prefill_executor", None)
-        if executor is not None:
+        first_error = None
+        if getattr(self, "_prefill_executor", None) is not None:
             try:
                 self.wait_prefill()
-            except BaseException:
-                logger.warning(
-                    "PLE prefill look-ahead failed during shutdown", exc_info=True
-                )
-            executor.shutdown(wait=True)
+            except BaseException as exc:
+                first_error = exc
+        executor = getattr(self, "_prefill_executor", None)
+        if executor is not None:
             self._prefill_executor = None
+            try:
+                executor.shutdown(wait=True)
+            except BaseException as exc:
+                first_error = first_error or exc
         self.hot = None
         dynamic = getattr(self, "dynamic", None)
         if dynamic is not None:
-            dynamic.close()
             self.dynamic = None
+            try:
+                dynamic.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         prefill_reader = getattr(self, "prefill_reader", None)
         if prefill_reader is not None:
-            prefill_reader.close()
             self.prefill_reader = None
+            try:
+                prefill_reader.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         reader = getattr(self, "reader", None)
         if reader is not None:
-            reader.close()
             self.reader = None
+            try:
+                reader.close()
+            except BaseException as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error

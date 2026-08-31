@@ -6,7 +6,9 @@
 
 #define PLE_FETCHER_WAIT_NS 100000000L
 #define PLE_FETCHER_MAX_WAITS 50U
-#define PLE_FETCHER_DESTROY_MAX_WAITS 5000U
+#define PLE_FETCHER_DESTROY_BUSY_WAITS 5000U
+/* The destroy drain waits at most 50 times for 100 ms, about five seconds. */
+#define PLE_FETCHER_DESTROY_DRAIN_WAITS 50U
 
 static inline int ple_fetcher_retry_after_timeout(unsigned* timeouts) {
   ++*timeouts;

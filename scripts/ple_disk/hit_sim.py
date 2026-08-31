@@ -68,7 +68,8 @@ def count_rows(
         row_ids = hash_token_stream_numpy(combined, metadata)[history.size :]
         for head, count_array in enumerate(counts):
             local = row_ids[:, head] - metadata.offsets[head]
-            np.add.at(count_array, local, 1)
+            increments = np.bincount(local, minlength=count_array.size)
+            count_array += increments.astype(np.uint64, copy=False)
         history = combined[-(metadata.ngram_size - 1) :].copy()
         chunk_index = start // chunk_tokens
         if chunk_index == 0 or end == tokens.size or chunk_index % 100 == 0:
@@ -85,20 +86,13 @@ def select_rows(
     capacity = min(capacity, nonzero_rows)
     if capacity == 0:
         return np.empty(0, dtype=np.uint32), np.empty(0, dtype=np.uint64)
-    max_frequency = max(int(array.max()) for array in counts)
-    histogram = np.zeros(max_frequency + 1, dtype=np.int64)
-    for array in counts:
-        local = np.bincount(
-            np.asarray(array, dtype=np.int64), minlength=max_frequency + 1
-        )
-        histogram[: local.size] += local
-    selected_above = 0
-    threshold = 0
-    for frequency in range(max_frequency, 0, -1):
-        if selected_above + int(histogram[frequency]) >= capacity:
-            threshold = frequency
-            break
-        selected_above += int(histogram[frequency])
+    nonzero_frequencies = [
+        np.asarray(array[np.flatnonzero(array)], dtype=np.uint64) for array in counts
+    ]
+    combined = np.concatenate(nonzero_frequencies)
+    threshold_index = combined.size - capacity
+    threshold = int(np.partition(combined, threshold_index)[threshold_index])
+    selected_above = sum(int(np.count_nonzero(array > threshold)) for array in counts)
     tie_remaining = capacity - selected_above
     ids = []
     frequencies = []

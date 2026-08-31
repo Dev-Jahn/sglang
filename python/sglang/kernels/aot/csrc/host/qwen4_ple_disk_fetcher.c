@@ -240,7 +240,7 @@ static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned c
     do {
       rc = submit_ring(f, count - submitted);
     } while (rc < 0 && errno == EINTR);
-    if (rc < 0) break;
+    if (rc <= 0) break;
     submitted += (unsigned)rc;
     f->outstanding += (unsigned)rc;
   }
@@ -370,7 +370,7 @@ int ple_fetcher_destroy(void* opaque) {
     /* Concurrent destroy violates the public contract; keep this result for
      * diagnostics if a caller bypasses the wrapper serialization. */
     if (expected_state == 2) return -EBUSY;
-    if (++waits >= PLE_FETCHER_DESTROY_MAX_WAITS) return -EBUSY;
+    if (++waits >= PLE_FETCHER_DESTROY_BUSY_WAITS) return -EBUSY;
     expected_state = 0;
     const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
     nanosleep(&pause, NULL);
@@ -379,7 +379,7 @@ int ple_fetcher_destroy(void* opaque) {
     unsigned drain_count = f->outstanding;
     unsigned drain_waits = 0;
     int ignored_result = 0;
-    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_MAX_WAITS) < 0) {
+    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_DRAIN_WAITS) < 0) {
       /* The ring and all mappings stay allocated because the kernel may still
        * complete a request into the registered staging buffer. */
       __atomic_store_n(&f->terminal_leaked, 1, __ATOMIC_RELEASE);

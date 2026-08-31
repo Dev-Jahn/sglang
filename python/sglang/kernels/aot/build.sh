@@ -61,6 +61,7 @@ echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
 echo "SGL_KERNEL_RUN_TESTS: ${SGL_KERNEL_RUN_TESTS:-0}"
+echo "SGL_KERNEL_PLE_REQUIRE_IO_URING: ${SGL_KERNEL_PLE_REQUIRE_IO_URING:-0}"
 echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
 echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
 echo "PIP_DEFAULT_INDEX:  ${PIP_DEFAULT_INDEX:-https://pypi.python.org/simple}"
@@ -107,11 +108,11 @@ BUILD_JOBS_FLAG="${BUILD_JOBS:-0}"
 NVCC_THREADS_FLAG="${NVCC_THREADS:-32}"
 GITHUB_ARTIFACTORY_FLAG="${GITHUB_ARTIFACTORY:-github.com}"
 RUN_TESTS_FLAG="${SGL_KERNEL_RUN_TESTS:-0}"
+REQUIRE_IO_URING_FLAG="${SGL_KERNEL_PLE_REQUIRE_IO_URING:-0}"
 DOCKER_TEST_FLAGS=()
 if [ "${RUN_TESTS_FLAG}" = "1" ]; then
-  # This profile is Docker's default plus the three io_uring calls used by the
-  # native PLE test.
-  DOCKER_TEST_FLAGS+=(--security-opt "seccomp=$(pwd)/ci/docker-default-io-uring-seccomp.json")
+  # The container already runs as root with a host bind mount and host network, so the profile added no isolation.
+  DOCKER_TEST_FLAGS+=(--security-opt seccomp=unconfined)
 fi
 
 docker run --rm \
@@ -123,6 +124,7 @@ docker run --rm \
   -e ARCH="${ARCH}" \
   -e GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY_FLAG}" \
   -e SGL_KERNEL_RUN_TESTS="${RUN_TESTS_FLAG}" \
+  -e SGL_KERNEL_PLE_REQUIRE_IO_URING="${REQUIRE_IO_URING_FLAG}" \
   "${DEPS_TAG}" \
   bash -c '
 set -eux

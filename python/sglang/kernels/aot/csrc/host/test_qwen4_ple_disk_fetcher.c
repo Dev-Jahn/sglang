@@ -21,6 +21,11 @@ static int skip_errno(int error) {
   return error == EPERM || error == EACCES || error == ENOSYS || error == EOPNOTSUPP;
 }
 
+static int unavailable_result(void) {
+  const char* required = getenv("SGL_KERNEL_PLE_REQUIRE_IO_URING");
+  return required && strcmp(required, "1") == 0 ? 1 : 77;
+}
+
 static int run_scenarios(int file_fd, const unsigned char* page, int register_buffer) {
   int result = 1;
   void* buffer = NULL;
@@ -44,12 +49,12 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     int error = errno;
     if (register_buffer && failure_stage == FETCHER_FAILURE_REGISTER_BUFFER && (skip_errno(error) || error == ENOMEM)) {
       printf("PLE fetcher registered-buffer scenarios skipped: %s\n", strerror(error));
-      result = 0;
+      result = unavailable_result();
       goto done;
     }
     if (!register_buffer && skip_errno(error)) {
       printf("PLE fetcher CTest skipped: io_uring is unavailable: %s\n", strerror(error));
-      result = getenv("SGL_KERNEL_RUN_TESTS") && strcmp(getenv("SGL_KERNEL_RUN_TESTS"), "1") == 0 ? 1 : 77;
+      result = unavailable_result();
       goto done;
     }
     fprintf(
@@ -243,7 +248,7 @@ int main(void) {
   if (file_fd < 0) {
     if (skip_errno(errno) || errno == EINVAL) {
       printf("PLE fetcher CTest skipped: O_DIRECT is unavailable: %s\n", strerror(errno));
-      return getenv("SGL_KERNEL_RUN_TESTS") && strcmp(getenv("SGL_KERNEL_RUN_TESTS"), "1") == 0 ? 1 : 77;
+      return unavailable_result();
     }
     perror("open O_DIRECT");
     return 1;

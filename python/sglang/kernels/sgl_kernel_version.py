@@ -1,1 +1,0 @@
-SGL_KERNEL_VERSION = "0.4.6.post2"

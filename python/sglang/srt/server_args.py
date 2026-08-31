@@ -1891,10 +1891,14 @@ class ServerArgs:
         NS("exec.graph"),
     ] = None
     disable_prefill_cuda_graph: A[
-        bool,
+        Optional[bool],
         "Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
         NS("exec.graph"),
-    ] = False
+    ] = None
+    # Preserve whether False came from the user after the public field is resolved.
+    _disable_prefill_cuda_graph_explicitly_set: A[
+        Optional[bool], Arg(no_cli=True), NS("exec.graph")
+    ] = None
     disable_decode_cuda_graph: A[
         bool,
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
@@ -3838,7 +3842,7 @@ class ServerArgs:
         self._handle_offload_compatibility(resolved=True)
 
     def _validate_ple_disk_args(self):
-        from sglang.srt.models.qwen4_ple_disk import validate_max_read_pages
+        from sglang.srt.utils.ple_disk import validate_max_read_pages
 
         if self.ple_disk_hot_cache_gb < 0:
             raise ValueError("--ple-disk-hot-cache-gb must be non-negative")
@@ -3854,10 +3858,29 @@ class ServerArgs:
             raise ValueError("--ple-disk-stats-log-interval must be non-negative")
 
     def _handle_offload_compatibility(self, *, resolved=False):
+        if not resolved:
+            if (
+                getattr(self, "_disable_prefill_cuda_graph_explicitly_set", None)
+                is None
+            ):
+                self._disable_prefill_cuda_graph_explicitly_set = (
+                    getattr(self, "disable_prefill_cuda_graph", None) is not None
+                )
+            if getattr(self, "disable_prefill_cuda_graph", None) is None:
+                self.disable_prefill_cuda_graph = False
         self._validate_ple_disk_args()
         storage = self.ple_storage
         changed_disk_options = []
         if storage == "disk":
+            if self.pp_size > 1:
+                raise ValueError(
+                    "--ple-storage disk does not support pipeline parallelism "
+                    "(--pp-size > 1)"
+                )
+            if self.dllm_algorithm is not None:
+                raise ValueError(
+                    "--ple-storage disk does not support dLLM (--dllm-algorithm)"
+                )
             if not self.ple_disk_dir:
                 raise ValueError("--ple-storage disk requires --ple-disk-dir")
             image_root = Path(self.ple_disk_dir)
@@ -4599,7 +4622,10 @@ class ServerArgs:
                 "disabled and --disable-prefill-cuda-graph"
             )
             self.cuda_graph_backend_prefill = Backend.DISABLED
-            if not self.disable_prefill_cuda_graph:
+            if (
+                self._disable_prefill_cuda_graph_explicitly_set
+                and not self.disable_prefill_cuda_graph
+            ):
                 logger.warning(
                     "--ple-storage disk overrides disable_prefill_cuda_graph=False "
                     "because disk prefill I/O cannot run inside prefill CUDA graphs"

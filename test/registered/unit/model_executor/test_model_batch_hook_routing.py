@@ -13,6 +13,8 @@
 # ==============================================================================
 """Tests for model batch hooks at tensor-parallel worker entry points."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -200,15 +202,61 @@ def test_model_batch_hook_runs_once_for_a_prepared_forward_batch():
     assert events == [(batch, forward_batch)]
 
 
-def test_model_batch_hook_entry_point_enumeration():
-    entries = {
-        "embedding",
-        "scheduled generation",
-        "prebuilt generation",
-        "dLLM generation",
-        "split prefill",
+def test_model_runner_forward_sites_prepare_the_model_batch():
+    root = Path(__file__).resolve().parents[4] / "python/sglang/srt"
+    allowlist = {
+        (
+            "managers/scheduler_pp_mixin.py",
+            "profile_and_init_predictor",
+        ): "pipeline parallelism is rejected with PLE disk storage",
+        (
+            "dllm/algorithm/base.py",
+            "_run_sync",
+        ): "dLLM is rejected with PLE disk storage",
+        (
+            "dllm/algorithm/base.py",
+            "_run_fdfo",
+        ): "dLLM is rejected with PLE disk storage",
     }
-    assert len(entries) == 5
+    paths = list((root / "managers").rglob("*.py")) + [root / "dllm/algorithm/base.py"]
+    seen_allowlist = set()
+    missing_prepare = []
+
+    def is_runner_call(node, method):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return False
+        if node.func.attr != method:
+            return False
+        owner = node.func.value
+        return (isinstance(owner, ast.Name) and owner.id == "model_runner") or (
+            isinstance(owner, ast.Attribute) and owner.attr == "model_runner"
+        )
+
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+            prepares = [
+                node.lineno
+                for node in calls
+                if is_runner_call(node, "prepare_model_batch")
+            ]
+            for call in calls:
+                if not is_runner_call(call, "forward"):
+                    continue
+                key = (relative, function.name)
+                if key in allowlist:
+                    seen_allowlist.add(key)
+                elif not any(line < call.lineno for line in prepares):
+                    missing_prepare.append(f"{relative}:{call.lineno}")
+
+    assert seen_allowlist == set(allowlist)
+    assert missing_prepare == []
 
 
 if __name__ == "__main__":

@@ -74,6 +74,30 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+CHECKPOINT_SOURCE_TENSOR_ATTR = "_sglang_checkpoint_source"
+
+
+def _checkpoint_source_identity(path: str) -> dict:
+    stat = os.stat(path)
+    return {
+        "file": os.path.basename(path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _set_checkpoint_source(tensor: torch.Tensor, source: dict) -> torch.Tensor:
+    setattr(tensor, CHECKPOINT_SOURCE_TENSOR_ATTR, source)
+    return tensor
+
+
+def _safetensors_sources_by_key(paths: List[str]) -> Dict[str, dict]:
+    sources = {}
+    for path in paths:
+        source = _checkpoint_source_identity(path)
+        with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+            sources.update((name, source) for name in handle.keys())
+    return sources
 
 
 # Matches routed-expert weight keys in both HF-style layouts
@@ -1112,15 +1136,16 @@ def safetensors_weights_iterator(
         bar_format=BAR_FORMAT,
         position=tqdm._get_free_pos(),
     ):
+        source = _checkpoint_source_identity(st_file)
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
-                    yield name, result[name]
+                    yield name, _set_checkpoint_source(result[name], source)
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    yield name, _set_checkpoint_source(f.get_tensor(name), source)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
 
@@ -1166,6 +1191,7 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
+        sources = _safetensors_sources_by_key(f_list)
         loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
@@ -1175,7 +1201,7 @@ def fastsafetensors_weights_iterator(
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
                     t = fb.get_tensor(k)
-                    yield k, t
+                    yield k, _set_checkpoint_source(t, sources[k])
             finally:
                 pass
         finally:
@@ -1222,8 +1248,9 @@ def multi_thread_safetensors_weights_iterator(
 
         for future in futures_iter:
             st_file, state_dict = future.result()
+            source = _checkpoint_source_identity(st_file)
             for name, param in state_dict.items():
-                yield name, param
+                yield name, _set_checkpoint_source(param, source)
             del state_dict
             if drop_cache_after_load:
                 _drop_file_cache_after_load(st_file)
@@ -1282,6 +1309,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 st_file, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
+                source = _checkpoint_source_identity(st_file)
 
                 # Replenish: submit the next file to keep the buffer full.
                 next_file = next(file_iter, None)
@@ -1289,7 +1317,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     pending.append((next_file, executor.submit(_load_file, next_file)))
 
                 for name in sorted(state_dict.keys()):
-                    yield name, state_dict[name]
+                    yield name, _set_checkpoint_source(state_dict[name], source)
                 del state_dict
                 if drop_cache_after_load:
                     # DONTNEED reduces page-cache pressure after copying weights,
@@ -1589,6 +1617,7 @@ def runai_safetensors_weights_iterator(
     )
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
+    sources = _safetensors_sources_by_key(hf_weights_files)
     with SafetensorsStreamer() as streamer:
 
         streamer.stream_files(
@@ -1612,7 +1641,7 @@ def runai_safetensors_weights_iterator(
 
         for name, tensor in tensor_iter:
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
-            yield name, tensor
+            yield name, _set_checkpoint_source(tensor, sources[name])
 
 
 def set_runai_streamer_env(load_config: LoadConfig):

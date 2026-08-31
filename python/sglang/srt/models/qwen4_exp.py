@@ -275,6 +275,7 @@ def _prepare_ple_batch(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
         if mask_invalid_tokens and out_cache_loc is not None:
+            # BaseTokenToKVPoolAllocator reserves slot 0 for padding.
             valid_tokens = valid_tokens & out_cache_loc[:processed_tokens].ne(0)
     else:
         valid_tokens = token_offsets < lengths.index_select(0, req_indices)
@@ -283,6 +284,7 @@ def _prepare_ple_batch(
             and mode.is_target_verify()
             and out_cache_loc is not None
         ):
+            # BaseTokenToKVPoolAllocator reserves slot 0 for padding.
             valid_tokens = valid_tokens & out_cache_loc[:processed_tokens].ne(0)
 
     req_pool_indices = (
@@ -1447,38 +1449,52 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         return output
 
     def close(self) -> None:
+        first_error = None
         future = getattr(self, "_prefill_submit_future", None)
         if future is not None:
+            self._prefill_submit_future = None
             try:
                 future.result()
-            except BaseException:
+            except BaseException as exc:
+                first_error = exc
                 logger.warning(
                     "PLE prefill submission failed during shutdown", exc_info=True
                 )
-            self._prefill_submit_future = None
         future = getattr(self, "_future", None)
         if future is not None:
+            self._future = None
             try:
                 future.result()
-            except BaseException:
+            except BaseException as exc:
+                first_error = first_error or exc
                 logger.warning("PLE disk fetch failed during shutdown", exc_info=True)
-            self._future = None
         fetcher = getattr(self, "_fetcher", None)
         if fetcher is not None:
-            fetcher.close()
             self._fetcher = None
+            try:
+                fetcher.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         builder = getattr(self, "_image_builder", None)
         if builder is not None:
-            builder.close()
             self._image_builder = None
+            try:
+                builder.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         executor = getattr(self, "_executor", None)
         if executor is not None:
-            executor.shutdown(wait=True)
             self._executor = None
+            try:
+                executor.shutdown(wait=True)
+            except BaseException as exc:
+                first_error = first_error or exc
         self._transfer_buffers.clear()
         self._active_transfer_device = None
         self._prefill_host_ids = None
         self._active_graph_generation = None
+        if first_error is not None:
+            raise first_error
 
     def reset_graph_step(self) -> None:
         self._reset_pending_fetch("PLE disk graph fetch failed")

@@ -45,6 +45,23 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_ple_disk_rejects_pipeline_parallelism_and_dllm(self):
+        with tempfile.TemporaryDirectory() as disk_dir:
+            for incompatible in (
+                {"pp_size": 2},
+                {"dllm_algorithm": "LowConfidence"},
+            ):
+                with (
+                    self.subTest(incompatible=incompatible),
+                    self.assertRaisesRegex(ValueError, "pipeline parallelism|dLLM"),
+                ):
+                    ServerArgs(
+                        model_path="dummy",
+                        ple_storage="disk",
+                        ple_disk_dir=disk_dir,
+                        **incompatible,
+                    )
+
     def test_ple_pinned_storage_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -96,6 +113,29 @@ class TestPrepareServerArgs(CustomTestCase):
                 args._handle_cuda_graph_config()
 
             self.assertIn("prefill CUDA graphs", "\n".join(logs.output))
+
+    def test_ple_disk_omitted_prefill_disable_has_no_override_warning(self):
+        with tempfile.TemporaryDirectory() as disk_dir:
+            args = ServerArgs(
+                model_path="dummy",
+                ple_storage="disk",
+                ple_disk_dir=disk_dir,
+            )
+            args.cuda_graph_config = SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED)
+            )
+            with (
+                patch.object(ServerArgs, "_parse_cuda_graph_config"),
+                patch.object(ServerArgs, "_apply_cuda_graph_compatibility"),
+                patch.object(ServerArgs, "_apply_deepep_adjustments"),
+                patch.object(ServerArgs, "_apply_cuda_graph_disaggregation_roles"),
+                patch.object(ServerArgs, "_validate_cuda_graph_config"),
+                patch("sglang.srt.arg_groups.kimi_k3_hook.disable_kimi_k3_symm_mem"),
+                patch.object(server_args_module.logger, "warning") as warning,
+            ):
+                args._handle_cuda_graph_config()
+
+            warning.assert_not_called()
 
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
