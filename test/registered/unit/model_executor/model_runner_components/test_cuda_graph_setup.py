@@ -105,7 +105,7 @@ def test_cuda_graph_prewarm_is_required_for_ple_offload(monkeypatch, ple_storage
         )
 
 
-def test_cuda_graph_prewarm_does_not_reach_non_sm120_models(monkeypatch):
+def test_cuda_graph_prewarm_reaches_non_sm120_models(monkeypatch):
     prewarm = MagicMock(name="prewarm_cuda_graphs")
     runner = SimpleNamespace(
         device="cuda",
@@ -124,10 +124,10 @@ def test_cuda_graph_prewarm_does_not_reach_non_sm120_models(monkeypatch):
 
     cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
 
-    prewarm.assert_not_called()
+    prewarm.assert_called_once_with(runner, capture_decode_cuda_graph=True)
 
 
-def test_cuda_graph_prewarm_does_not_reach_sm121_models(monkeypatch):
+def test_cuda_graph_prewarm_reaches_sm121_models(monkeypatch):
     prewarm = MagicMock(name="prewarm_cuda_graphs")
     runner = SimpleNamespace(
         device="cuda",
@@ -147,7 +147,7 @@ def test_cuda_graph_prewarm_does_not_reach_sm121_models(monkeypatch):
 
     cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
 
-    prewarm.assert_not_called()
+    prewarm.assert_called_once_with(runner, capture_decode_cuda_graph=True)
 
 
 def test_capture_cuda_graphs_prewarms_before_prefill_capture(monkeypatch):

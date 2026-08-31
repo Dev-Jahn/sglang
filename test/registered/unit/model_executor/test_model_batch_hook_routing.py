@@ -16,8 +16,16 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
+
 from sglang.srt.managers import tp_worker
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpDiskEmbedding,
+    Qwen4ExpModel,
+    Qwen4ExpPLELayer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -115,6 +123,29 @@ def test_prebuilt_generation_entry_prepares_the_model_batch(routed_batch):
 
     assert ("prepare", None, forward_batch) in events
     assert result == (forward_batch, None)
+
+
+def test_prebuilt_extend_entry_skips_disk_lookahead_without_schedule_batch():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._prefill_buffer_tokens = 8
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+    layer._future_lookup_contexts = object()
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 2
+    model._ple_layers = lambda: iter([layer])
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.arange(3),
+    )
+
+    Qwen4ExpModel.prepare_model_batch(model, None, forward_batch)
+
+    assert layer._future_lookup_contexts is None
 
 
 def test_dllm_entry_prepares_the_model_batch(routed_batch):

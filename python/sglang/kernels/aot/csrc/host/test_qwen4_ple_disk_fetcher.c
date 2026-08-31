@@ -10,13 +10,168 @@
 #include "qwen4_ple_disk_fetcher.h"
 
 #define PAGE_BYTES 4096
+#define FETCHER_FAILURE_REGISTER_BUFFER 2
 
 #ifndef EUCLEAN
 #define EUCLEAN 117
 #endif
 
 static int skip_errno(int error) {
-  return error == EPERM || error == EACCES || error == ENOSYS || error == EOPNOTSUPP || error == ENOMEM;
+  return error == EPERM || error == EACCES || error == ENOSYS || error == EOPNOTSUPP;
+}
+
+static int run_scenarios(int file_fd, const unsigned char* page, int register_buffer) {
+  int result = 1;
+  void* buffer = NULL;
+  void* fetcher = NULL;
+  int allocation_error = posix_memalign(&buffer, PAGE_BYTES, 2 * PAGE_BYTES);
+  if (allocation_error) {
+    fprintf(stderr, "posix_memalign failed: %s\n", strerror(allocation_error));
+    return 1;
+  }
+
+  int failure_stage = 0;
+  fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
+  if (!fetcher) {
+    int error = errno;
+    if (register_buffer && failure_stage == FETCHER_FAILURE_REGISTER_BUFFER && (skip_errno(error) || error == ENOMEM)) {
+      printf("PLE fetcher registered-buffer scenarios skipped: %s\n", strerror(error));
+      result = 0;
+      goto done;
+    }
+    if (!register_buffer && skip_errno(error)) {
+      printf("PLE fetcher CTest skipped: io_uring is unavailable: %s\n", strerror(error));
+      result = 77;
+      goto done;
+    }
+    fprintf(
+        stderr,
+        "ple_fetcher_create(register_buffer=%d) failed at stage %d: %s\n",
+        register_buffer,
+        failure_stage,
+        strerror(error));
+    goto done;
+  }
+
+  uint64_t offsets[2] = {PAGE_BYTES, 2 * PAGE_BYTES};
+  int rc = ple_fetcher_read(fetcher, offsets, 2, buffer, PAGE_BYTES);
+  if (rc != -EFAULT) {
+    fprintf(stderr, "short buffer returned %d instead of %d\n", rc, -EFAULT);
+    goto done;
+  }
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
+    fprintf(stderr, "read check failed: %d\n", rc);
+    goto done;
+  }
+
+  uint64_t invalid_offset = 3 * PAGE_BYTES;
+  rc = ple_fetcher_read(fetcher, &invalid_offset, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -EIO) {
+    fprintf(stderr, "out-of-range read returned %d instead of %d\n", rc, -EIO);
+    goto done;
+  }
+  unsigned failed_index = 99;
+  int io_result = 99;
+  rc = ple_fetcher_last_error(fetcher, &failed_index, &io_result);
+  if (rc != 1 || failed_index != 0 || io_result != 0) {
+    fprintf(stderr, "last_error returned rc=%d index=%u result=%d\n", rc, failed_index, io_result);
+    goto done;
+  }
+
+  rc = ple_fetcher_read(fetcher, NULL, 0, buffer, 2 * PAGE_BYTES);
+  if (rc != 0) {
+    fprintf(stderr, "empty read returned %d\n", rc);
+    goto done;
+  }
+
+  ple_fetcher_test_limit_submissions(1);
+  rc = ple_fetcher_read(fetcher, offsets, 2, buffer, 2 * PAGE_BYTES);
+  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0 || ple_fetcher_test_partial_submissions() == 0) {
+    fprintf(stderr, "partial submission check failed: rc=%d partial=%u\n", rc, ple_fetcher_test_partial_submissions());
+    goto done;
+  }
+  ple_fetcher_test_limit_submissions(0);
+
+  ple_fetcher_test_successful_empty_wakes(3);
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
+    fprintf(stderr, "successful wake accounting check failed: %d\n", rc);
+    goto done;
+  }
+
+  /* The last allowed wake may make a completion visible. Reap it before
+   * deciding that the no-progress budget is exhausted. */
+  ple_fetcher_test_completion_on_last_wake(1);
+  ple_fetcher_test_successful_empty_wakes(PLE_FETCHER_MAX_WAITS);
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
+    fprintf(stderr, "completion on final wake check failed: %d\n", rc);
+    goto done;
+  }
+
+  unsigned timeouts = 0;
+  for (unsigned index = 1; index < PLE_FETCHER_MAX_WAITS; ++index) {
+    if (!ple_fetcher_retry_after_timeout(&timeouts)) {
+      fprintf(stderr, "timeout budget ended at %u\n", index);
+      goto done;
+    }
+  }
+  if (ple_fetcher_retry_after_timeout(&timeouts) || (uint64_t)timeouts * PLE_FETCHER_WAIT_NS != 5000000000ULL) {
+    fprintf(stderr, "timeout budget accounting failed: timeouts=%u\n", timeouts);
+    goto done;
+  }
+
+  ple_fetcher_test_stall_wakes(PLE_FETCHER_MAX_WAITS + 2);
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -ETIMEDOUT) {
+    fprintf(stderr, "read-timeout quiesce returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
+    fprintf(stderr, "read after timeout quiesce failed: %d\n", rc);
+    goto done;
+  }
+
+  ple_fetcher_test_stall_completions(1);
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -EUCLEAN) {
+    fprintf(stderr, "poison setup returned %d instead of %d\n", rc, -EUCLEAN);
+    goto done;
+  }
+  ple_fetcher_test_stall_completions(0);
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -EUCLEAN) {
+    fprintf(stderr, "poisoned fetcher returned %d instead of %d\n", rc, -EUCLEAN);
+    goto done;
+  }
+  if (!ple_fetcher_test_ring_open(fetcher)) {
+    fprintf(stderr, "poisoned fetcher closed its ring before destroy\n");
+    goto done;
+  }
+  rc = ple_fetcher_read(fetcher, NULL, 0, buffer, 2 * PAGE_BYTES);
+  if (rc != -EUCLEAN) {
+    fprintf(stderr, "poisoned empty read returned %d instead of %d\n", rc, -EUCLEAN);
+    goto done;
+  }
+
+  result = 0;
+done:
+  ple_fetcher_test_limit_submissions(0);
+  ple_fetcher_test_stall_completions(0);
+  ple_fetcher_test_stall_wakes(0);
+  ple_fetcher_test_successful_empty_wakes(0);
+  ple_fetcher_test_completion_on_last_wake(0);
+  if (fetcher) {
+    int destroy_rc = ple_fetcher_destroy(fetcher);
+    if (destroy_rc && result == 0) {
+      fprintf(stderr, "ple_fetcher_destroy returned %d\n", destroy_rc);
+      result = 1;
+    }
+  }
+  free(buffer);
+  return result;
 }
 
 int main(void) {
@@ -54,159 +209,8 @@ int main(void) {
     return 1;
   }
 
-  void* buffer = NULL;
-  if (posix_memalign(&buffer, PAGE_BYTES, 2 * PAGE_BYTES) != 0) {
-    close(file_fd);
-    return 1;
-  }
-  int failure_stage = 0;
-  void* fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, 0, &failure_stage);
-  if (!fetcher) {
-    int error = errno;
-    free(buffer);
-    close(file_fd);
-    if (skip_errno(error)) {
-      printf("PLE fetcher CTest skipped: io_uring is unavailable: %s\n", strerror(error));
-      return 77;
-    }
-    fprintf(stderr, "ple_fetcher_create failed at stage %d: %s\n", failure_stage, strerror(error));
-    return 1;
-  }
-
-  uint64_t offsets[2] = {PAGE_BYTES, 2 * PAGE_BYTES};
-  int rc = ple_fetcher_read(fetcher, offsets, 2, buffer, PAGE_BYTES);
-  if (rc != -EFAULT) {
-    fprintf(stderr, "short buffer returned %d instead of %d\n", rc, -EFAULT);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
-    fprintf(stderr, "read check failed: %d\n", rc);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  rc = ple_fetcher_read(fetcher, NULL, 0, buffer, 2 * PAGE_BYTES);
-  if (rc != 0) {
-    fprintf(stderr, "empty read returned %d\n", rc);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  ple_fetcher_test_limit_submissions(1);
-  rc = ple_fetcher_read(fetcher, offsets, 2, buffer, 2 * PAGE_BYTES);
-  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0 || ple_fetcher_test_partial_submissions() == 0) {
-    fprintf(stderr, "partial submission check failed: rc=%d partial=%u\n", rc, ple_fetcher_test_partial_submissions());
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-  ple_fetcher_test_limit_submissions(0);
-
-  ple_fetcher_test_successful_empty_wakes(3);
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
-    fprintf(stderr, "successful wake accounting check failed: %d\n", rc);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  /* The last allowed wake may make a completion visible. Reap it before
-   * deciding that the no-progress budget is exhausted. */
-  ple_fetcher_test_completion_on_last_wake(1);
-  ple_fetcher_test_successful_empty_wakes(PLE_FETCHER_MAX_WAITS);
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
-    fprintf(stderr, "completion on final wake check failed: %d\n", rc);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  unsigned timeouts = 0;
-  for (unsigned index = 1; index < PLE_FETCHER_MAX_WAITS; ++index) {
-    if (!ple_fetcher_retry_after_timeout(&timeouts)) {
-      fprintf(stderr, "timeout budget ended at %u\n", index);
-      ple_fetcher_destroy(fetcher);
-      free(buffer);
-      close(file_fd);
-      return 1;
-    }
-  }
-  if (ple_fetcher_retry_after_timeout(&timeouts) || (uint64_t)timeouts * PLE_FETCHER_WAIT_NS != 5000000000ULL) {
-    fprintf(stderr, "timeout budget accounting failed: timeouts=%u\n", timeouts);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  ple_fetcher_test_stall_wakes(PLE_FETCHER_MAX_WAITS + 2);
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != -ETIMEDOUT) {
-    fprintf(stderr, "read-timeout quiesce returned %d instead of %d\n", rc, -ETIMEDOUT);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
-    fprintf(stderr, "read after timeout quiesce failed: %d\n", rc);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  ple_fetcher_test_stall_completions(1);
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != -EUCLEAN) {
-    fprintf(stderr, "poison setup returned %d instead of %d\n", rc, -EUCLEAN);
-    ple_fetcher_test_stall_completions(0);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-  ple_fetcher_test_stall_completions(0);
-  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
-  if (rc != -EUCLEAN) {
-    fprintf(stderr, "poisoned fetcher returned %d instead of %d\n", rc, -EUCLEAN);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-  if (!ple_fetcher_test_ring_open(fetcher)) {
-    fprintf(stderr, "poisoned fetcher closed its ring before destroy\n");
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-  rc = ple_fetcher_read(fetcher, NULL, 0, buffer, 2 * PAGE_BYTES);
-  if (rc != -EUCLEAN) {
-    fprintf(stderr, "poisoned empty read returned %d instead of %d\n", rc, -EUCLEAN);
-    ple_fetcher_destroy(fetcher);
-    free(buffer);
-    close(file_fd);
-    return 1;
-  }
-
-  ple_fetcher_destroy(fetcher);
-  free(buffer);
+  int result = run_scenarios(file_fd, page, 0);
+  if (result == 0) result = run_scenarios(file_fd, page, 1);
   close(file_fd);
-  return 0;
+  return result;
 }

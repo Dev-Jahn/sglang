@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt import server_args as server_args_module
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
@@ -25,6 +26,7 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpModel,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
+    _prepare_ple_batch,
 )
 from sglang.srt.models.qwen4_ple_hash import (
     PLEMetadata,
@@ -74,6 +76,74 @@ def test_gpu_mode_ngram_ids_match_the_pre_disk_stream(monkeypatch, rows):
     disk_ids = module.compute_ngram_ids(batch)
     assert torch.equal(disk_ids[valid_tokens], expected[valid_tokens])
     assert torch.all(disk_ids[~valid_tokens] == -1)
+
+
+@pytest.mark.parametrize("storage", ["gpu", "pinned"])
+def test_non_disk_target_verify_keeps_base_valid_tokens(monkeypatch, storage):
+    pool = SimpleNamespace(
+        ple_window_cache=None,
+        get_mamba_indices=lambda indices: indices,
+    )
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+    forward_batch = SimpleNamespace(
+        tbo_parent_token_range=None,
+        spec_algorithm=None,
+        spec_info=SimpleNamespace(topk=1, draft_token_num=4),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        _original_forward_mode=None,
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        out_cache_loc=torch.tensor([7, 0, 9, 0], dtype=torch.long),
+        req_pool_indices=torch.tensor([1], dtype=torch.long),
+        num_token_non_padded_cpu=4,
+    )
+
+    batch = _prepare_ple_batch(
+        torch.arange(4),
+        forward_batch,
+        ngram_size=None,
+        ngram_eos_token_id=None,
+        mask_invalid_tokens=storage == "disk",
+    )
+
+    assert batch.valid_tokens.tolist() == [True, True, True, False]
+
+
+def test_disk_target_verify_masks_invalid_graph_slots(monkeypatch):
+    pool = SimpleNamespace(
+        ple_window_cache=None,
+        get_mamba_indices=lambda indices: indices,
+    )
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+    forward_batch = SimpleNamespace(
+        tbo_parent_token_range=None,
+        spec_algorithm=None,
+        spec_info=SimpleNamespace(topk=1, draft_token_num=4),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        _original_forward_mode=None,
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        out_cache_loc=torch.tensor([7, 0, 9, 0], dtype=torch.long),
+        req_pool_indices=torch.tensor([1], dtype=torch.long),
+        num_token_non_padded_cpu=4,
+    )
+
+    batch = _prepare_ple_batch(
+        torch.arange(4),
+        forward_batch,
+        ngram_size=None,
+        ngram_eos_token_id=None,
+        mask_invalid_tokens=True,
+    )
+
+    assert batch.valid_tokens.tolist() == [True, False, True, False]
+
+
+def test_checkpoint_ple_offload_embedding_maps_to_storage_with_warning():
+    from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+    for legacy, expected in ((True, "pinned"), (False, "gpu")):
+        with pytest.warns(FutureWarning, match="ple_offload_embedding"):
+            config = Qwen4ExpTextConfig(ple_offload_embedding=legacy)
+        assert config.ple_storage == expected
 
 
 def _fp8_rows(count: int) -> torch.Tensor:
@@ -335,7 +405,7 @@ def test_poisoned_fetcher_error_requires_restart(tmp_path, monkeypatch):
         reader.close()
 
 
-def test_poisoned_reader_retains_staging_until_native_close(
+def test_poisoned_reader_retains_staging_when_native_drain_expires(
     tmp_path, monkeypatch, caplog
 ):
     image = disk.build_test_image(tmp_path, _fp8_rows(25))
@@ -347,26 +417,28 @@ def test_poisoned_reader_retains_staging_until_native_close(
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
     )
-    library.ring_open = True
+    retained = []
+    monkeypatch.setattr(disk, "_RETAINED_POISONED_STAGING", retained)
     reader = disk.DirectPageReader(image, max_pages=1)
+    fd = reader.fd
     staging = weakref.ref(reader._staging_allocation)
-    observed = []
-
-    def destroy(handle):
-        observed.append(library.ring_open and staging() is not None)
-        library.ring_open = False
-        return 0
-
-    library.ple_fetcher_destroy = _FakeFunction(destroy)
+    library.ple_fetcher_destroy = _FakeFunction(lambda handle: -errno.ETIMEDOUT)
     with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="poisoned"):
         reader.read(np.array([0], dtype=np.int64))
+    assert retained == []
+
+    with caplog.at_level("ERROR"), pytest.raises(OSError, match="shutdown failed"):
+        reader.close()
     assert "retained 8191 staging bytes" in caplog.text
+    with pytest.raises(OSError) as exc_info:
+        os.fstat(fd)
+    assert exc_info.value.errno == errno.EBADF
+    assert reader.handle is None
 
     del reader
     gc.collect()
-    assert observed == [True]
-    assert library.ring_open is False
-    assert staging() is None
+    assert staging() is not None
+    assert retained == [staging()]
 
 
 def test_fetcher_error_reports_page_and_short_read_size(tmp_path, monkeypatch):
@@ -511,7 +583,7 @@ def test_max_read_pages_rejects_io_uring_entry_overflow():
 @pytest.mark.parametrize("max_pages", [0, disk.IORING_MAX_ENTRIES + 1])
 def test_direct_reader_rejects_invalid_io_uring_entry_count(tmp_path, max_pages):
     image = disk.build_test_image(tmp_path, _fp8_rows(1))
-    with pytest.raises(ValueError, match="max_pages must be between"):
+    with pytest.raises(ValueError, match="ple-disk-max-read-pages must be between"):
         disk.DirectPageReader(image, max_pages=max_pages)
 
 
@@ -1080,19 +1152,25 @@ def test_graph_lookup_validation_defaults_to_every_replay():
     layer._graph_lookup_validation_due = {4}
     layer._graph_lookup_validation_interval = 1
 
-    assert layer._graph_lookup_validation_required(4)
-    assert all(layer._graph_lookup_validation_required(4) for _ in range(8))
+    assert layer._graph_lookup_validation_required(4, 1)
+    assert all(
+        layer._graph_lookup_validation_required(4, step) for step in range(2, 10)
+    )
+    assert layer._graph_replay_steps == 0
+    assert layer._graph_lookup_validation_due == {4}
 
     layer._graph_lookup_validation_interval = 256
-    layer._graph_replay_steps = 0
     layer._graph_lookup_validation_due = {4}
-    assert layer._graph_lookup_validation_required(4)
-    assert all(not layer._graph_lookup_validation_required(4) for _ in range(254))
-    assert layer._graph_lookup_validation_required(4)
+    assert layer._graph_lookup_validation_required(4, 1)
+    layer._graph_lookup_validation_due.clear()
+    assert all(
+        not layer._graph_lookup_validation_required(4, step) for step in range(2, 256)
+    )
+    assert layer._graph_lookup_validation_required(4, 256)
 
     layer._graph_lookup_validation_interval = 0
     with pytest.raises(ValueError, match="must be positive"):
-        layer._graph_lookup_validation_required(4)
+        layer._graph_lookup_validation_required(4, 257)
 
 
 def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
@@ -1160,6 +1238,7 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
     layer._completed_graph_embedding_validation = deque()
     layer._pending_graph_lookup_validation = (
         2,
+        17,
         torch.tensor([[3], [5]], dtype=torch.long),
     )
     layer._completed_graph_lookup_validation = deque()
@@ -1168,7 +1247,10 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
 
     layer.finish_cuda_graph_replay()
     assert len(layer._completed_graph_lookup_validation) == 1
-    with pytest.raises(RuntimeError, match="lookup IDs differ"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"one step behind.*step 17.*already emitted.*lookup.tokens=2",
+    ):
         layer.validate_cuda_graph_replay()
 
 
@@ -1452,13 +1534,10 @@ def test_direct_reader_closes_fd_when_native_destroy_fails(tmp_path, monkeypatch
     reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: -errno.EBUSY)
     with pytest.raises(OSError, match="shutdown failed"):
         reader.close()
-    os.fstat(fd)
-    assert reader.handle is not None
-    reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: 0)
-    reader.close()
     with pytest.raises(OSError) as exc_info:
         os.fstat(fd)
     assert exc_info.value.errno == errno.EBADF
+    assert reader.handle is None
 
 
 def test_fetcher_constructor_closes_decode_reader_when_prefill_reader_fails(
@@ -2251,6 +2330,28 @@ def test_gather_rejects_missing_fetcher_before_forward_work():
     embedding._fetcher = None
     with pytest.raises(RuntimeError, match="not finalized after weight loading"):
         embedding.gather(torch.tensor([0], dtype=torch.long))
+
+
+def test_disk_gather_uses_the_driver_capture_predicate(monkeypatch):
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._fetcher = object()
+    embedding._future = None
+    embedding.embedding_dim = 4
+    embedding.allocate_output = lambda shape, device: torch.empty(
+        shape, dtype=torch.bfloat16, device=device
+    )
+    embedding._launch_fetch = lambda *args, **kwargs: pytest.fail(
+        "capture launched a disk fetch"
+    )
+    monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(qwen4_exp_module, "_is_stream_capturing", lambda stream: True)
+
+    output = embedding.gather(torch.tensor([0], dtype=torch.long))
+
+    assert output.shape == (1, 4)
 
 
 if __name__ == "__main__":

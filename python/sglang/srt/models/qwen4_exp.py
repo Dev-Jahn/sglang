@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch import nn
+
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import (
     Qwen4ExpConfig,
@@ -77,7 +79,6 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm120_supported, is_sm121, logger
 from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
-from torch import nn
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -118,6 +119,14 @@ def _should_interleave_ple_table() -> bool:
 
 def _set_cuda_device(device: int) -> None:
     torch.cuda.set_device(device)
+
+
+def _is_ple_cuda_graph_capturing() -> bool:
+    if get_is_capture_mode():
+        return True
+    return torch.cuda.is_available() and _is_stream_capturing(
+        torch.cuda.current_stream()
+    )
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -164,6 +173,7 @@ def _prepare_ple_batch(
     ngram_size: Optional[int],
     ngram_eos_token_id: Optional[int],
     replay: Optional[CudaGraphReplayInput] = None,
+    mask_invalid_tokens: bool = False,
 ) -> Optional[_PLEBatch]:
     """Prepare the token layout and the shared N-gram history once per forward."""
 
@@ -272,11 +282,15 @@ def _prepare_ple_batch(
         valid_tokens = torch.ones(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
-        if out_cache_loc is not None:
+        if mask_invalid_tokens and out_cache_loc is not None:
             valid_tokens = valid_tokens & out_cache_loc[:processed_tokens].ne(0)
     else:
         valid_tokens = token_offsets < lengths.index_select(0, req_indices)
-        if mode.is_target_verify() and out_cache_loc is not None:
+        if (
+            mask_invalid_tokens
+            and mode.is_target_verify()
+            and out_cache_loc is not None
+        ):
             valid_tokens = valid_tokens & out_cache_loc[:processed_tokens].ne(0)
 
     req_pool_indices = (
@@ -315,9 +329,8 @@ def _prepare_ple_batch(
     if ngram_size is not None:
         assert ngram_eos_token_id is not None
         if use_decode_fast_path:
-            # For decode, rows and tokens are one-to-one and valid_tokens is all
-            # true.  The view is exactly the tensor the fill/where/index-put chain
-            # would materialize.
+            # Decode rows and tokens are one-to-one. Disk graph padding is
+            # excluded later through valid_tokens and the lookup sentinel.
             padded = tokens.unsqueeze(1)
         else:
             padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
@@ -965,13 +978,15 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             )
         if embedding.weight.dtype != torch.float8_e4m3fn:
             raise TypeError(
-                "--ple-storage disk requires a checkpoint with float8_e4m3fn "
+                "--ple-storage disk requires float8_e4m3fn "
                 "PLE rows; use the FP8 or NVFP4 checkpoint"
             )
         if embedding.num_added_embeddings:
             raise NotImplementedError("PLE disk storage does not support added rows")
         for name in _PLE_EMBEDDING_ATTRIBUTES:
             setattr(self, name, getattr(embedding, name))
+        # This subclass uses the base embedding's loader metadata and overrides
+        # its gather and forward paths, so no quantization method is invoked.
         self.quant_method = None
         self.weight_dtype = embedding.weight.dtype
         self._cuda_device = (
@@ -1263,6 +1278,10 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         stream = torch.cuda.current_stream(input_ids.device)
         host_ids.copy_(input_ids, non_blocking=True)
         ids_ready = torch.cuda.Event()
+        # There is one in-flight fetch per embedding. The worker enqueues the
+        # raw_host copy on this stream before its future completes. A later
+        # launch waits for that future, then records ids_ready on the same
+        # stream, so ids_ready.synchronize() also waits for the prior host read.
         ids_ready.record(stream)
         self._future = self._executor.submit(
             self._fetch_to_device,
@@ -1337,7 +1356,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             )
         if output.dtype != torch.bfloat16 or output.device != input_ids.device:
             raise ValueError("PLE prefetch output must be bfloat16 on the id device")
-        if get_is_capture_mode():
+        if _is_ple_cuda_graph_capturing():
             return output
         self._launch_fetch(input_ids, output, admit_dynamic=admit_dynamic)
         return output
@@ -1639,6 +1658,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self._completed_graph_lookup_validation = deque()
         self._graph_validation_free_slots = deque()
         self._graph_replay_steps = 0
+        self._graph_replay_step_index = None
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         y = norm(x.flatten(-2, -1))
@@ -1775,23 +1795,15 @@ class Qwen4ExpPLELayer(nn.Module):
         self, lookup_tokens: int, device: torch.device
     ) -> torch.Tensor:
         offloaded_embedding = self.ple_embedding.ngram_embedding
-        output = offloaded_embedding.allocate_output(
+        return offloaded_embedding.allocate_output(
             (lookup_tokens, self.ple_embed_dim), device
         )
-        if isinstance(offloaded_embedding, Qwen4ExpDiskEmbedding):
-            output.zero_()
-        return output
 
     def prepare_cuda_graph_prefetch_buffer(
         self, lookup_tokens: int, device: torch.device
     ) -> None:
         """Allocate the shared graph output before any capture begins."""
-        if (
-            not is_sm120_supported()
-            or is_sm121()
-            or self._prefetch_stream is None
-            or lookup_tokens <= 0
-        ):
+        if self._prefetch_stream is None or lookup_tokens <= 0:
             return
         buffer = self._graph_prefetch_buffer
         if buffer is not None:
@@ -1800,10 +1812,13 @@ class Qwen4ExpPLELayer(nn.Module):
                     "PLE graph prefetch buffer is already referenced by captured "
                     f"graphs ({buffer.shape[0]} tokens < {lookup_tokens})"
                 )
+            if isinstance(self.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
+                buffer.zero_()
             return
-        self._graph_prefetch_buffer = self._allocate_prefetch_buffer(
-            lookup_tokens, device
-        )
+        buffer = self._allocate_prefetch_buffer(lookup_tokens, device)
+        if isinstance(self.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
+            buffer.zero_()
+        self._graph_prefetch_buffer = buffer
 
     def reset_cuda_graph_capture_buffers(self) -> None:
         self._graph_prefetch_buffers.clear()
@@ -1823,11 +1838,7 @@ class Qwen4ExpPLELayer(nn.Module):
         that buffer, leaving the graph writing into a freed block. Ask the
         driver as well.
         """
-        if get_is_capture_mode():
-            return True
-        return torch.cuda.is_available() and _is_stream_capturing(
-            torch.cuda.current_stream()
-        )
+        return _is_ple_cuda_graph_capturing()
 
     def _get_prefetch_buffer(
         self, lookup_tokens: int, lookup_ids: torch.Tensor
@@ -1850,11 +1861,7 @@ class Qwen4ExpPLELayer(nn.Module):
         device: Optional[torch.device] = None,
         allocate: bool = False,
     ) -> torch.Tensor:
-        if (
-            is_sm120_supported()
-            and not is_sm121()
-            and self._graph_prefetch_buffer is not None
-        ):
+        if self._graph_prefetch_buffer is not None:
             if not allocate and lookup_tokens not in self._graph_lookup_id_buffers:
                 raise RuntimeError(
                     "PLE graph replay has no captured staging buffer for "
@@ -1868,18 +1875,14 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
             return buffer[:lookup_tokens]
 
-        buffer = self._graph_prefetch_buffers.get(lookup_tokens)
-        if buffer is None and allocate:
-            if device is None:
-                raise ValueError("a device is required for graph buffer allocation")
-            buffer = self._allocate_prefetch_buffer(lookup_tokens, device)
-            self._graph_prefetch_buffers[lookup_tokens] = buffer
-        if buffer is None:
+        if allocate:
             raise RuntimeError(
-                "PLE graph replay has no captured staging buffer for "
-                f"{lookup_tokens} lookup tokens"
+                "PLE graph staging must be preallocated and zeroed before capture"
             )
-        return buffer
+        raise RuntimeError(
+            "PLE graph replay has no captured staging buffer for "
+            f"{lookup_tokens} lookup tokens"
+        )
 
     def start_prefetch(
         self,
@@ -1975,8 +1978,9 @@ class Qwen4ExpPLELayer(nn.Module):
     def set_disk_prefill_contexts(self, contexts: Optional[torch.Tensor]) -> None:
         self._future_lookup_contexts = contexts
 
-    def _graph_lookup_validation_required(self, lookup_tokens: int) -> bool:
-        self._graph_replay_steps += 1
+    def _graph_lookup_validation_required(
+        self, lookup_tokens: int, replay_step: int
+    ) -> bool:
         interval = self._graph_lookup_validation_interval
         if interval <= 0:
             raise ValueError(
@@ -1984,9 +1988,7 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         required = interval == 1 or lookup_tokens in self._graph_lookup_validation_due
         if interval > 1:
-            required = required or self._graph_replay_steps % interval == 0
-        if required:
-            self._graph_lookup_validation_due.discard(lookup_tokens)
+            required = required or replay_step % interval == 0
         return required
 
     def prepare_cuda_graph_replay(
@@ -2014,10 +2016,17 @@ class Qwen4ExpPLELayer(nn.Module):
         lookup_tokens = lookup_ids.shape[0]
         if lookup_tokens == 0:
             return
-        validate_lookup_ids = self._graph_lookup_validation_required(lookup_tokens)
+        self._graph_replay_steps += 1
+        replay_step = self._graph_replay_steps
+        self._graph_replay_step_index = replay_step
+        validate_lookup_ids = self._graph_lookup_validation_required(
+            lookup_tokens, replay_step
+        )
         if validate_lookup_ids:
+            self._graph_lookup_validation_due.discard(lookup_tokens)
             self._pending_graph_lookup_validation = (
                 lookup_tokens,
+                replay_step,
                 lookup_ids.detach().clone(),
             )
         prefetched = self._select_graph_prefetch_buffer(lookup_tokens)
@@ -2035,28 +2044,36 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def finish_cuda_graph_replay(self) -> None:
         if self._pending_graph_embedding_validation is not None:
-            previous_tokens, expected_embeddings = (
+            previous_tokens, replay_step, expected_embeddings = (
                 self._pending_graph_embedding_validation
             )
             actual_embeddings = self._graph_embedding_snapshot_buffers[previous_tokens]
             self._record_graph_validation(
                 "_completed_graph_embedding_validation",
                 previous_tokens,
+                replay_step,
                 actual_embeddings.ne(expected_embeddings),
             )
             self._pending_graph_embedding_validation = None
         if self._pending_graph_lookup_validation is not None:
-            previous_tokens, expected_ids = self._pending_graph_lookup_validation
+            previous_tokens, replay_step, expected_ids = (
+                self._pending_graph_lookup_validation
+            )
             actual_ids = self._graph_lookup_id_buffers[previous_tokens]
             self._record_graph_validation(
                 "_completed_graph_lookup_validation",
                 previous_tokens,
+                replay_step,
                 actual_ids.ne(expected_ids),
             )
             self._pending_graph_lookup_validation = None
 
     def _record_graph_validation(
-        self, completed_attr: str, lookup_tokens: int, mismatch: torch.Tensor
+        self,
+        completed_attr: str,
+        lookup_tokens: int,
+        replay_step: int,
+        mismatch: torch.Tensor,
     ) -> None:
         free_slots = getattr(self, "_graph_validation_free_slots", None)
         if free_slots is None:
@@ -2073,7 +2090,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if completed is None:
             completed = deque()
             setattr(self, completed_attr, completed)
-        completed.append((lookup_tokens, host_result, ready))
+        completed.append((lookup_tokens, replay_step, host_result, ready))
 
     def _consume_graph_validation(
         self, completed_attr: str, error_message: str
@@ -2081,8 +2098,8 @@ class Qwen4ExpPLELayer(nn.Module):
         completed = getattr(self, completed_attr, None)
         if not completed:
             return
-        while completed and completed[0][2].query():
-            _, host_result, ready = completed.popleft()
+        while completed and completed[0][3].query():
+            lookup_tokens, replay_step, host_result, ready = completed.popleft()
             mismatch = bool(host_result.numpy()[0])
             free_slots = getattr(self, "_graph_validation_free_slots", None)
             if free_slots is None:
@@ -2090,7 +2107,11 @@ class Qwen4ExpPLELayer(nn.Module):
                 self._graph_validation_free_slots = free_slots
             free_slots.append((host_result, ready))
             if mismatch:
-                raise RuntimeError(error_message)
+                raise RuntimeError(
+                    f"{error_message}; check is one step behind: output for replay "
+                    f"step {replay_step} was already emitted "
+                    f"(lookup tokens={lookup_tokens})"
+                )
 
     def validate_cuda_graph_replay(self) -> None:
         self._consume_graph_validation(
@@ -2119,6 +2140,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 lookup_tokens = self._graph_replay_lookup_tokens
                 self._pending_graph_embedding_validation = (
                     lookup_tokens,
+                    self._graph_replay_step_index,
                     self._graph_replay_prefetch_buffer.detach().clone(),
                 )
         finally:
@@ -2126,6 +2148,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self._graph_replay_stage_expected = False
             self._graph_replay_lookup_tokens = None
             self._graph_replay_prefetch_buffer = None
+            self._graph_replay_step_index = None
 
     def reset_cuda_graph_replay(self) -> None:
         offloaded_embedding = self.ple_embedding.ngram_embedding
@@ -2137,6 +2160,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self._graph_replay_stage_expected = False
             self._graph_replay_lookup_tokens = None
             self._graph_replay_prefetch_buffer = None
+            self._graph_replay_step_index = None
             self._pending_graph_lookup_validation = None
             self._pending_graph_embedding_validation = None
 
@@ -2636,6 +2660,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     ) -> None:
         super().__init__(config, quant_config, prefix, is_nextn)
         disk_storage = resolve_ple_storage(config, default="gpu") == "disk"
+        self._ple_disk_storage = disk_storage
         self.supports_model_batch_hook = disk_storage
         self.supports_cuda_graph_replay_hook = disk_storage
         self.supports_storage_lifecycle_hook = disk_storage
@@ -2675,6 +2700,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             return
         contexts = None
         if forward_batch.forward_mode.is_extend_without_speculative():
+            if schedule_batch is None:
+                # Prebuilt forwards do not carry request token histories, so
+                # this entry point cannot form prefill look-ahead contexts.
+                for ple in disk_layers:
+                    ple.set_disk_prefill_contexts(None)
+                return
             embedding = disk_layers[0].ple_embedding.ngram_embedding
             remaining = embedding.prefill_buffer_tokens
             ngram_size = self.ple_ngram_size
@@ -2744,6 +2775,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             ngram_size=self.ple_ngram_size,
             ngram_eos_token_id=self.ple_ngram_eos_token_id,
             replay=replay,
+            mask_invalid_tokens=True,
         )
         try:
             for ple in disk_layers:
@@ -2862,8 +2894,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         ]
         for module in ple_layers:
             module.reset_cuda_graph_capture_buffers()
-        if not is_sm120_supported() or is_sm121():
-            return
         graph_config = model_runner.server_args.cuda_graph_config
         max_tokens = 0
         if graph_config.prefill.backend != Backend.DISABLED:
@@ -2895,6 +2925,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 lookup_tokens, torch.device(model_runner.device)
             )
 
+        if not is_sm120_supported() or is_sm121():
+            return
         tic = time.perf_counter()
         self._prewarm_cuda_graph_jit_kernels(
             self,
@@ -2947,6 +2979,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 forward_batch,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                mask_invalid_tokens=getattr(self, "_ple_disk_storage", False),
             )
             if self.has_ple
             else None

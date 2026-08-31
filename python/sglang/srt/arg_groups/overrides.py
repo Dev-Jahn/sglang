@@ -1379,7 +1379,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         and get_quantization_config(hf_config) != "fp8"
     ):
         raise ValueError(
-            "--ple-storage disk requires a checkpoint with float8_e4m3fn PLE "
+            "--ple-storage disk requires float8_e4m3fn PLE "
             "rows; use the FP8 or NVFP4 checkpoint"
         )
     if (

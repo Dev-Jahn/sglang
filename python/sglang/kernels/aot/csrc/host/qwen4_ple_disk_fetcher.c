@@ -21,6 +21,7 @@ struct fetcher {
   int has_last_error;
   unsigned last_error_index;
   int last_error_result;
+  unsigned outstanding;
   unsigned max_pages;
   void* registered_buffer;
   size_t registered_buffer_bytes;
@@ -98,7 +99,7 @@ static long register_ring(int fd, unsigned op, const void* arg, unsigned nr) {
 
 void* ple_fetcher_create(
     int file_fd, void* buffer, size_t buffer_bytes, unsigned max_pages, int register_buffer, int* failure_stage) {
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_NONE;
+  if (failure_stage) *failure_stage = FETCHER_FAILURE_SETUP;
   if (!buffer || !max_pages || buffer_bytes < (size_t)max_pages * 4096 || ((uintptr_t)buffer & 4095)) {
     errno = EINVAL;
     return NULL;
@@ -117,7 +118,6 @@ void* ple_fetcher_create(
   _Static_assert(sizeof(struct io_cqring_offsets) == 40, "invalid io_uring CQ offsets ABI");
   _Static_assert(sizeof(struct io_uring_params) == 120, "invalid io_uring params ABI");
   _Static_assert(sizeof(struct io_uring_getevents_arg) == 24, "invalid io_uring getevents ABI");
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_SETUP;
   f->ring_fd = setup(max_pages, &p);
   if (f->ring_fd < 0) goto fail;
   if (!(p.features & IORING_FEAT_EXT_ARG)) {
@@ -198,6 +198,10 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result) {
     ++completed;
   }
   if (completed) __atomic_store_n(f->cq_head, head, __ATOMIC_RELEASE);
+  if (completed >= f->outstanding)
+    f->outstanding = 0;
+  else
+    f->outstanding -= completed;
   return completed;
 }
 
@@ -236,6 +240,7 @@ static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned c
     } while (rc < 0 && errno == EINTR);
     if (rc < 0) break;
     submitted += (unsigned)rc;
+    f->outstanding += (unsigned)rc;
   }
 
   int ignored_result = 0;
@@ -302,6 +307,7 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
       return finish_read(f, error);
     }
     submitted += (unsigned)rc;
+    f->outstanding += (unsigned)rc;
   }
   unsigned completed = 0;
   int result = 0;
@@ -359,16 +365,24 @@ int ple_fetcher_destroy(void* opaque) {
     const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
     nanosleep(&pause, NULL);
   }
+  if (f->outstanding) {
+    unsigned drain_count = f->outstanding;
+    unsigned drain_waits = 0;
+    int ignored_result = 0;
+    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits) < 0) return -ETIMEDOUT;
+  }
+  int destroy_result = 0;
   if (f->ring_fd >= 0) {
-    register_ring(f->ring_fd, IORING_UNREGISTER_FILES, NULL, 0);
-    if (f->fixed_buffer) register_ring(f->ring_fd, IORING_UNREGISTER_BUFFERS, NULL, 0);
+    if (register_ring(f->ring_fd, IORING_UNREGISTER_FILES, NULL, 0) < 0) destroy_result = -errno;
+    if (f->fixed_buffer && register_ring(f->ring_fd, IORING_UNREGISTER_BUFFERS, NULL, 0) < 0 && !destroy_result)
+      destroy_result = -errno;
   }
   if (f->sqes_ptr) munmap(f->sqes_ptr, f->sqes_size);
   if (!f->single_mmap && f->cq_ptr) munmap(f->cq_ptr, f->cq_size);
   if (f->sq_ptr) munmap(f->sq_ptr, f->sq_size);
   if (f->ring_fd >= 0) close(f->ring_fd);
   free(f);
-  return 0;
+  return destroy_result;
 }
 
 #ifdef PLE_FETCHER_TESTING

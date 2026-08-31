@@ -1,3 +1,9 @@
+"""CUDA disk PLE tests.
+
+CI registration for this suite waits for a GPU runner that permits io_uring.
+Run this file directly on a compatible host.
+"""
+
 import errno
 import os
 import threading
@@ -8,6 +14,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torch import nn
+from torch.profiler import ProfilerActivity, profile
+
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -29,11 +38,6 @@ from sglang.srt.models.qwen4_ple_disk import (
     open_ple_image,
     write_hot_frequency_file,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from torch import nn
-from torch.profiler import ProfilerActivity, profile
-
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA pinned memory is required"
@@ -406,7 +410,7 @@ def test_disk_graph_step_uses_static_output_and_generation_tags(tmp_path, monkey
         embedding.close()
 
 
-def test_disk_graph_greedy_trace_matches_pinned_for_20_prompts(tmp_path, monkeypatch):
+def test_disk_graph_synthetic_token_loop_matches_pinned(tmp_path, monkeypatch):
     rows_per_head = 256
     total_rows = 16 * rows_per_head
     _, rows = _fp8_rows(total_rows)
@@ -817,14 +821,12 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     layer.ple_embedding = ngram
     layer.ple_embed_dim = heads * row_width
     layer._prefetch_stream = torch.cuda.Stream()
-    layer._graph_prefetch_buffer = None
-    layer._graph_prefetch_buffers = {
-        lookup_tokens: torch.zeros(
-            (lookup_tokens, heads * row_width),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-    }
+    layer._graph_prefetch_buffer = torch.zeros(
+        (lookup_tokens, heads * row_width),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    layer._graph_prefetch_buffers = {}
     layer._graph_replay_generation = None
     layer._graph_replay_stage_expected = False
     layer._graph_replay_lookup_tokens = None
@@ -910,6 +912,7 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     assert layer._pending_graph_lookup_validation[0] == lookup_tokens
     layer._pending_graph_embedding_validation = (
         lookup_tokens,
+        layer._graph_replay_step_index,
         replay_rows.clone(),
     )
 
@@ -936,7 +939,7 @@ def test_graph_lookup_validation_records_an_async_host_result():
     layer = qwen4_exp_module.Qwen4ExpPLELayer.__new__(qwen4_exp_module.Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     lookup_ids = torch.arange(32, dtype=torch.long, device="cuda").view(2, 16)
-    layer._pending_graph_lookup_validation = (2, lookup_ids.clone())
+    layer._pending_graph_lookup_validation = (2, 1, lookup_ids.clone())
     layer._completed_graph_lookup_validation = deque()
     layer._pending_graph_embedding_validation = None
     layer._completed_graph_embedding_validation = deque()
@@ -947,7 +950,7 @@ def test_graph_lookup_validation_records_an_async_host_result():
         layer.finish_cuda_graph_replay()
     assert len(layer._completed_graph_lookup_validation) == 1
 
-    layer._completed_graph_lookup_validation[0][2].synchronize()
+    layer._completed_graph_lookup_validation[0][3].synchronize()
     with profile(activities=[ProfilerActivity.CPU]) as consume_profile:
         layer.validate_cuda_graph_replay()
 

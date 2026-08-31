@@ -33,6 +33,8 @@ import numpy as np
 import torch
 from packaging.version import InvalidVersion, Version
 
+from sglang.kernels.sgl_kernel_version import SGL_KERNEL_VERSION
+
 logger = logging.getLogger(__name__)
 
 PAGE_BYTES = 4096
@@ -43,12 +45,25 @@ CRC_MAGIC = b"PLCRC001"
 HOT_MAGIC = b"PLHOT001"
 FORMAT_VERSION = 3
 HOT_FORMAT_VERSION = 1
-REQUIRED_SGL_KERNEL_VERSION = "0.4.6.post2"
+REQUIRED_SGL_KERNEL_VERSION = SGL_KERNEL_VERSION
 CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 FETCHER_FAILURE_SETUP = 1
 FETCHER_FAILURE_REGISTER_BUFFER = 2
 FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
 IORING_MAX_ENTRIES = 32768
+_METADATA_HEADER = struct.Struct("<8sI")
+_METADATA_HEADER_BYTES = _METADATA_HEADER.size
+_RETAINED_POISONED_STAGING = []
+
+
+def validate_max_read_pages(value: int) -> int:
+    value = int(value)
+    if not 1 <= value <= IORING_MAX_ENTRIES:
+        raise ValueError(
+            "--ple-disk-max-read-pages must be between 1 and "
+            f"{IORING_MAX_ENTRIES}, got {value}"
+        )
+    return value
 
 
 def resolve_hot_frequency_file(
@@ -191,7 +206,7 @@ def _logical_block_size(path: str | Path) -> int:
 
 def _write_metadata_page(magic: bytes, metadata: Mapping) -> bytes:
     encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
-    prefix = struct.pack("<8sI", magic, len(encoded))
+    prefix = _METADATA_HEADER.pack(magic, len(encoded))
     if len(prefix) + len(encoded) > PAGE_BYTES:
         raise ValueError("PLE image metadata does not fit in one 4 KiB block")
     return prefix + encoded + bytes(PAGE_BYTES - len(prefix) - len(encoded))
@@ -202,11 +217,13 @@ def _read_metadata_page(path: Path, expected_magic: bytes) -> dict:
         block = handle.read(PAGE_BYTES)
     if len(block) != PAGE_BYTES:
         raise IOError(f"short PLE metadata read from {path}")
-    magic, length = struct.unpack_from("<8sI", block)
-    if magic != expected_magic or length > PAGE_BYTES - 12:
+    magic, length = _METADATA_HEADER.unpack_from(block)
+    if magic != expected_magic or length > PAGE_BYTES - _METADATA_HEADER_BYTES:
         raise ValueError(f"invalid PLE metadata header in {path}")
     try:
-        return json.loads(block[12 : 12 + length])
+        return json.loads(
+            block[_METADATA_HEADER_BYTES : _METADATA_HEADER_BYTES + length]
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid PLE metadata JSON in {path}") from exc
 
@@ -1447,12 +1464,7 @@ class DirectPageReader:
 
     def __init__(self, image: PLEImage, max_pages: int = 4096):
         self.image = image
-        self.max_pages = int(max_pages)
-        if not 1 <= self.max_pages <= IORING_MAX_ENTRIES:
-            raise ValueError(
-                f"max_pages must be between 1 and {IORING_MAX_ENTRIES}, got "
-                f"{self.max_pages}"
-            )
+        self.max_pages = validate_max_read_pages(max_pages)
         self.register_buffer = not pageable_memory_access_uses_host_page_tables()
         staging_bytes = self.max_pages * PAGE_BYTES
         logical_block_size = _logical_block_size(image.path)
@@ -1475,7 +1487,6 @@ class DirectPageReader:
         self.offsets = np.empty(self.max_pages, dtype=np.uint64)
         self._read_lock = threading.Lock()
         self._poisoned = False
-        self._poisoned_staging = None
         if self.staging.data_ptr() & (self.alignment - 1):
             raise RuntimeError("PLE registered staging buffer is not O_DIRECT aligned")
         self.lib = ctypes.CDLL(str(_find_helper_library()), use_errno=True)
@@ -1578,12 +1589,10 @@ class DirectPageReader:
                 if -rc == FETCHER_ERR_POISONED:
                     if not self._poisoned:
                         self._poisoned = True
-                        self._poisoned_staging = self._staging_allocation
                         logger.error(
-                            "PLE disk fetcher retained %d staging bytes after "
-                            "poisoning (max_pages=%d); the allocation will be "
-                            "released when the reader closes",
-                            self._staging_allocation.numel(),
+                            "PLE disk fetcher was poisoned after an I/O drain "
+                            "failure (max_pages=%d); shutdown will drain pending "
+                            "reads before releasing its staging area",
                             self.max_pages,
                         )
                     raise RuntimeError(
@@ -1632,21 +1641,29 @@ class DirectPageReader:
 
     def close(self) -> None:
         with self._read_lock:
+            destroy_error = None
             if getattr(self, "handle", None):
-                rc = self.lib.ple_fetcher_destroy(self.handle)
+                handle = self.handle
+                self.handle = None
+                rc = self.lib.ple_fetcher_destroy(handle)
                 if rc:
-                    raise OSError(
+                    if -rc in (errno.ETIMEDOUT, errno.EBUSY):
+                        _RETAINED_POISONED_STAGING.append(self._staging_allocation)
+                        logger.error(
+                            "PLE disk fetcher retained %d staging bytes for the "
+                            "process lifetime after shutdown could not drain "
+                            "pending reads",
+                            self._staging_allocation.numel(),
+                        )
+                    destroy_error = OSError(
                         -rc,
                         "PLE disk fetcher shutdown failed: " f"{os.strerror(-rc)}",
                     )
-                self.handle = None
-                if self.fd is not None:
-                    os.close(self.fd)
-                    self.fd = None
-                self._poisoned_staging = None
-            elif getattr(self, "fd", None) is not None:
+            if getattr(self, "fd", None) is not None:
                 os.close(self.fd)
                 self.fd = None
+            if destroy_error is not None:
+                raise destroy_error
 
     def __del__(self) -> None:
         try:
@@ -1924,10 +1941,14 @@ class DiskRowFetcher:
     ) -> torch.Tensor:
         if priority not in ("decode", "prefill"):
             raise ValueError(f"invalid PLE fetch priority: {priority}")
-        if priority == "prefill" and self.prefill_reader is None:
-            raise RuntimeError(
-                "PLE prefill priority requires a separate prefill reader"
-            )
+        priority_reader = self.reader
+        if priority == "prefill":
+            with self._prefill_lock:
+                priority_reader = self.prefill_reader
+            if priority_reader is None:
+                raise RuntimeError(
+                    "PLE prefill priority requires a separate prefill reader"
+                )
         ids = np.asarray(global_ids, dtype=np.int64)
         expected_shape = (*ids.shape, ROW_BYTES)
         if out is None:
@@ -1990,7 +2011,7 @@ class DiskRowFetcher:
             unique, inverse = np.unique(page_ids, return_inverse=True)
             cold_pages = int(unique.size)
             coalesced_rows = int(cold_positions.size - unique.size)
-            reader = self.prefill_reader if priority == "prefill" else self.reader
+            reader = priority_reader
             row_bytes = np.arange(ROW_BYTES)[None, :]
             inverse_order = np.argsort(inverse, kind="stable")
             sorted_inverse = inverse[inverse_order]

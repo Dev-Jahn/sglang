@@ -18,6 +18,7 @@ import torch
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.hyperconnection import GatedResidual
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpDiskEmbedding,
     Qwen4ExpModel,
     Qwen4ExpPLEGroupedNorm,
     Qwen4ExpPLELayer,
@@ -40,6 +41,7 @@ class _Stub(Qwen4ExpPLELayer):
     def __init__(self):
         torch.nn.Module.__init__(self)
         self._prefetch_stream = object()
+        self.ple_embedding = SimpleNamespace(ngram_embedding=object())
         self._graph_prefetch_buffer = None
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -111,17 +113,14 @@ def test_capture_rejects_an_unprepared_prefetch_size(monkeypatch):
         stub._get_prefetch_buffer(8, ids)
 
 
-def test_zero_sized_prewarm_budget_uses_stable_capture_buffer(monkeypatch):
+def test_capture_rejects_a_missing_graph_prefetch_allocation(monkeypatch):
     stub = _Stub()
     ids = torch.zeros(8, dtype=torch.long)
     monkeypatch.setattr(stub, "_is_capturing", lambda: True)
     monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: True)
 
-    first = stub._get_prefetch_buffer(8, ids)
-    second = stub._get_prefetch_buffer(8, ids)
-
-    assert first.data_ptr() == second.data_ptr()
-    assert stub._graph_prefetch_buffers[8].data_ptr() == first.data_ptr()
+    with pytest.raises(RuntimeError, match="preallocated"):
+        stub._get_prefetch_buffer(8, ids)
 
 
 def test_capture_probe_uses_cuda_runtime_status_on_nvidia(monkeypatch):
@@ -145,10 +144,11 @@ def test_capture_probe_uses_cuda_runtime_status_on_nvidia(monkeypatch):
     assert _Stub._is_capturing()
 
 
-def test_model_prewarm_does_not_allocate_on_non_sm120(monkeypatch):
+def test_model_prewarm_allocates_on_non_sm120(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
     layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
     model = torch.nn.Module()
     model.add_module("ple", layer)
@@ -169,13 +169,17 @@ def test_model_prewarm_does_not_allocate_on_non_sm120(monkeypatch):
 
     Qwen4ExpModel.prewarm_cuda_graphs(model, runner, capture_decode_cuda_graph=True)
 
-    layer.prepare_cuda_graph_prefetch_buffer.assert_not_called()
+    layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
+        32, torch.device("cuda")
+    )
+    model._prewarm_cuda_graph_jit_kernels.assert_not_called()
 
 
-def test_model_prewarm_does_not_allocate_on_sm121(monkeypatch):
+def test_model_prewarm_allocates_on_sm121(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
     layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
     model = torch.nn.Module()
     model.add_module("ple", layer)
@@ -199,13 +203,17 @@ def test_model_prewarm_does_not_allocate_on_sm121(monkeypatch):
 
     Qwen4ExpModel.prewarm_cuda_graphs(model, runner, capture_decode_cuda_graph=True)
 
-    layer.prepare_cuda_graph_prefetch_buffer.assert_not_called()
+    layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
+        32, torch.device("cuda")
+    )
+    model._prewarm_cuda_graph_jit_kernels.assert_not_called()
 
 
 def test_model_prewarm_allocates_the_largest_sm120_capture_shape(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
     layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
     model = torch.nn.Module()
     model.add_module("ple", layer)
@@ -229,6 +237,52 @@ def test_model_prewarm_allocates_the_largest_sm120_capture_shape(monkeypatch):
     layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
         32, torch.device("cuda")
     )
+
+
+def test_non_sm120_disk_graph_replay_matches_pinned_gather(monkeypatch):
+    _require_cuda()
+    monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: False)
+
+    table = (
+        torch.arange(16 * EMBED_DIM, dtype=torch.float32, device="cuda")
+        .reshape(16, EMBED_DIM)
+        .to(torch.bfloat16)
+    )
+    disk = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(disk)
+    disk.embedding_dim = EMBED_DIM
+    disk._fetcher = object()
+    disk._future = None
+    disk._graph_generation = 0
+    disk._active_graph_generation = None
+    disk.allocate_output = lambda shape, device: torch.empty(
+        shape, dtype=torch.bfloat16, device=device
+    )
+    disk._launch_fetch = lambda ids, output, **_: output.copy_(
+        table.index_select(0, ids.reshape(-1)).view(*ids.shape, EMBED_DIM)
+    )
+
+    layer = _Stub()
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=disk)
+    layer.prepare_cuda_graph_prefetch_buffer(4, torch.device("cuda"))
+    ids = torch.tensor([1, 3, 7, 11], dtype=torch.long, device="cuda")
+    graph_output = torch.empty((4, EMBED_DIM), dtype=torch.bfloat16, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+
+    monkeypatch.setattr(
+        "sglang.srt.models.qwen4_exp.get_is_capture_mode", lambda: False
+    )
+    with torch.cuda.graph(graph):
+        staging = layer._get_prefetch_buffer(4, ids)
+        disk.gather(ids, out=staging)
+        graph_output.copy_(staging)
+
+    disk.stage_graph_step(ids, staging)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    pinned = table.index_select(0, ids)
+    torch.testing.assert_close(graph_output, pinned, rtol=0, atol=0)
 
 
 def test_jit_prewarm_uses_runtime_eligible_specializations(monkeypatch):

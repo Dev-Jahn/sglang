@@ -3838,6 +3838,8 @@ class ServerArgs:
         self._handle_offload_compatibility(resolved=True)
 
     def _validate_ple_disk_args(self):
+        from sglang.srt.models.qwen4_ple_disk import validate_max_read_pages
+
         if self.ple_disk_hot_cache_gb < 0:
             raise ValueError("--ple-disk-hot-cache-gb must be non-negative")
         if self.ple_disk_dynamic_cache_gb < 0:
@@ -3846,11 +3848,8 @@ class ServerArgs:
             raise ValueError("--ple-disk-prefill-buffer-tokens must be non-negative")
         if self.ple_disk_prefill_read_pages <= 0:
             raise ValueError("--ple-disk-prefill-read-pages must be positive")
-        if (
-            self.ple_disk_max_read_pages is not None
-            and not 1 <= self.ple_disk_max_read_pages <= 32768
-        ):
-            raise ValueError("--ple-disk-max-read-pages must be between 1 and 32768")
+        if self.ple_disk_max_read_pages is not None:
+            validate_max_read_pages(self.ple_disk_max_read_pages)
         if self.ple_disk_stats_log_interval < 0:
             raise ValueError("--ple-disk-stats-log-interval must be non-negative")
 
@@ -3876,6 +3875,8 @@ class ServerArgs:
                     )
             if self.ple_disk_hot_frequency_file:
                 hot_path = self.ple_disk_hot_frequency_file
+                # ServerArgs has no checkpoint layer count yet. Validate layer
+                # zero here; model construction checks every resolved layer.
                 hot_file = Path(hot_path.replace("{layer}", "0"))
                 if "{" in str(hot_file) or "}" in str(hot_file):
                     raise ValueError(

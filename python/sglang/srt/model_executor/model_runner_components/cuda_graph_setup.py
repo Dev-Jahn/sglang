@@ -44,8 +44,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
     get_available_gpu_memory,
-    is_sm120_supported,
-    is_sm121,
     log_info_on_rank0,
 )
 
@@ -61,8 +59,6 @@ def _prewarm_model_cuda_graphs(
 ) -> None:
     """Let the language model prepare resources needed by graph capture."""
     if model_runner.device != "cuda":
-        return
-    if not is_sm120_supported() or is_sm121():
         return
     graph_config = model_runner.server_args.cuda_graph_config
     prefill_enabled = graph_config.prefill.backend != Backend.DISABLED

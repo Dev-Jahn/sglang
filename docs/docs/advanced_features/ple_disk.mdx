@@ -32,9 +32,12 @@ Disk mode targets RAM-constrained, low-concurrency serving. In equal-commit NVFP
 
 ## Launch a server
 
+The measurements below used `RadixArk/Qwen3.8-Flash-Next-NVFP4`. The FP8
+checkpoint `Qwen/Qwen3.8-Flash-Next-FP8` is an alternative.
+
 ```bash
 python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.8-Flash-Next-FP8 \
+  --model-path RadixArk/Qwen3.8-Flash-Next-NVFP4 \
   --tp 4 \
   --ple-storage disk \
   --ple-disk-dir /mnt/local-nvme/qwen4-ple \
@@ -83,7 +86,7 @@ The file starts with one 4 KiB metadata page. It contains the `PLHOT001` magic, 
 
 `--ple-disk-max-read-pages` sets the page count for the decode `io_uring` and its staging area. Its automatic value is 1024 when the CUDA device uses the host page tables for pageable memory and 4096 on other CUDA devices. Set the flag directly when you need a smaller queue or memlock allocation.
 
-Each completion wait uses a 100 ms `io_uring` timeout. SGLang retries an idle completion wait up to 50 times, giving a read about 5 seconds to make progress before it returns a timeout. If the helper cannot account for submitted requests within that budget, it closes the ring to cancel outstanding work, marks the reader poisoned, and requires a server restart.
+Each completion wait uses a 100 ms `io_uring` timeout. SGLang retries an idle completion wait up to 50 times, giving a read about 5 seconds to make progress before it returns a timeout. If the helper cannot account for submitted requests within that budget, it marks the reader poisoned and requires a server restart. Shutdown makes one bounded attempt to reap pending requests. When that budget expires, the native reader and its staging allocation remain allocated for the process lifetime so the kernel cannot write into released memory.
 
 `--ple-disk-prefill-read-pages` controls a separate prefill ring. SGLang clamps it to `--ple-disk-max-read-pages` and logs a warning when the requested value is larger.
 
@@ -95,7 +98,7 @@ Without a frequency file the resident cache cost is the dynamic tier alone, 2 Gi
 
 ## Replay validation
 
-Every CUDA graph replay compares the recomputed lookup IDs with the IDs captured by the graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL` must be positive; values above `1` sample later replays while the first replay after each capture remains checked. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
+Every CUDA graph replay compares the recomputed lookup IDs with the IDs captured by the graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. The check is one replay step behind, so the reported step's output has already been emitted when an error is raised. The error names the replay step and lookup-token count. Treat output since the last successful check as suspect. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL` must be positive; values above `1` sample later replays while the first replay after each capture remains checked. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
 
 ## Run in a container
 
@@ -117,7 +120,7 @@ On NVIDIA GB10, start with `--mem-fraction-static 0.85` and `--max-running-reque
 
 ```bash
 python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.8-Flash-Next-FP8 \
+  --model-path RadixArk/Qwen3.8-Flash-Next-NVFP4 \
   --ple-storage disk \
   --ple-disk-dir /mnt/local-nvme/qwen4-ple \
   --mem-fraction-static 0.85 \

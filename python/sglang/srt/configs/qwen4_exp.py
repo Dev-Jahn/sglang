@@ -1,3 +1,5 @@
+import warnings
+
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
@@ -34,6 +36,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         ngram_vocab_size_base=20000000,
         make_ngram_vocab_size_divisible_by=128,
         ple_storage=None,
+        ple_offload_embedding=None,
         ple_embedding_dtype=None,
         index_share_for_mtp_iteration=True,
         rope_parameters=None,
@@ -42,6 +45,15 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     ):
         if hc_count <= 1:
             raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}.")
+        if ple_offload_embedding is not None:
+            warnings.warn(
+                "text_config.ple_offload_embedding is deprecated; use "
+                "text_config.ple_storage instead",
+                FutureWarning,
+                stacklevel=2,
+            )
+            if ple_storage is None:
+                ple_storage = "pinned" if ple_offload_embedding else "gpu"
         # Qwen3.5/Qwen4-Exp checkpoints may provide RoPE settings under
         # rope_parameters. Normalize it before parent init so Qwen3Next shared
         # config logic sees the expected rope_scaling and rope_theta fields.

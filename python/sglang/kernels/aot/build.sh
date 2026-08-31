@@ -109,8 +109,9 @@ GITHUB_ARTIFACTORY_FLAG="${GITHUB_ARTIFACTORY:-github.com}"
 RUN_TESTS_FLAG="${SGL_KERNEL_RUN_TESTS:-0}"
 DOCKER_TEST_FLAGS=()
 if [ "${RUN_TESTS_FLAG}" = "1" ]; then
-  # The native PLE test needs io_uring_setup inside the wheel build container.
-  DOCKER_TEST_FLAGS+=(--security-opt seccomp=unconfined)
+  # This profile is Docker's default plus the three io_uring calls used by the
+  # native PLE test.
+  DOCKER_TEST_FLAGS+=(--security-opt "seccomp=$(pwd)/ci/docker-default-io-uring-seccomp.json")
 fi
 
 docker run --rm \
