@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef QWEN4_PLE_DISK_FETCHER_H
 #define QWEN4_PLE_DISK_FETCHER_H
 

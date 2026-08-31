@@ -68,6 +68,8 @@ _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 # Intentionally unbounded: releasing any entry could let the kernel write into
 # freed memory after a native reader teardown timed out or stayed busy.
 _RETAINED_POISONED_STAGING = []
+_missing_checkpoint_source_identity_warned = False
+_missing_checkpoint_source_identity_lock = threading.Lock()
 
 
 def resolve_hot_frequency_file(
@@ -218,7 +220,15 @@ def _write_metadata_page(magic: bytes, metadata: Mapping) -> bytes:
 
 def _read_metadata_page(path: Path, expected_magic: bytes) -> dict:
     with path.open("rb", buffering=0) as handle:
-        block = handle.read(PAGE_BYTES)
+        chunks = []
+        remaining = PAGE_BYTES
+        while remaining:
+            chunk = handle.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        block = b"".join(chunks)
     if len(block) != PAGE_BYTES:
         raise IOError(f"short PLE metadata read from {path}")
     magic, length = _METADATA_HEADER.unpack_from(block)
@@ -289,7 +299,22 @@ _PLE_IMAGE_CONFIG_FIELDS = (
     "ngram_vocab_size_base",
     "make_ngram_vocab_size_divisible_by",
     "ple_embedding_dtype",
+    "eos_token_id",
 )
+
+
+def _warn_missing_checkpoint_source_identity() -> None:
+    global _missing_checkpoint_source_identity_warned
+    if _missing_checkpoint_source_identity_warned:
+        return
+    with _missing_checkpoint_source_identity_lock:
+        if _missing_checkpoint_source_identity_warned:
+            return
+        logger.warning(
+            "A PLE checkpoint shard has no checkpoint source identity; image "
+            "reuse will compare the tensor name, byte count, and sampled rows"
+        )
+        _missing_checkpoint_source_identity_warned = True
 
 
 def config_digest(config) -> str:
@@ -633,7 +658,10 @@ class PLEImageBuilder:
                 f"PLE disk storage requires float8_e4m3fn checkpoint rows, got "
                 f"{loaded_weight.dtype} for {name}"
             )
-        source = getattr(loaded_weight, "_sglang_checkpoint_source", None) or {}
+        source = getattr(loaded_weight, "_sglang_checkpoint_source", None)
+        if source is None:
+            _warn_missing_checkpoint_source_identity()
+            source = {}
         item = {
             "name": name,
             "rows": int(loaded_weight.shape[0]),

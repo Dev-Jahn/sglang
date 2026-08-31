@@ -1412,7 +1412,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             self._future = None
             self._active_transfer_device = None
         wait_us = (time.perf_counter_ns() - wait_started) / 1000.0
-        torch.cuda.current_stream().wait_event(self._completion_event)
+        torch.cuda.current_stream(active_device).wait_event(self._completion_event)
         stats = self._stats
         stats["steps"] += 1
         stats["rows_requested"] += fetch_stats.rows_requested
@@ -1667,14 +1667,16 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_replay_stage_expected = False
         self._graph_replay_lookup_tokens = None
         self._graph_replay_prefetch_buffer = None
+        self._graph_replay_key = None
         self._future_lookup_contexts = None
         self._validate_graph_staging = envs.SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING.get()
         self._graph_lookup_validation_interval = (
             envs.SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL.get()
         )
-        if ple_storage == "disk" and self._graph_lookup_validation_interval <= 0:
+        if ple_storage == "disk" and self._graph_lookup_validation_interval < 0:
             raise ValueError(
-                "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be positive"
+                "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be "
+                "non-negative"
             )
         self._graph_embedding_snapshot_buffers = {}
         self._pending_graph_embedding_validation = None
@@ -1869,10 +1871,15 @@ class Qwen4ExpPLELayer(nn.Module):
         return _is_ple_cuda_graph_capturing()
 
     def _get_prefetch_buffer(
-        self, lookup_tokens: int, lookup_ids: torch.Tensor
+        self,
+        lookup_tokens: int,
+        lookup_ids: torch.Tensor,
+        graph_key: Optional[Tuple[ForwardMode, int]] = None,
     ) -> torch.Tensor:
         if self._is_capturing():
-            return self._select_graph_prefetch_buffer(lookup_tokens, allocate=True)
+            if graph_key is None:
+                graph_key = (ForwardMode.DECODE, lookup_tokens)
+            return self._select_graph_prefetch_buffer(graph_key, allocate=True)
 
         buffer = self._eager_prefetch_buffer
         if buffer is None or buffer.shape[0] < lookup_tokens:
@@ -1882,15 +1889,16 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def _select_graph_prefetch_buffer(
         self,
-        lookup_tokens: int,
+        graph_key: Tuple[ForwardMode, int],
         *,
         allocate: bool = False,
     ) -> torch.Tensor:
+        _, lookup_tokens = graph_key
         if self._graph_prefetch_buffer is not None:
-            if not allocate and lookup_tokens not in self._graph_lookup_id_buffers:
+            if not allocate and graph_key not in self._graph_lookup_id_buffers:
                 raise RuntimeError(
                     "PLE graph replay has no captured staging buffer for "
-                    f"{lookup_tokens} lookup tokens"
+                    f"{graph_key[0].name} with {lookup_tokens} lookup tokens"
                 )
             buffer = self._graph_prefetch_buffer
             if buffer.shape[0] < lookup_tokens:
@@ -1958,12 +1966,20 @@ class Qwen4ExpPLELayer(nn.Module):
             and future_contexts.numel()
         ):
             future_lookup_ids = self.ple_embedding._hash_contexts(future_contexts)
-        prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
+        graph_key = (
+            batch.mode if batch is not None else _get_ple_forward_mode(forward_batch),
+            lookup_tokens,
+        )
+        prefetched = self._get_prefetch_buffer(
+            lookup_tokens,
+            lookup_ids,
+            graph_key if capturing_disk else None,
+        )
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
 
         if capturing_disk:
-            self._graph_lookup_id_buffers[lookup_tokens] = lookup_ids
-            self._graph_lookup_validation_due.add(lookup_tokens)
+            self._graph_lookup_id_buffers[graph_key] = lookup_ids
+            self._graph_lookup_validation_due.add(graph_key)
             offloaded_embedding.gather(lookup_ids, out=output_view)
             self._prefetch_state = (
                 prefetched,
@@ -2004,15 +2020,16 @@ class Qwen4ExpPLELayer(nn.Module):
         self._future_lookup_contexts = contexts
 
     def _graph_lookup_validation_required(
-        self, lookup_tokens: int, replay_step: int
+        self, graph_key: Tuple[ForwardMode, int], replay_step: int
     ) -> bool:
         interval = self._graph_lookup_validation_interval
-        if interval <= 0:
+        if interval < 0:
             raise ValueError(
-                "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be positive"
+                "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be "
+                "non-negative"
             )
-        required = interval == 1 or lookup_tokens in self._graph_lookup_validation_due
-        if interval > 1:
+        required = graph_key in self._graph_lookup_validation_due
+        if interval > 0:
             required = required or replay_step % interval == 0
         return required
 
@@ -2041,20 +2058,21 @@ class Qwen4ExpPLELayer(nn.Module):
         lookup_tokens = lookup_ids.shape[0]
         if lookup_tokens == 0:
             return
+        graph_key = (batch.mode, lookup_tokens)
         self._graph_replay_steps += 1
         replay_step = self._graph_replay_steps
         self._graph_replay_step_index = replay_step
         validate_lookup_ids = self._graph_lookup_validation_required(
-            lookup_tokens, replay_step
+            graph_key, replay_step
         )
         if validate_lookup_ids:
-            self._graph_lookup_validation_due.discard(lookup_tokens)
+            self._graph_lookup_validation_due.discard(graph_key)
             self._pending_graph_lookup_validation = (
-                lookup_tokens,
+                graph_key,
                 replay_step,
                 lookup_ids.detach().clone(),
             )
-        prefetched = self._select_graph_prefetch_buffer(lookup_tokens)
+        prefetched = self._select_graph_prefetch_buffer(graph_key)
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
         stream = self._prefetch_stream
         stream.wait_stream(torch.cuda.current_stream())
@@ -2066,31 +2084,48 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         self._graph_replay_lookup_tokens = lookup_tokens
         self._graph_replay_prefetch_buffer = prefetched
+        self._graph_replay_key = graph_key
 
     def finish_cuda_graph_replay(self) -> None:
         if self._pending_graph_embedding_validation is not None:
-            previous_tokens, replay_step, expected_embeddings = (
+            graph_key, replay_step, expected_embeddings = (
                 self._pending_graph_embedding_validation
             )
-            actual_embeddings = self._graph_embedding_snapshot_buffers[previous_tokens]
-            self._record_graph_validation(
-                "_completed_graph_embedding_validation",
-                previous_tokens,
-                replay_step,
-                actual_embeddings.ne(expected_embeddings),
-            )
+            actual_embeddings = self._graph_embedding_snapshot_buffers.get(graph_key)
+            if actual_embeddings is None:
+                logger.warning(
+                    "PLE graph embedding capture buffer is missing for %s with "
+                    "%d lookup tokens; dropping replay step %d validation",
+                    graph_key[0].name,
+                    graph_key[1],
+                    replay_step,
+                )
+            else:
+                self._record_graph_validation(
+                    "_completed_graph_embedding_validation",
+                    graph_key[1],
+                    replay_step,
+                    actual_embeddings.ne(expected_embeddings),
+                )
             self._pending_graph_embedding_validation = None
         if self._pending_graph_lookup_validation is not None:
-            previous_tokens, replay_step, expected_ids = (
-                self._pending_graph_lookup_validation
-            )
-            actual_ids = self._graph_lookup_id_buffers[previous_tokens]
-            self._record_graph_validation(
-                "_completed_graph_lookup_validation",
-                previous_tokens,
-                replay_step,
-                actual_ids.ne(expected_ids),
-            )
+            graph_key, replay_step, expected_ids = self._pending_graph_lookup_validation
+            actual_ids = self._graph_lookup_id_buffers.get(graph_key)
+            if actual_ids is None:
+                logger.warning(
+                    "PLE graph lookup capture buffer is missing for %s with "
+                    "%d lookup tokens; dropping replay step %d validation",
+                    graph_key[0].name,
+                    graph_key[1],
+                    replay_step,
+                )
+            else:
+                self._record_graph_validation(
+                    "_completed_graph_lookup_validation",
+                    graph_key[1],
+                    replay_step,
+                    actual_ids.ne(expected_ids),
+                )
             self._pending_graph_lookup_validation = None
 
     def _record_graph_validation(
@@ -2167,9 +2202,8 @@ class Qwen4ExpPLELayer(nn.Module):
             offloaded_embedding.wait_for_graph_step(self._graph_replay_generation)
             torch.cuda.current_stream().wait_stream(self._prefetch_stream)
             if self._validate_graph_staging:
-                lookup_tokens = self._graph_replay_lookup_tokens
                 self._pending_graph_embedding_validation = (
-                    lookup_tokens,
+                    self._graph_replay_key,
                     self._graph_replay_step_index,
                     self._graph_replay_prefetch_buffer.detach().clone(),
                 )
@@ -2178,6 +2212,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self._graph_replay_stage_expected = False
             self._graph_replay_lookup_tokens = None
             self._graph_replay_prefetch_buffer = None
+            self._graph_replay_key = None
             self._graph_replay_step_index = None
 
     def release_cuda_graph_replay(self) -> None:
@@ -2190,6 +2225,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self._graph_replay_stage_expected = False
             self._graph_replay_lookup_tokens = None
             self._graph_replay_prefetch_buffer = None
+            self._graph_replay_key = None
             self._graph_replay_step_index = None
             self._pending_graph_lookup_validation = None
             self._pending_graph_embedding_validation = None
@@ -2221,10 +2257,11 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         if captured_disk and self._validate_graph_staging:
             lookup_tokens = embeddings.shape[0]
-            snapshot = self._graph_embedding_snapshot_buffers.get(lookup_tokens)
+            graph_key = (_get_ple_forward_mode(forward_batch), lookup_tokens)
+            snapshot = self._graph_embedding_snapshot_buffers.get(graph_key)
             if snapshot is None:
                 snapshot = torch.empty_like(embeddings)
-                self._graph_embedding_snapshot_buffers[lookup_tokens] = snapshot
+                self._graph_embedding_snapshot_buffers[graph_key] = snapshot
             snapshot.copy_(embeddings)
         if not captured_disk:
             if wait_for_prefetch is not None:

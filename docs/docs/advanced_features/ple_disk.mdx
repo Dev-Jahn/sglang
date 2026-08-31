@@ -6,7 +6,7 @@ metatags:
 
 Qwen3.8-Flash-Next checkpoints contain a large Qwen4-architecture n-gram PLE table. Use `--ple-storage disk` to keep its packed row image on local storage while SGLang holds selected exact rows in host memory. The implementation requires low-latency `O_DIRECT` storage and access to `/sys/dev/block` for logical-block-size validation. A local NVMe filesystem is recommended, although other local block-backed filesystems can provide the same interface with higher latency.
 
-The first load creates one fingerprinted image per PLE layer and tensor-parallel rank under `--ple-disk-dir`. Later loads reuse an image only when its module prefix, configuration, shard manifest, source-file size and modification time, sampled row data, and weight scale match the checkpoint.
+The first load creates one fingerprinted image per PLE layer and tensor-parallel rank under `--ple-disk-dir`. Later loads reuse an image only when its module prefix, configuration, shard manifest, sampled row data, and weight scale match the checkpoint. The standard safetensors iterator also records the shard basename, file size, and modification time. Other load formats record the tensor name and byte count because they do not expose the source file while yielding a tensor. SGLang emits one warning when this reduced source identity is used.
 
 Disk mode constructs the full PLE weight on the meta device, so startup does not allocate the table on the GPU before creating its disk image.
 
@@ -19,8 +19,10 @@ Before launching the server, provide:
 - A local filesystem that supports `O_DIRECT`
 - A storage device with a logical block size no larger than 4096 bytes
 - Access to `/sys/dev/block` so SGLang can verify the device logical block size
-- PLE rows stored as `float8_e4m3fn`; BF16 is rejected during argument resolution when the model configuration identifies it, or during model construction when the checkpoint rows are loaded
+- `ple_embedding_dtype: float8_e4m3fn` in the model configuration and FP8 E4M3 checkpoint rows
 - Free space for the raw row file and packed image during the first build
+
+Disk storage does not support pipeline parallelism with `--pp-size > 1`, dLLM with `--dllm-algorithm`, or prefill CUDA graphs. An enabled `--cuda-graph-backend-prefill` is rejected; the automatic setting disables prefill graphs while keeping decode graphs enabled.
 
 The packed image stores 25 160-byte rows in each 4 KiB page. Its 96-byte page tail makes it about 2.4% larger than the row payload. The first build holds the full raw row file and packed image at the same time, so reserve slightly more than twice the row payload. After a successful install, SGLang removes the raw file.
 
@@ -53,7 +55,7 @@ Set `--ple-disk-stats-log-interval N` to log cumulative storage and cache counte
 
 The hot and dynamic cache budgets are totals across all tensor-parallel ranks, PLE layers, and attention-DP replicas. SGLang divides each budget evenly among the corresponding embedding instances. Each layer has its own readers, staging buffers, caches, and executors.
 
-The image fingerprint covers the sanitized model configuration, shard metadata, source-file size and modification time, and up to 64 evenly spaced rows from each shard. Replacing a checkpoint shard in place changes its manifest identity and prevents image reuse.
+The image fingerprint covers the selected model configuration, including the EOS token ID, plus shard metadata and up to 64 evenly spaced rows from each shard. With the standard safetensors iterator, the metadata includes the source basename, file size, and modification time. Other iterators use the tensor name and byte count. The sampled-row digest is included for every load format.
 
 ## Generate a static hot-row file
 
@@ -86,7 +88,7 @@ The file starts with one 4 KiB metadata page. It contains the `PLHOT001` magic, 
 
 `--ple-disk-max-read-pages` sets the page count for the decode `io_uring` and its staging area. Its automatic value is 1024 when the CUDA device uses the host page tables for pageable memory and 4096 on other CUDA devices. Set the flag directly when you need a smaller queue or memlock allocation.
 
-Each completion wait uses a 100 ms `io_uring` timeout. SGLang retries an idle completion wait up to 50 times, giving a read about 5 seconds to make progress before it returns a timeout. If the helper cannot account for submitted requests within that budget, it marks the reader poisoned and requires a server restart. Shutdown also allows up to 50 waits of 100 ms, about 5 seconds, to reap pending requests. When that budget expires, the native reader and its staging allocation remain allocated for the process lifetime so the kernel cannot write into released memory.
+Each completion wait uses a 100 ms `io_uring` timeout. SGLang retries an idle completion wait up to 50 times, giving a read about 5 seconds to make progress before it returns a timeout. If the helper cannot account for submitted requests within that budget, it marks the reader poisoned and requires a server restart. Shutdown first allows up to 5,000 busy retries of 1 ms, about 5 seconds, for the active read to leave its critical section. It then allows up to 50 waits of 100 ms, about 5 more seconds, to reap pending requests. The combined shutdown budget is about 10 seconds per reader. When that budget expires, the native reader and its staging allocation remain allocated for the process lifetime so the kernel cannot write into released memory.
 
 `--ple-disk-prefill-read-pages` controls a separate prefill ring. Its maximum is 32,768 pages. SGLang clamps it to `--ple-disk-max-read-pages` and logs a warning when the requested value is larger. `--ple-disk-prefill-buffer-tokens` accepts up to 65,536 tokens.
 
@@ -98,7 +100,7 @@ Without a frequency file the resident cache cost is the dynamic tier alone, 2 Gi
 
 ## Replay validation
 
-Every CUDA graph replay compares the recomputed lookup IDs with the IDs captured by the graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. The check is one replay step behind, so the reported step's output has already been emitted when an error is raised. The error names the replay step and lookup-token count. Treat output since the last successful check as suspect. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL` must be positive; values above `1` sample later replays while the first replay after each capture remains checked. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
+The first CUDA graph replay after each capture compares the recomputed lookup IDs with the IDs captured by that graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. The check is one replay step behind, so the reported step's output has already been emitted when an error is raised. The error names the replay step and lookup-token count. Treat output since the last successful check as suspect. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL=0`, the default, runs only the first-replay check. A positive value also checks every Nth replay: `1` checks every replay, `64` checks every 64th replay, and larger values reduce the diagnostic work proportionally. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
 
 ## Run in a container
 
@@ -119,6 +121,10 @@ reader staging and mirror bytes per rank and PLE layer = 8192 * (max read pages 
 The prefill term applies when `--ple-disk-prefill-buffer-tokens` is greater than zero. Leave room for other locked allocations made by the process. For Docker, `--ulimit memlock=-1` removes this limit; a finite limit at or above the required allocation also works. If registration returns `ENOMEM`, SGLang reports the attempted byte count and the flag that reduces it.
 
 Systems where `pageableMemoryAccessUsesHostPageTables` is true use an unregistered staging area, so the `io_uring` staging bytes do not consume the memlock budget.
+
+### Run the native helper test locally
+
+From a source checkout, set `SGL_KERNEL_RUN_TESTS=1` when running `python/sglang/kernels/aot/build.sh`. This enables `SGL_KERNEL_BUILD_TESTS`, runs CTest in the local build container, and adds `seccomp=unconfined` so `io_uring` can be exercised. Set `SGL_KERNEL_PLE_REQUIRE_IO_URING=1` as well to turn an `io_uring` capability skip into a test failure. The shared PR wheel workflow leaves these variables unset and uses the release CMake configuration.
 
 ## GB10 untested starting point
 

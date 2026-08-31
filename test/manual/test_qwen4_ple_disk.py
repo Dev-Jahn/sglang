@@ -22,6 +22,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     VocabParallelEmbeddingShardIndices,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpDiskEmbedding,
@@ -793,10 +794,7 @@ def test_disk_fails_closed_on_corruption_fingerprint_and_short_image(tmp_path):
 
 
 def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch):
-    from sglang.srt.model_executor.forward_batch_info import (
-        CudaGraphReplayInput,
-        ForwardMode,
-    )
+    from sglang.srt.model_executor.forward_batch_info import CudaGraphReplayInput
     from sglang.srt.models.qwen4_exp import Qwen4ExpModel, Qwen4ExpPLELayer
 
     device = torch.device("cuda")
@@ -836,6 +834,7 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     layer._graph_replay_stage_expected = False
     layer._graph_replay_lookup_tokens = None
     layer._graph_replay_prefetch_buffer = None
+    layer._graph_replay_key = None
     layer._graph_replay_steps = 0
     layer._graph_lookup_validation_interval = 1
     layer._graph_lookup_validation_due = set()
@@ -843,12 +842,13 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     layer._completed_graph_lookup_validation = deque()
     layer._completed_graph_embedding_validation = deque()
     layer._graph_validation_free_slots = deque()
+    capture_key = (ForwardMode.DECODE, lookup_tokens)
     captured_ids = torch.zeros((lookup_tokens, heads), dtype=torch.long, device=device)
-    layer._graph_lookup_id_buffers = {lookup_tokens: captured_ids}
+    layer._graph_lookup_id_buffers = {capture_key: captured_ids}
     captured_rows = torch.zeros(
         (lookup_tokens, heads * row_width), dtype=torch.bfloat16, device=device
     )
-    layer._graph_embedding_snapshot_buffers = {lookup_tokens: captured_rows}
+    layer._graph_embedding_snapshot_buffers = {capture_key: captured_rows}
     replay_ids = torch.arange(
         lookup_tokens * heads, device=device, dtype=torch.long
     ).view(lookup_tokens, heads)
@@ -913,9 +913,9 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
 
     assert staged[0].shape == (lookup_tokens, heads)
     assert layer._graph_replay_lookup_tokens == lookup_tokens
-    assert layer._pending_graph_lookup_validation[0] == lookup_tokens
+    assert layer._pending_graph_lookup_validation[0] == capture_key
     layer._pending_graph_embedding_validation = (
-        lookup_tokens,
+        capture_key,
         layer._graph_replay_step_index,
         replay_rows.clone(),
     )
@@ -943,12 +943,13 @@ def test_graph_lookup_validation_records_an_async_host_result():
     layer = qwen4_exp_module.Qwen4ExpPLELayer.__new__(qwen4_exp_module.Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     lookup_ids = torch.arange(32, dtype=torch.long, device="cuda").view(2, 16)
-    layer._pending_graph_lookup_validation = (2, 1, lookup_ids.clone())
+    capture_key = (ForwardMode.DECODE, 2)
+    layer._pending_graph_lookup_validation = (capture_key, 1, lookup_ids.clone())
     layer._completed_graph_lookup_validation = deque()
     layer._pending_graph_embedding_validation = None
     layer._completed_graph_embedding_validation = deque()
     layer._graph_validation_free_slots = deque()
-    layer._graph_lookup_id_buffers = {2: lookup_ids}
+    layer._graph_lookup_id_buffers = {capture_key: lookup_ids}
 
     with profile(activities=[ProfilerActivity.CPU]) as finish_profile:
         layer.finish_cuda_graph_replay()

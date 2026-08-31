@@ -301,9 +301,9 @@ class Envs:
     SGLANG_PLE_OFFLOAD_NUMA_INTERLEAVE = EnvBool(True)
     # Compare staged graph lookup rows with the values used by the next replay.
     SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING = EnvBool(False)
-    # Check graph lookup IDs every replay by default. Values above one keep the
-    # first replay after capture checked and sample later replays at that interval.
-    SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL = EnvInt(1)
+    # Check the first replay after capture. Positive values also sample later
+    # replays at that interval; zero keeps only the first-replay check.
+    SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL = EnvInt(0)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)

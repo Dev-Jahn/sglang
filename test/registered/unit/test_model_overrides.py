@@ -373,6 +373,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ple_disk_dir=image_dir,
             )
 
+    def test_qwen4_disk_storage_uses_the_ple_row_dtype(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        image_dir = tempfile.mkdtemp(prefix="qwen4_disk_images_")
+        self.addCleanup(shutil.rmtree, image_dir, ignore_errors=True)
+        with self.assertRaisesRegex(ValueError, "requires float8_e4m3fn PLE rows"):
+            self._construct(
+                *qwen4,
+                config_extra={"quantization_config": {"quant_method": "fp8"}},
+                ple_storage="disk",
+                ple_disk_dir=image_dir,
+            )
+
+        accepted = self._construct(
+            *qwen4,
+            config_extra={"ple_embedding_dtype": "float8_e4m3fn"},
+            ple_storage="disk",
+            ple_disk_dir=image_dir,
+        )
+        self.assertEqual(accepted.ple_storage, "disk")
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(sa.enable_tf32_matmul)  # materialized

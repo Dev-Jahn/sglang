@@ -1376,7 +1376,6 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     if (
         ple_storage == "disk"
         and getattr(text_config, "ple_embedding_dtype", None) != "float8_e4m3fn"
-        and get_quantization_config(hf_config) != "fp8"
     ):
         raise ValueError(
             "--ple-storage disk requires float8_e4m3fn PLE "

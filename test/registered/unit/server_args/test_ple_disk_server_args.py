@@ -125,6 +125,19 @@ def test_disk_storage_accepts_a_readable_hot_file_template(tmp_path):
     args._handle_offload_compatibility()
 
 
+def test_disk_storage_accepts_literal_braces_in_a_hot_file_path(tmp_path):
+    archive = tmp_path / "{archive}"
+    archive.mkdir()
+    hot_file = archive / "hot.bin"
+    hot_file.touch()
+    args = _server_args(
+        ple_storage="disk",
+        ple_disk_dir=str(tmp_path),
+        ple_disk_hot_frequency_file=str(hot_file),
+    )
+    args._handle_offload_compatibility()
+
+
 def test_max_read_pages_rejects_io_uring_entry_overflow():
     args = _server_args(ple_disk_max_read_pages=32769)
     with pytest.raises(ValueError, match="32768"):

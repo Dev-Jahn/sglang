@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
@@ -69,7 +70,36 @@ def test_sgl_kernel_version_survives_missing_distribution_metadata(monkeypatch):
         "version",
         lambda name: (_ for _ in ()).throw(importlib.metadata.PackageNotFoundError),
     )
-    assert runpy.run_path(version_file)["__version__"] == "0.4.6.post2"
+    required = Version(disk.MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK)
+    fallback = Version(runpy.run_path(version_file)["__version__"])
+    assert disk._installed_sgl_kernel_version() is None
+    assert fallback >= required
+
+
+def test_metadata_page_reader_accepts_short_reads():
+    block = disk._write_metadata_page(disk.HOT_MAGIC, {"value": 17})
+
+    class ShortReader:
+        def __init__(self):
+            self.offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, size):
+            size = min(size, 37)
+            chunk = block[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    fake_path = SimpleNamespace(
+        parent=Path("/tmp/metadata-parent"),
+        open=lambda *args, **kwargs: ShortReader(),
+    )
+    assert disk._read_metadata_page(fake_path, disk.HOT_MAGIC) == {"value": 17}
 
 
 @pytest.mark.parametrize("rows", [4, 8])
@@ -716,6 +746,24 @@ def test_manifest_source_identity_controls_reuse(tmp_path):
     touched.add_shard("shard", set_source_identity(rows), 0, 25)
     with pytest.raises(ValueError, match="manifest mismatch.*delete"):
         touched.finalize(0.5)
+
+
+def test_missing_checkpoint_source_identity_warns_once(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(disk, "_missing_checkpoint_source_identity_warned", False)
+    rows = _fp8_rows(25)
+    builders = [
+        disk.PLEImageBuilder(tmp_path, f"missing-source-{index}", 0, 1, 0, 25)
+        for index in range(2)
+    ]
+    try:
+        with caplog.at_level("WARNING"):
+            for index, builder in enumerate(builders):
+                builder.add_shard(f"shard-{index}", rows, 0, 25)
+    finally:
+        for builder in builders:
+            builder.close()
+
+    assert caplog.text.count("has no checkpoint source identity") == 1
 
 
 @pytest.mark.parametrize("failure_call", [2, 3])
@@ -1488,10 +1536,13 @@ def test_image_fingerprint_uses_only_explicit_identity_fields():
         "ngram_vocab_size_base": 20_000_000,
         "make_ngram_vocab_size_divisible_by": 128,
         "ple_embedding_dtype": "float8_e4m3fn",
+        "eos_token_id": 2,
     }
     digest = disk.config_digest(config)
     assert digest == disk.config_digest({**config, "unrelated_server_arg": 9})
     assert digest != disk.config_digest({**config, "ngram_size": 4})
+    assert digest != disk.config_digest({**config, "eos_token_id": 3})
+    assert digest == disk.config_digest({**config, "eos_token_id": 2})
 
     manifest = [{"name": "weight", "sample_sha256": "a"}]
     identity = {

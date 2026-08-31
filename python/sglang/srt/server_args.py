@@ -3905,11 +3905,6 @@ class ServerArgs:
                 # ServerArgs has no checkpoint layer count yet. Validate layer
                 # zero here; model construction checks every resolved layer.
                 hot_file = Path(hot_path.replace("{layer}", "0"))
-                if "{" in str(hot_file) or "}" in str(hot_file):
-                    raise ValueError(
-                        "--ple-disk-hot-frequency-file supports only the {layer} "
-                        "template field"
-                    )
                 if not hot_file.is_file() or not os.access(hot_file, os.R_OK):
                     raise ValueError(
                         "--ple-disk-hot-frequency-file must be a readable file: "
