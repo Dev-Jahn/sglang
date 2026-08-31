@@ -1,3 +1,1 @@
-from importlib.metadata import version
-
-__version__ = version("sglang-kernel")
+__version__ = "0.4.6.post2"

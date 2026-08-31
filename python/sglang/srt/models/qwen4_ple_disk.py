@@ -1,3 +1,16 @@
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Exact disk backing for Qwen4 PLE embeddings with 160-byte FP8 rows.
 
 Format 3 stores one 4 KiB metadata block followed by records containing 25
@@ -33,8 +46,6 @@ import numpy as np
 import torch
 from packaging.version import InvalidVersion, Version
 
-from sglang.kernels.sgl_kernel_version import SGL_KERNEL_VERSION
-
 logger = logging.getLogger(__name__)
 
 PAGE_BYTES = 4096
@@ -45,7 +56,7 @@ CRC_MAGIC = b"PLCRC001"
 HOT_MAGIC = b"PLHOT001"
 FORMAT_VERSION = 3
 HOT_FORMAT_VERSION = 1
-REQUIRED_SGL_KERNEL_VERSION = SGL_KERNEL_VERSION
+MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK = "0.4.6.post2"
 CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 FETCHER_FAILURE_SETUP = 1
 FETCHER_FAILURE_REGISTER_BUFFER = 2
@@ -101,7 +112,7 @@ def resolve_hot_frequency_file(
 
 
 def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
-    return torch.empty(*size, pin_memory=pin_memory, **kwargs)
+    return torch.empty(*size, device="cpu", pin_memory=pin_memory, **kwargs)
 
 
 def _current_cuda_device() -> int:
@@ -1421,9 +1432,19 @@ def _installed_sgl_kernel_version() -> Optional[str]:
 def _find_helper_library() -> Path:
     spec = importlib.util.find_spec("sgl_kernel")
     locations = list(spec.submodule_search_locations or ()) if spec is not None else []
+    for location in locations:
+        package_dir = Path(location)
+        helper = package_dir / "qwen4_ple_disk_fetcher.so"
+        marker = package_dir / "qwen4_ple_disk_fetcher.build"
+        if (
+            helper.is_file()
+            and marker.is_file()
+            and marker.read_text().strip() == "enabled"
+        ):
+            return helper
     installed = _installed_sgl_kernel_version()
     try:
-        required = Version(REQUIRED_SGL_KERNEL_VERSION)
+        required = Version(MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK)
         installed_version = Version(installed) if installed is not None else None
         old_wheel = installed_version is None or installed_version < required
     except InvalidVersion:
@@ -1432,7 +1453,8 @@ def _find_helper_library() -> Path:
         found_text = installed or "no installed distribution"
         raise RuntimeError(
             "PLE disk storage requires sglang-kernel >= "
-            f"{REQUIRED_SGL_KERNEL_VERSION}; found {found_text}. Install the matching "
+            f"{MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK}; found {found_text}. "
+            "Install the matching "
             "sglang-kernel wheel"
         )
     for location in locations:
@@ -1644,10 +1666,20 @@ class DirectPageReader:
             destroy_error = None
             if getattr(self, "handle", None):
                 handle = self.handle
-                self.handle = None
                 rc = self.lib.ple_fetcher_destroy(handle)
-                if rc:
-                    if -rc in (errno.ETIMEDOUT, errno.EBUSY):
+                if -rc == errno.EBUSY:
+                    logger.error(
+                        "PLE disk fetcher shutdown is busy; retaining the native "
+                        "handle so close can retry"
+                    )
+                    destroy_error = OSError(
+                        errno.EBUSY,
+                        "PLE disk fetcher shutdown failed: "
+                        f"{os.strerror(errno.EBUSY)}",
+                    )
+                else:
+                    self.handle = None
+                    if -rc == errno.ETIMEDOUT:
                         _RETAINED_POISONED_STAGING.append(self._staging_allocation)
                         logger.error(
                             "PLE disk fetcher retained %d staging bytes for the "
@@ -1655,11 +1687,12 @@ class DirectPageReader:
                             "pending reads",
                             self._staging_allocation.numel(),
                         )
-                    destroy_error = OSError(
-                        -rc,
-                        "PLE disk fetcher shutdown failed: " f"{os.strerror(-rc)}",
-                    )
-            if getattr(self, "fd", None) is not None:
+                    if rc:
+                        destroy_error = OSError(
+                            -rc,
+                            "PLE disk fetcher shutdown failed: " f"{os.strerror(-rc)}",
+                        )
+            if self.handle is None and getattr(self, "fd", None) is not None:
                 os.close(self.fd)
                 self.fd = None
             if destroy_error is not None:
@@ -1794,6 +1827,8 @@ class DiskRowFetcher:
         return hit
 
     def submit_prefill(self, global_ids: np.ndarray) -> bool:
+        if getattr(self, "_closed", False):
+            raise RuntimeError("PLE disk fetcher is closed")
         if not self._prefill_slots or self._prefill_disabled:
             return False
         ids = np.asarray(global_ids, dtype=np.int64).reshape(-1)
@@ -1917,6 +1952,8 @@ class DiskRowFetcher:
             raise
 
     def wait_prefill(self) -> None:
+        if getattr(self, "_closed", False) and self._prefill_executor is None:
+            raise RuntimeError("PLE disk fetcher is closed")
         while True:
             with self._prefill_lock:
                 futures = list(self._prefill_futures)
@@ -1939,6 +1976,8 @@ class DiskRowFetcher:
         use_prefill: bool = True,
         admit_dynamic: bool = True,
     ) -> torch.Tensor:
+        if getattr(self, "_closed", False):
+            raise RuntimeError("PLE disk fetcher is closed")
         if priority not in ("decode", "prefill"):
             raise ValueError(f"invalid PLE fetch priority: {priority}")
         priority_reader = self.reader

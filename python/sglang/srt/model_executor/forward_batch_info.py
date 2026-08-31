@@ -430,6 +430,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # (QSA's fill is 1, a legal real length); None outside replay.
     num_padding: Optional[int] = None
 
+    # Set after model batch hooks have prepared this forward batch.
+    _model_batch_hook_prepared: bool = False
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)

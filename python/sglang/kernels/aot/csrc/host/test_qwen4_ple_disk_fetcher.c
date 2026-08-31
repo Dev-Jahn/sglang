@@ -11,6 +11,7 @@
 
 #define PAGE_BYTES 4096
 #define FETCHER_FAILURE_REGISTER_BUFFER 2
+#define FETCHER_FAILURE_NONE 0
 
 #ifndef EUCLEAN
 #define EUCLEAN 117
@@ -31,6 +32,13 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   }
 
   int failure_stage = 0;
+  errno = 0;
+  void* invalid_fetcher =
+      ple_fetcher_create(file_fd, (unsigned char*)buffer + 1, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
+  if (invalid_fetcher || errno != EINVAL || failure_stage != FETCHER_FAILURE_NONE) {
+    fprintf(stderr, "invalid create returned %p errno=%d stage=%d\n", invalid_fetcher, errno, failure_stage);
+    goto done;
+  }
   fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
   if (!fetcher) {
     int error = errno;
@@ -41,7 +49,7 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     }
     if (!register_buffer && skip_errno(error)) {
       printf("PLE fetcher CTest skipped: io_uring is unavailable: %s\n", strerror(error));
-      result = 77;
+      result = getenv("SGL_KERNEL_RUN_TESTS") && strcmp(getenv("SGL_KERNEL_RUN_TESTS"), "1") == 0 ? 1 : 77;
       goto done;
     }
     fprintf(
@@ -54,7 +62,13 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   }
 
   uint64_t offsets[2] = {PAGE_BYTES, 2 * PAGE_BYTES};
-  int rc = ple_fetcher_read(fetcher, offsets, 2, buffer, PAGE_BYTES);
+  uint64_t misaligned_offset = PAGE_BYTES + 1;
+  int rc = ple_fetcher_read(fetcher, &misaligned_offset, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -EINVAL) {
+    fprintf(stderr, "misaligned offset returned %d instead of %d\n", rc, -EINVAL);
+    goto done;
+  }
+  rc = ple_fetcher_read(fetcher, offsets, 2, buffer, PAGE_BYTES);
   if (rc != -EFAULT) {
     fprintf(stderr, "short buffer returned %d instead of %d\n", rc, -EFAULT);
     goto done;
@@ -156,6 +170,32 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     goto done;
   }
 
+  ple_fetcher_test_stall_completions(1);
+  rc = ple_fetcher_destroy(fetcher);
+  if (rc != -ETIMEDOUT) {
+    fprintf(stderr, "destroy timeout returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -ETIMEDOUT) {
+    fprintf(stderr, "read after destroy timeout returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  rc = ple_fetcher_last_error(fetcher, &failed_index, &io_result);
+  if (rc != -ETIMEDOUT) {
+    fprintf(stderr, "last_error after destroy timeout returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  rc = ple_fetcher_destroy(fetcher);
+  if (rc != -ETIMEDOUT || !ple_fetcher_test_ring_open(fetcher)) {
+    fprintf(stderr, "destroy retry returned %d or released retained mappings\n", rc);
+    goto done;
+  }
+
+  /* The terminal fetcher and its staging buffer remain live until exit. */
+  fetcher = NULL;
+  buffer = NULL;
+
   result = 0;
 done:
   ple_fetcher_test_limit_submissions(0);
@@ -203,7 +243,7 @@ int main(void) {
   if (file_fd < 0) {
     if (skip_errno(errno) || errno == EINVAL) {
       printf("PLE fetcher CTest skipped: O_DIRECT is unavailable: %s\n", strerror(errno));
-      return 77;
+      return getenv("SGL_KERNEL_RUN_TESTS") && strcmp(getenv("SGL_KERNEL_RUN_TESTS"), "1") == 0 ? 1 : 77;
     }
     perror("open O_DIRECT");
     return 1;

@@ -43,7 +43,6 @@ class _Stub(Qwen4ExpPLELayer):
         self._prefetch_stream = object()
         self.ple_embedding = SimpleNamespace(ngram_embedding=object())
         self._graph_prefetch_buffer = None
-        self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
 
     def _allocate_prefetch_buffer(self, lookup_tokens, device):

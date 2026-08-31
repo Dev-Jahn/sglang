@@ -13,6 +13,8 @@ static inline int ple_fetcher_retry_after_timeout(unsigned* timeouts) {
   return *timeouts < PLE_FETCHER_MAX_WAITS;
 }
 
+/* Calls on a handle must be externally serialized. A single caller owns the
+ * handle, and no read or last_error call may be in flight during destroy. */
 void* ple_fetcher_create(
     int file_fd, void* buffer, size_t buffer_bytes, unsigned max_pages, int register_buffer, int* failure_stage);
 int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void* buffer, size_t buffer_bytes);

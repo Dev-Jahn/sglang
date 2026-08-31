@@ -4599,6 +4599,11 @@ class ServerArgs:
                 "disabled and --disable-prefill-cuda-graph"
             )
             self.cuda_graph_backend_prefill = Backend.DISABLED
+            if not self.disable_prefill_cuda_graph:
+                logger.warning(
+                    "--ple-storage disk overrides disable_prefill_cuda_graph=False "
+                    "because disk prefill I/O cannot run inside prefill CUDA graphs"
+                )
             self.disable_prefill_cuda_graph = True
         self._parse_cuda_graph_config()
         # Reads the resolved per-phase backends; must precede the compat rules

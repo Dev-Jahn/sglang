@@ -4,7 +4,7 @@ metatags:
     description: "Store Qwen3.8-Flash-Next PLE rows on local direct-I/O storage with exact host caches and io_uring reads."
 ---
 
-Qwen3.8-Flash-Next checkpoints contain a large Qwen4-architecture n-gram PLE table. Use `--ple-storage disk` to keep its packed row image on local storage while SGLang holds selected exact rows in host memory. The implementation requires low-latency `O_DIRECT` storage. A local NVMe filesystem is recommended, although other local block-backed filesystems can provide the same interface with higher latency.
+Qwen3.8-Flash-Next checkpoints contain a large Qwen4-architecture n-gram PLE table. Use `--ple-storage disk` to keep its packed row image on local storage while SGLang holds selected exact rows in host memory. The implementation requires low-latency `O_DIRECT` storage and access to `/sys/dev/block` for logical-block-size validation. A local NVMe filesystem is recommended, although other local block-backed filesystems can provide the same interface with higher latency.
 
 The first load creates one fingerprinted image per PLE layer and tensor-parallel rank under `--ple-disk-dir`. Later loads reuse an image only when its module prefix, configuration, shard manifest, sampled row data, and weight scale match the checkpoint.
 
@@ -38,12 +38,12 @@ checkpoint `Qwen/Qwen3.8-Flash-Next-FP8` is an alternative.
 ```bash
 python -m sglang.launch_server \
   --model-path RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --tp 4 \
+  --tp 2 \
   --ple-storage disk \
-  --ple-disk-dir /mnt/local-nvme/qwen4-ple \
-  --ple-disk-hot-cache-gb 8 \
-  --ple-disk-dynamic-cache-gb 2
+  --ple-disk-dir /mnt/local-nvme/qwen4-ple
 ```
+
+This example starts with an empty static hot cache because it does not pass `--ple-disk-hot-frequency-file`. It uses the default 2 GiB dynamic cache budget.
 
 SGLang checks each 4 KiB image page against its stored CRC before using the rows. An incomplete install, older image format, or incompatible manifest produces an error that names the directory to delete before rebuilding.
 
@@ -53,7 +53,7 @@ Set `--ple-disk-stats-log-interval N` to log cumulative storage and cache counte
 
 The hot and dynamic cache budgets are totals across all tensor-parallel ranks and all PLE layers. SGLang divides each budget evenly among the corresponding embedding instances. Each layer has its own readers, staging buffers, caches, and executors.
 
-The image fingerprint covers the sanitized model configuration, shard metadata, and up to 64 evenly spaced rows from each shard. A replace-in-place checkpoint edit outside those samples requires deletion of the old image directory. The model configuration can include its source path, so moving a checkpoint can produce a different fingerprint and rebuild the image.
+The image fingerprint covers the sanitized model configuration, shard metadata, and up to 64 evenly spaced rows from each shard. A replace-in-place checkpoint edit outside those samples requires deletion of the old image directory.
 
 ## Generate a static hot-row file
 

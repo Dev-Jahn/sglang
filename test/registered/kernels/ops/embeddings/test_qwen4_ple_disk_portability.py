@@ -1,9 +1,11 @@
 import ctypes
 import errno
 import gc
+import importlib.metadata
 import importlib.util
 import json
 import os
+import runpy
 import struct
 import sys
 import threading
@@ -18,7 +20,7 @@ import pytest
 import torch
 
 from sglang.srt import server_args as server_args_module
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models import qwen4_ple_disk as disk
 from sglang.srt.models.qwen4_exp import (
@@ -37,6 +39,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
+_REAL_ALLOCATE_HOST_TENSOR = disk._allocate_host_tensor
+
 
 @pytest.fixture(autouse=True)
 def replace_pinned_allocators_without_cuda(monkeypatch):
@@ -48,6 +52,31 @@ def replace_pinned_allocators_without_cuda(monkeypatch):
 
     monkeypatch.setattr(disk, "_allocate_host_tensor", cpu_host_tensor)
     monkeypatch.setattr(qwen4_exp_module, "_allocate_host_tensor", cpu_host_tensor)
+
+
+def test_host_tensor_allocator_pins_the_cpu_device(monkeypatch):
+    call = {}
+
+    def record_empty(*args, **kwargs):
+        call.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+    _REAL_ALLOCATE_HOST_TENSOR(1, pin_memory=False)
+    assert call["device"] == "cpu"
+
+
+def test_sgl_kernel_version_survives_missing_distribution_metadata(monkeypatch):
+    version_file = (
+        Path(__file__).parents[5]
+        / "python/sglang/kernels/aot/python/sgl_kernel/version.py"
+    )
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: (_ for _ in ()).throw(importlib.metadata.PackageNotFoundError),
+    )
+    assert runpy.run_path(version_file)["__version__"] == "0.4.6.post2"
 
 
 @pytest.mark.parametrize("rows", [4, 8])
@@ -334,13 +363,14 @@ def test_helper_is_loaded_from_the_sgl_kernel_package(tmp_path, monkeypatch):
     helper.touch()
     spec = SimpleNamespace(submodule_search_locations=[str(package_dir)])
     monkeypatch.setattr(disk.importlib.util, "find_spec", lambda name: spec)
-    monkeypatch.setattr(disk, "_installed_sgl_kernel_version", lambda: "0.4.6.post2")
+    (package_dir / "qwen4_ple_disk_fetcher.build").write_text("enabled\n")
+    monkeypatch.setattr(disk, "_installed_sgl_kernel_version", lambda: "0.4.6.post1")
     assert disk._find_helper_library() == helper
 
 
 def test_missing_helper_names_the_required_sgl_kernel_version(monkeypatch):
     monkeypatch.setattr(disk.importlib.util, "find_spec", lambda name: None)
-    with pytest.raises(RuntimeError, match=disk.REQUIRED_SGL_KERNEL_VERSION):
+    with pytest.raises(RuntimeError, match=disk.MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK):
         disk._find_helper_library()
 
 
@@ -1189,17 +1219,19 @@ def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
 def test_capture_start_drops_references_from_the_previous_graph():
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
-    layer._graph_prefetch_buffers = {1: object()}
     layer._graph_lookup_id_buffers = {1: object()}
     layer._graph_embedding_snapshot_buffers = {1: object()}
     layer._graph_lookup_validation_due = {1}
+    layer._pending_graph_lookup_validation = object()
+    layer._pending_graph_embedding_validation = object()
 
     layer.reset_cuda_graph_capture_buffers()
 
-    assert layer._graph_prefetch_buffers == {}
     assert layer._graph_lookup_id_buffers == {}
     assert layer._graph_embedding_snapshot_buffers == {}
     assert layer._graph_lookup_validation_due == set()
+    assert layer._pending_graph_lookup_validation is None
+    assert layer._pending_graph_embedding_validation is None
 
 
 def test_aborted_graph_replay_reset_discards_pending_validation(monkeypatch):
@@ -1252,6 +1284,34 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
         match=r"one step behind.*step 17.*already emitted.*lookup.tokens=2",
     ):
         layer.validate_cuda_graph_replay()
+
+
+def test_graph_validation_recycles_every_consumed_ready_entry():
+    class ReadyEvent:
+        def query(self):
+            return True
+
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer._graph_validation_free_slots = deque()
+    layer._completed_graph_lookup_validation = deque(
+        [
+            (2, 17, torch.tensor([True]), ReadyEvent()),
+            (4, 18, torch.tensor([False]), ReadyEvent()),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="step 17"):
+        layer._consume_graph_validation(
+            "_completed_graph_lookup_validation", "lookup mismatch"
+        )
+
+    assert not layer._completed_graph_lookup_validation
+    assert len(layer._graph_validation_free_slots) == 2
+
+
+def test_forward_batch_declares_model_batch_hook_state():
+    assert "_model_batch_hook_prepared" in ForwardBatch.__dataclass_fields__
 
 
 def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):
@@ -1523,7 +1583,7 @@ def test_unknown_device_block_alignment_stops_before_direct_io(tmp_path, monkeyp
         disk._logical_block_size(path)
 
 
-def test_direct_reader_closes_fd_when_native_destroy_fails(tmp_path, monkeypatch):
+def test_direct_reader_retries_native_destroy_after_busy(tmp_path, monkeypatch, caplog):
     image = disk.build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
@@ -1531,13 +1591,34 @@ def test_direct_reader_closes_fd_when_native_destroy_fails(tmp_path, monkeypatch
     )
     reader = disk.DirectPageReader(image, max_pages=1)
     fd = reader.fd
-    reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: -errno.EBUSY)
-    with pytest.raises(OSError, match="shutdown failed"):
+    handle = reader.handle
+    results = iter((-errno.EBUSY, 0))
+    reader.lib.ple_fetcher_destroy = _FakeFunction(lambda value: next(results))
+    with caplog.at_level("ERROR"), pytest.raises(OSError, match="shutdown failed"):
         reader.close()
+    assert reader.handle == handle
+    os.fstat(fd)
+    assert "busy" in caplog.text
+    assert "could not drain" not in caplog.text
+
+    reader.close()
     with pytest.raises(OSError) as exc_info:
         os.fstat(fd)
     assert exc_info.value.errno == errno.EBADF
     assert reader.handle is None
+
+
+def test_disk_fetcher_calls_raise_after_close():
+    fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
+    fetcher._closed = True
+    fetcher._prefill_executor = None
+
+    with pytest.raises(RuntimeError, match="PLE disk fetcher is closed"):
+        fetcher.fetch(np.array([0], dtype=np.int64))
+    with pytest.raises(RuntimeError, match="PLE disk fetcher is closed"):
+        fetcher.submit_prefill(np.array([0], dtype=np.int64))
+    with pytest.raises(RuntimeError, match="PLE disk fetcher is closed"):
+        fetcher.wait_prefill()
 
 
 def test_fetcher_constructor_closes_decode_reader_when_prefill_reader_fails(

@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "sglang-kernel"
-dynamic = ["version"]
+version = "0.4.6.post2"
 authors = [
   { name="SGLang Kernel Team", email="sglang@lmsys.org" },
 ]
@@ -40,8 +40,3 @@ minimum-version = "build-system.requires"
 wheel.py-api = "cp310"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]
-
-[tool.scikit-build.metadata.version]
-provider = "scikit_build_core.metadata.regex"
-input = "../sgl_kernel_version.py"
-regex = '''SGL_KERNEL_VERSION\s*=\s*["'](?P<value>[^"']+)["']'''

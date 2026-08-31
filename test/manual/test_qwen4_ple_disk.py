@@ -46,6 +46,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module", autouse=True)
 def require_ple_direct_io(tmp_path_factory):
+    hard_fail = os.environ.get("SGLANG_CI_PLE_DISK_IO_URING") == "1"
     root = tmp_path_factory.mktemp("ple-direct-io-probe")
     _, rows = _fp8_rows(25)
     image = build_test_image(root, rows)
@@ -58,13 +59,14 @@ def require_ple_direct_io(tmp_path_factory):
             errno.EPERM,
             errno.EACCES,
             errno.ENOSYS,
+            errno.EINVAL,
             errno.EOPNOTSUPP,
             errno.ENOMEM,
         }:
             reason = f"PLE io_uring or O_DIRECT is unavailable: {exc}"
             # Self-hosted runner operators may enable this after confirming the
             # runner permits io_uring and its scratch filesystem supports O_DIRECT.
-            if os.environ.get("SGLANG_CI_PLE_DISK_IO_URING") == "1":
+            if hard_fail:
                 pytest.fail(reason)
             pytest.skip(reason)
         raise
@@ -74,8 +76,12 @@ def require_ple_direct_io(tmp_path_factory):
             "requires sglang-kernel" in message
             or "qwen4_ple_disk_fetcher" in message
             or "io_uring support" in message
+            or "Could not determine the logical block size" in message
         ):
-            pytest.skip(f"PLE disk helper is unavailable: {exc}")
+            reason = f"PLE disk helper or direct-I/O storage is unavailable: {exc}"
+            if hard_fail:
+                pytest.fail(reason)
+            pytest.skip(reason)
         raise
     finally:
         if reader is not None:
@@ -826,7 +832,6 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
         dtype=torch.bfloat16,
         device=device,
     )
-    layer._graph_prefetch_buffers = {}
     layer._graph_replay_generation = None
     layer._graph_replay_stage_expected = False
     layer._graph_replay_lookup_tokens = None
@@ -901,7 +906,6 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     legacy_ids = ngram.compute_ngram_ids(legacy_batch)
     assert legacy_batch.processed_tokens == 1
     assert legacy_ids.shape[0] == 1
-    assert 1 not in layer._graph_prefetch_buffers
     assert 1 not in layer._graph_lookup_id_buffers
     assert 1 not in layer._graph_embedding_snapshot_buffers
 

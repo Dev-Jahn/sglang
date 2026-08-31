@@ -17,6 +17,7 @@ struct fetcher {
   int ring_fd;
   int fixed_buffer;
   int poisoned;
+  int terminal_leaked;
   int state;
   int has_last_error;
   unsigned last_error_index;
@@ -99,11 +100,12 @@ static long register_ring(int fd, unsigned op, const void* arg, unsigned nr) {
 
 void* ple_fetcher_create(
     int file_fd, void* buffer, size_t buffer_bytes, unsigned max_pages, int register_buffer, int* failure_stage) {
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_SETUP;
+  if (failure_stage) *failure_stage = FETCHER_FAILURE_NONE;
   if (!buffer || !max_pages || buffer_bytes < (size_t)max_pages * 4096 || ((uintptr_t)buffer & 4095)) {
     errno = EINVAL;
     return NULL;
   }
+  if (failure_stage) *failure_stage = FETCHER_FAILURE_SETUP;
   struct fetcher* f = calloc(1, sizeof(*f));
   if (!f) return NULL;
   f->ring_fd = -1;
@@ -205,7 +207,7 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result) {
   return completed;
 }
 
-static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned* waits) {
+static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned* waits, unsigned max_waits) {
   unsigned completed = 0;
   while (completed < count) {
     unsigned reaped = reap_available(f, count - completed, result);
@@ -221,7 +223,7 @@ static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned
     completed += reaped;
     if (completed == count) return 0;
     if (reaped) continue;
-    if (!ple_fetcher_retry_after_timeout(waits)) return -ETIMEDOUT;
+    if (++*waits >= max_waits) return -ETIMEDOUT;
   }
   return 0;
 }
@@ -245,7 +247,8 @@ static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned c
 
   int ignored_result = 0;
   unsigned quiesce_waits = 0;
-  if (submitted > completed && reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits) < 0) {
+  if (submitted > completed &&
+      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_MAX_WAITS) < 0) {
     return poison_fetcher(f);
   }
   if (submitted != count) {
@@ -261,17 +264,20 @@ static int finish_read(struct fetcher* f, int result) {
 
 int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void* buffer, size_t buffer_bytes) {
   struct fetcher* f = opaque;
-  if (!f || !buffer || count > f->max_pages || ((uintptr_t)buffer & 4095)) return -EINVAL;
+  if (!f) return -EINVAL;
+  if (__atomic_load_n(&f->terminal_leaked, __ATOMIC_ACQUIRE)) return -ETIMEDOUT;
+  if (!buffer || count > f->max_pages || ((uintptr_t)buffer & 4095)) return -EINVAL;
   if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return -EUCLEAN;
   if (count == 0) return 0;
   if (!offsets) return -EINVAL;
+  for (unsigned index = 0; index < count; ++index)
+    if (offsets[index] & 4095) return -EINVAL;
   size_t required_bytes = (size_t)count * 4096;
   if (buffer_bytes < required_bytes) return -EFAULT;
   if (f->fixed_buffer && (buffer != f->registered_buffer || required_bytes > f->registered_buffer_bytes))
     return -EFAULT;
   int expected_state = 0;
-  if (!__atomic_compare_exchange_n(&f->state, &expected_state, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-    return expected_state == 2 ? -EBADF : -EBUSY;
+  if (!__atomic_compare_exchange_n(&f->state, &expected_state, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return -EBUSY;
   f->has_last_error = 0;
   f->last_error_index = 0;
   f->last_error_result = 0;
@@ -340,10 +346,11 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
 
 int ple_fetcher_last_error(void* opaque, unsigned* index, int* result) {
   struct fetcher* f = opaque;
-  if (!f || !index || !result) return -EINVAL;
+  if (!f) return -EINVAL;
+  if (__atomic_load_n(&f->terminal_leaked, __ATOMIC_ACQUIRE)) return -ETIMEDOUT;
+  if (!index || !result) return -EINVAL;
   int expected_state = 0;
-  if (!__atomic_compare_exchange_n(&f->state, &expected_state, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-    return expected_state == 2 ? -EBADF : -EBUSY;
+  if (!__atomic_compare_exchange_n(&f->state, &expected_state, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return -EBUSY;
   int has_error = f->has_last_error;
   if (has_error) {
     *index = f->last_error_index;
@@ -356,10 +363,13 @@ int ple_fetcher_last_error(void* opaque, unsigned* index, int* result) {
 int ple_fetcher_destroy(void* opaque) {
   struct fetcher* f = opaque;
   if (!f) return 0;
+  if (__atomic_load_n(&f->terminal_leaked, __ATOMIC_ACQUIRE)) return -ETIMEDOUT;
   int expected_state = 0;
   unsigned waits = 0;
   while (!__atomic_compare_exchange_n(&f->state, &expected_state, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-    if (expected_state == 2) return 0;
+    /* Concurrent destroy violates the public contract; keep this result for
+     * diagnostics if a caller bypasses the wrapper serialization. */
+    if (expected_state == 2) return -EBUSY;
     if (++waits >= PLE_FETCHER_DESTROY_MAX_WAITS) return -EBUSY;
     expected_state = 0;
     const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
@@ -369,7 +379,12 @@ int ple_fetcher_destroy(void* opaque) {
     unsigned drain_count = f->outstanding;
     unsigned drain_waits = 0;
     int ignored_result = 0;
-    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits) < 0) return -ETIMEDOUT;
+    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_MAX_WAITS) < 0) {
+      /* The ring and all mappings stay allocated because the kernel may still
+       * complete a request into the registered staging buffer. */
+      __atomic_store_n(&f->terminal_leaked, 1, __ATOMIC_RELEASE);
+      return -ETIMEDOUT;
+    }
   }
   int destroy_result = 0;
   if (f->ring_fd >= 0) {

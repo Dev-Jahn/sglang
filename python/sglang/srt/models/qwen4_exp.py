@@ -76,6 +76,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_ple_disk import _allocate_host_tensor
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm120_supported, is_sm121, logger
 from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
@@ -101,10 +102,6 @@ _PLE_EMBEDDING_ATTRIBUTES = (
     "num_org_embeddings_per_partition",
     "num_added_embeddings_per_partition",
 )
-
-
-def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
-    return torch.empty(*size, device="cpu", pin_memory=pin_memory, **kwargs)
 
 
 def _ple_transfer_buffer_retain_rows(
@@ -208,11 +205,6 @@ def _prepare_ple_batch(
         if replay is not None
         else _get_processed_token_count(forward_batch, physical_tokens)
     )
-    if replay is not None and processed_tokens != physical_tokens:
-        raise RuntimeError(
-            "PLE graph replay input does not match its padded token extent: "
-            f"{processed_tokens=} {physical_tokens=}"
-        )
     tokens = input_ids[:processed_tokens]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
@@ -1633,7 +1625,6 @@ class Qwen4ExpPLELayer(nn.Module):
             torch.cuda.Stream() if ple_storage in ("pinned", "disk") else None
         )
         self._graph_prefetch_buffer = None
-        self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
         self._graph_replay_generation = None
@@ -1645,7 +1636,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_lookup_validation_interval = (
             envs.SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL.get()
         )
-        if self._graph_lookup_validation_interval <= 0:
+        if ple_storage == "disk" and self._graph_lookup_validation_interval <= 0:
             raise ValueError(
                 "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL must be positive"
             )
@@ -1821,10 +1812,11 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffer = buffer
 
     def reset_cuda_graph_capture_buffers(self) -> None:
-        self._graph_prefetch_buffers.clear()
         self._graph_lookup_id_buffers.clear()
         self._graph_embedding_snapshot_buffers.clear()
         self._graph_lookup_validation_due.clear()
+        self._pending_graph_lookup_validation = None
+        self._pending_graph_embedding_validation = None
 
     @staticmethod
     def _is_capturing() -> bool:
@@ -1844,9 +1836,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self, lookup_tokens: int, lookup_ids: torch.Tensor
     ) -> torch.Tensor:
         if self._is_capturing():
-            return self._select_graph_prefetch_buffer(
-                lookup_tokens, device=lookup_ids.device, allocate=True
-            )
+            return self._select_graph_prefetch_buffer(lookup_tokens, allocate=True)
 
         buffer = self._eager_prefetch_buffer
         if buffer is None or buffer.shape[0] < lookup_tokens:
@@ -1858,7 +1848,6 @@ class Qwen4ExpPLELayer(nn.Module):
         self,
         lookup_tokens: int,
         *,
-        device: Optional[torch.device] = None,
         allocate: bool = False,
     ) -> torch.Tensor:
         if self._graph_prefetch_buffer is not None:
@@ -2098,20 +2087,25 @@ class Qwen4ExpPLELayer(nn.Module):
         completed = getattr(self, completed_attr, None)
         if not completed:
             return
+        consumed = []
         while completed and completed[0][3].query():
-            lookup_tokens, replay_step, host_result, ready = completed.popleft()
-            mismatch = bool(host_result.numpy()[0])
-            free_slots = getattr(self, "_graph_validation_free_slots", None)
-            if free_slots is None:
-                free_slots = deque()
-                self._graph_validation_free_slots = free_slots
-            free_slots.append((host_result, ready))
-            if mismatch:
-                raise RuntimeError(
-                    f"{error_message}; check is one step behind: output for replay "
-                    f"step {replay_step} was already emitted "
-                    f"(lookup tokens={lookup_tokens})"
-                )
+            consumed.append(completed.popleft())
+        free_slots = getattr(self, "_graph_validation_free_slots", None)
+        if free_slots is None:
+            free_slots = deque()
+            self._graph_validation_free_slots = free_slots
+        try:
+            for lookup_tokens, replay_step, host_result, _ in consumed:
+                if bool(host_result.numpy()[0]):
+                    raise RuntimeError(
+                        f"{error_message}; check is one step behind: output for "
+                        f"replay step {replay_step} was already emitted "
+                        f"(lookup tokens={lookup_tokens})"
+                    )
+        finally:
+            free_slots.extend(
+                (host_result, ready) for _, _, host_result, ready in consumed
+            )
 
     def validate_cuda_graph_replay(self) -> None:
         self._consume_graph_validation(
@@ -2767,8 +2761,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         ]
         if not disk_layers:
             return
-        # Replay batch construction updates the shared PLE window cache. The graph
-        # does not read it, and the following eager forward installs its own batch.
+        # Replay batch construction refreshes the shared PLE window cache. The next
+        # replay preparation clears it before building the next batch.
         batch = _prepare_ple_batch(
             replay.input_ids,
             replay.runtime_forward_batch,
