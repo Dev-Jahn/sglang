@@ -923,7 +923,7 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
     model.wait_cuda_graph_replay()
     graph.replay()
     model.finish_cuda_graph_replay()
-    model.reset_cuda_graph_replay()
+    model.release_cuda_graph_replay()
 
     assert layer._pending_graph_lookup_validation is None
     assert layer._pending_graph_embedding_validation is None
@@ -936,7 +936,7 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
 
     assert not layer._completed_graph_lookup_validation
     assert not layer._completed_graph_embedding_validation
-    model.reset_cuda_graph_replay()
+    model.release_cuda_graph_replay()
 
 
 def test_graph_lookup_validation_records_an_async_host_result():

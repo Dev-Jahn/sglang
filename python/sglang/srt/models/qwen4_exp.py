@@ -964,6 +964,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         valid_vocab_size: int,
         module_prefix: str = "ple",
         ple_layer_index: int = 0,
+        ple_metadata: Optional[dict] = None,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -1017,6 +1018,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             "padded_vocab_size": self.num_embeddings_padded,
             "valid_vocab_size": int(valid_vocab_size),
             "dtype": "float8_e4m3fn",
+            "ple_metadata": ple_metadata,
         }
         self._image_builder = PLEImageBuilder(**self._builder_args)
         self._rank = rank
@@ -1224,6 +1226,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         storage_fetch_us = (time.perf_counter_ns() - fetch_started) / 1000.0
         fetch_stats = self._fetcher.last_fetch_stats
         with torch.cuda.stream(stream):
+            raw_device.record_stream(stream)
             raw_device.copy_(raw_host, non_blocking=True)
             output.copy_(raw_device.view(torch.float8_e4m3fn).to(torch.bfloat16))
             complete = torch.cuda.Event()
@@ -1272,10 +1275,9 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         stream = torch.cuda.current_stream(input_ids.device)
         host_ids.copy_(input_ids, non_blocking=True)
         ids_ready = torch.cuda.Event()
-        # There is one in-flight fetch per embedding. The worker enqueues the
-        # raw_host copy on this stream before its future completes. A later
-        # launch waits for that future, then records ids_ready on the same
-        # stream, so ids_ready.synchronize() also waits for the prior host read.
+        # There is one in-flight fetch per embedding. gather and stage_graph_step
+        # reject another launch until wait_for_prefetch has joined the worker,
+        # so the worker finishes reading host_ids before this storage is reused.
         ids_ready.record(stream)
         self._future = self._executor.submit(
             self._fetch_to_device,
@@ -1464,7 +1466,8 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         if future is not None:
             self._future = None
             try:
-                future.result()
+                result = future.result()
+                self._completion_event = result[0]
             except BaseException as exc:
                 first_error = first_error or exc
                 logger.warning("PLE disk fetch failed during shutdown", exc_info=True)
@@ -1489,7 +1492,17 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
                 executor.shutdown(wait=True)
             except BaseException as exc:
                 first_error = first_error or exc
-        self._transfer_buffers.clear()
+        completion_event = getattr(self, "_completion_event", None)
+        release_transfer_buffers = True
+        if completion_event is not None:
+            try:
+                completion_event.synchronize()
+            except BaseException as exc:
+                first_error = first_error or exc
+                release_transfer_buffers = False
+        if release_transfer_buffers:
+            self._transfer_buffers.clear()
+            self._completion_event = None
         self._active_transfer_device = None
         self._prefill_host_ids = None
         self._active_graph_generation = None
@@ -1590,6 +1603,13 @@ class Qwen4ExpPLELayer(nn.Module):
                 int(self.ple_embedding.ngram_heads_vocab_sizes.sum().item()),
                 module_prefix=prefix,
                 ple_layer_index=ple_layer_index,
+                ple_metadata={
+                    "multipliers": self.ple_embedding.layer_multipliers.tolist(),
+                    "vocab_sizes": self.ple_embedding.ngram_heads_vocab_sizes.tolist(),
+                    "offsets": self.ple_embedding.ngram_heads_offsets.tolist(),
+                    "eos_token_id": self.ple_embedding.eos_token_id,
+                    "ngram_size": self.ple_embedding.ngram_size,
+                },
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
@@ -2160,7 +2180,7 @@ class Qwen4ExpPLELayer(nn.Module):
             self._graph_replay_prefetch_buffer = None
             self._graph_replay_step_index = None
 
-    def reset_cuda_graph_replay(self) -> None:
+    def release_cuda_graph_replay(self) -> None:
         offloaded_embedding = self.ple_embedding.ngram_embedding
         try:
             if isinstance(offloaded_embedding, Qwen4ExpDiskEmbedding):
@@ -2800,7 +2820,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ple.prepare_cuda_graph_replay(batch, lookup_ids)
         except BaseException:
             for ple in disk_layers:
-                ple.reset_cuda_graph_replay()
+                ple.release_cuda_graph_replay()
             raise
 
     def wait_cuda_graph_replay(self) -> None:
@@ -2817,10 +2837,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if isinstance(ple.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
                 ple.finish_cuda_graph_replay()
 
-    def reset_cuda_graph_replay(self) -> None:
+    def release_cuda_graph_replay(self) -> None:
         for ple in self._ple_layers():
             if isinstance(ple.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
-                ple.reset_cuda_graph_replay()
+                ple.release_cuda_graph_replay()
 
     def close(self) -> None:
         for ple in self._ple_layers():
@@ -3119,8 +3139,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def finish_cuda_graph_replay(self) -> None:
         self.model.finish_cuda_graph_replay()
 
-    def reset_cuda_graph_replay(self) -> None:
-        self.model.reset_cuda_graph_replay()
+    def release_cuda_graph_replay(self) -> None:
+        self.model.release_cuda_graph_replay()
 
     def close(self) -> None:
         self.model.close()

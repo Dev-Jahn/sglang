@@ -65,6 +65,8 @@ FETCHER_FAILURE_REGISTER_BUFFER = 2
 FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
 _METADATA_HEADER = struct.Struct("<8sI")
 _METADATA_HEADER_BYTES = _METADATA_HEADER.size
+# Intentionally unbounded: releasing any entry could let the kernel write into
+# freed memory after a native reader teardown timed out or stayed busy.
 _RETAINED_POISONED_STAGING = []
 
 
@@ -220,14 +222,24 @@ def _read_metadata_page(path: Path, expected_magic: bytes) -> dict:
     if len(block) != PAGE_BYTES:
         raise IOError(f"short PLE metadata read from {path}")
     magic, length = _METADATA_HEADER.unpack_from(block)
+    display_path = path.parent if expected_magic == IMAGE_MAGIC else path
+    if (
+        expected_magic == IMAGE_MAGIC
+        and magic.startswith(b"PLEDISK")
+        and magic != IMAGE_MAGIC
+    ):
+        raise ValueError(
+            f"PLE image in {display_path} uses an older format; delete that "
+            "directory before rebuilding"
+        )
     if magic != expected_magic or length > PAGE_BYTES - _METADATA_HEADER_BYTES:
-        raise ValueError(f"invalid PLE metadata header in {path}")
+        raise ValueError(f"invalid PLE metadata header in {display_path}")
     try:
         return json.loads(
             block[_METADATA_HEADER_BYTES : _METADATA_HEADER_BYTES + length]
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid PLE metadata JSON in {path}") from exc
+        raise ValueError(f"invalid PLE metadata JSON in {display_path}") from exc
 
 
 def _validate_manifest_ranges(manifest: list[dict], vocab_end: int, path: Path) -> None:
@@ -481,6 +493,7 @@ class PLEImageBuilder:
         padded_vocab_size: Optional[int] = None,
         valid_vocab_size: Optional[int] = None,
         dtype: str = "float8_e4m3fn",
+        ple_metadata: Optional[Mapping] = None,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -497,6 +510,7 @@ class PLEImageBuilder:
         self.padded_vocab_size = int(padded_vocab_size or default_padded_vocab)
         self.valid_vocab_size = int(valid_vocab_size or vocab_end)
         self.dtype = str(dtype)
+        self.ple_metadata = dict(ple_metadata) if ple_metadata is not None else None
         if self.image_count <= 0:
             raise ValueError("image_count must be positive")
         if self.padded_vocab_size % self.tp_size:
@@ -551,7 +565,11 @@ class PLEImageBuilder:
         for path in self.root.glob(f"*/rank{self.rank}.bin"):
             try:
                 header = _read_metadata_page(path, IMAGE_MAGIC)
-            except (OSError, ValueError):
+            except OSError:
+                continue
+            except ValueError as exc:
+                if "uses an older format" in str(exc):
+                    raise
                 continue
             if (
                 header.get("config_sha256") == self.config_sha256
@@ -722,6 +740,7 @@ class PLEImageBuilder:
         image_path = final_dir / f"rank{self.rank}.bin"
         crc_path = final_dir / f"rank{self.rank}.crc32"
         manifest_path = final_dir / "manifest.json"
+        ple_metadata_path = final_dir / "ple-metadata.json"
         header = {
             "format_version": FORMAT_VERSION,
             "fingerprint": fingerprint,
@@ -748,6 +767,7 @@ class PLEImageBuilder:
         tmp_image = Path(tmp_image_name)
         tmp_crc: Optional[Path] = None
         manifest_tmp: Optional[Path] = None
+        ple_metadata_tmp: Optional[Path] = None
         try:
             header_page = _write_metadata_page(IMAGE_MAGIC, header)
             if os.write(out_fd, header_page) != len(header_page):
@@ -820,8 +840,29 @@ class PLEImageBuilder:
             finally:
                 os.close(manifest_fd)
 
+            if self.ple_metadata is not None:
+                ple_metadata_doc = dict(self.ple_metadata)
+                ple_metadata_doc["fingerprint"] = fingerprint
+                ple_metadata_payload = (
+                    json.dumps(ple_metadata_doc, indent=2, sort_keys=True) + "\n"
+                ).encode()
+                metadata_fd, metadata_tmp_name = tempfile.mkstemp(
+                    prefix=".ple-metadata.", suffix=".tmp", dir=final_dir
+                )
+                ple_metadata_tmp = Path(metadata_tmp_name)
+                try:
+                    if os.write(metadata_fd, ple_metadata_payload) != len(
+                        ple_metadata_payload
+                    ):
+                        raise IOError("short write while storing PLE hash metadata")
+                    os.fsync(metadata_fd)
+                finally:
+                    os.close(metadata_fd)
+
             os.replace(tmp_crc, crc_path)
             os.replace(manifest_tmp, manifest_path)
+            if ple_metadata_tmp is not None:
+                os.replace(ple_metadata_tmp, ple_metadata_path)
             directory_fd = os.open(final_dir, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_fd)
@@ -854,6 +895,8 @@ class PLEImageBuilder:
                 tmp_crc.unlink(missing_ok=True)
             if manifest_tmp is not None:
                 manifest_tmp.unlink(missing_ok=True)
+            if ple_metadata_tmp is not None:
+                ple_metadata_tmp.unlink(missing_ok=True)
 
     def close(self) -> None:
         if self._raw_fd is not None:
@@ -974,7 +1017,7 @@ def read_hot_frequency_file(
     path: str | Path,
     rank: int,
     *,
-    expected_fingerprint: str = "",
+    expected_fingerprint: str,
     expected_tp_size: Optional[int] = None,
     expected_vocab_start: Optional[int] = None,
     expected_vocab_end: Optional[int] = None,
@@ -986,7 +1029,7 @@ def read_hot_frequency_file(
     if header.get("dtype") != "uint32-global-row-id":
         raise ValueError("PLE hot-frequency file dtype mismatch")
     fingerprint = header.get("fingerprint", "")
-    if expected_fingerprint and fingerprint != expected_fingerprint:
+    if fingerprint != expected_fingerprint:
         raise ValueError("PLE hot-frequency file fingerprint mismatch")
     if expected_tp_size is not None and int(header.get("tp_size", -1)) != int(
         expected_tp_size
@@ -1441,8 +1484,7 @@ class WTinyLFURowCache:
             error = error or RuntimeError(
                 "PLE disk dynamic cache could not enqueue its shutdown marker"
             )
-            if error is not exc:
-                error.__cause__ = exc
+            error.__cause__ = error.__cause__ or exc
         self._worker.join(timeout=5.0)
         if self._worker.is_alive():
             error = error or RuntimeError(
@@ -1462,6 +1504,11 @@ def _installed_sgl_kernel_version() -> Optional[str]:
 def _find_helper_library() -> Path:
     spec = importlib.util.find_spec("sgl_kernel")
     locations = list(spec.submodule_search_locations or ()) if spec is not None else []
+    if not locations:
+        raise RuntimeError(
+            "PLE disk storage cannot start because sgl_kernel is not importable; "
+            "install the matching sglang-kernel wheel"
+        )
     for location in locations:
         package_dir = Path(location)
         helper = package_dir / "qwen4_ple_disk_fetcher.so"
@@ -1487,14 +1534,9 @@ def _find_helper_library() -> Path:
             "Install the matching "
             "sglang-kernel wheel"
         )
-    for location in locations:
-        package_dir = Path(location)
-        helper = package_dir / "qwen4_ple_disk_fetcher.so"
-        if helper.is_file():
-            return helper
     markers = [
-        package_dir / "qwen4_ple_disk_fetcher.build"
-        for package_dir in map(Path, locations)
+        location_path / "qwen4_ple_disk_fetcher.build"
+        for location_path in map(Path, locations)
     ]
     enabled_marker = any(
         marker.is_file() and marker.read_text().strip() == "enabled"
@@ -1539,6 +1581,7 @@ class DirectPageReader:
         self.offsets = np.empty(self.max_pages, dtype=np.uint64)
         self._read_lock = threading.Lock()
         self._poisoned = False
+        self._staging_retained = False
         if self.staging.data_ptr() & (self.alignment - 1):
             raise RuntimeError("PLE registered staging buffer is not O_DIRECT aligned")
         self.lib = ctypes.CDLL(str(_find_helper_library()), use_errno=True)
@@ -1710,7 +1753,9 @@ class DirectPageReader:
                 else:
                     self.handle = None
                     if -rc == errno.ETIMEDOUT:
-                        _RETAINED_POISONED_STAGING.append(self._staging_allocation)
+                        if not self._staging_retained:
+                            _RETAINED_POISONED_STAGING.append(self._staging_allocation)
+                            self._staging_retained = True
                         logger.error(
                             "PLE disk fetcher retained %d staging bytes for the "
                             "process lifetime after shutdown could not drain "
@@ -1731,6 +1776,15 @@ class DirectPageReader:
     def __del__(self) -> None:
         try:
             self.close()
+        except OSError as exc:
+            if exc.errno == errno.EBUSY and not self._staging_retained:
+                _RETAINED_POISONED_STAGING.append(self._staging_allocation)
+                self._staging_retained = True
+                logger.error(
+                    "PLE disk fetcher retained %d staging bytes during garbage "
+                    "collection because native shutdown stayed busy",
+                    self._staging_allocation.numel(),
+                )
         except Exception:
             pass
 
@@ -2110,7 +2164,6 @@ class DiskRowFetcher:
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
-        self._closed = True
         first_error = None
         if getattr(self, "_prefill_executor", None) is not None:
             try:
@@ -2124,6 +2177,7 @@ class DiskRowFetcher:
                 executor.shutdown(wait=True)
             except BaseException as exc:
                 first_error = first_error or exc
+        self._closed = True
         self.hot = None
         dynamic = getattr(self, "dynamic", None)
         if dynamic is not None:

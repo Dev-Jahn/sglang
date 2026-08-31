@@ -5,11 +5,9 @@ The input token file has no header. It is a contiguous array of little-endian
 signed 32-bit token IDs. Insert the model EOS token between documents so PLE
 history does not cross document boundaries.
 
-The metadata JSON contains ``multipliers`` (3 int64 values), ``vocab_sizes``
-(16 int64 values), ``offsets`` (16 int64 values), and ``eos_token_id``. These
-values can be copied from the loaded PLE module or checkpoint tensors. The
-output is the runtime ``PLHOT001`` file accepted by
-``--ple-disk-hot-frequency-file``.
+The metadata JSON contains the hash geometry and image fingerprint written by
+the server next to each PLE disk image. The output is the runtime ``PLHOT001``
+file accepted by ``--ple-disk-hot-frequency-file``.
 """
 
 from __future__ import annotations
@@ -39,6 +37,7 @@ def load_metadata(path: Path) -> PLEMetadata:
         offsets=np.asarray(document["offsets"], dtype=np.int64),
         eos_token_id=int(document["eos_token_id"]),
         ngram_size=ngram_size,
+        fingerprint=str(document.get("fingerprint", "")),
     )
 
 
@@ -142,7 +141,7 @@ def main() -> None:
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--fingerprint", required=True)
+    parser.add_argument("--fingerprint")
     parser.add_argument("--tp-size", type=int, required=True)
     parser.add_argument("--budget-gib", type=float, default=8.0)
     parser.add_argument("--padding-divisor", type=int, default=128)
@@ -150,6 +149,17 @@ def main() -> None:
     args = parser.parse_args()
 
     metadata = load_metadata(args.metadata)
+    fingerprint = args.fingerprint or metadata.fingerprint
+    if not fingerprint:
+        parser.error(
+            "--fingerprint is required when the metadata file has no fingerprint"
+        )
+    if (
+        args.fingerprint
+        and metadata.fingerprint
+        and args.fingerprint != metadata.fingerprint
+    ):
+        parser.error("--fingerprint does not match the metadata file")
     counts = open_counts(args.work_dir, metadata)
     token_count = count_rows(args.tokens, metadata, counts, args.chunk_tokens)
     capacity = int(args.budget_gib * (1 << 30) // ROW_BYTES)
@@ -164,7 +174,7 @@ def main() -> None:
     write_hot_frequency_file(
         args.output,
         ranks,
-        fingerprint=args.fingerprint,
+        fingerprint=fingerprint,
         total_rows=int(metadata.vocab_sizes.sum()),
         tp_size=args.tp_size,
         padding_divisor=args.padding_divisor,

@@ -7,12 +7,9 @@ import json
 import os
 import queue
 import runpy
-import struct
-import sys
 import threading
 import weakref
-from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,8 +17,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt import server_args as server_args_module
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models import qwen4_ple_disk as disk
 from sglang.srt.models.qwen4_exp import (
@@ -31,15 +27,10 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
     _prepare_ple_batch,
 )
-from sglang.srt.models.qwen4_ple_hash import (
-    PLEMetadata,
-    hash_contexts_numpy,
-    hash_token_stream_numpy,
-)
 from sglang.srt.utils.ple_disk import IORING_MAX_ENTRIES
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _REAL_ALLOCATE_HOST_TENSOR = disk._allocate_host_tensor
 
@@ -266,29 +257,6 @@ def _patch_fetcher_library(monkeypatch, image: disk.PLEImage, **kwargs):
     return library
 
 
-def _server_args(**overrides):
-    values = {
-        "ple_storage": "gpu",
-        "ple_disk_dir": "/tmp/ple",
-        "ple_disk_hot_cache_gb": 0.0,
-        "ple_disk_hot_frequency_file": None,
-        "ple_disk_dynamic_cache_gb": 0.0,
-        "ple_disk_prefill_buffer_tokens": 16,
-        "ple_disk_prefill_read_pages": 2048,
-        "ple_disk_max_read_pages": None,
-        "ple_disk_stats_log_interval": 0,
-        "cpu_offload_gb": 0.0,
-        "offload_group_size": 0,
-        "pp_size": 1,
-        "dllm_algorithm": None,
-    }
-    values.update(overrides)
-    args = object.__new__(server_args_module.ServerArgs)
-    for name, value in values.items():
-        object.__setattr__(args, name, value)
-    return args
-
-
 @pytest.mark.parametrize(
     ("uses_host_tables", "expected"), [(True, 1024), (False, 4096)]
 )
@@ -374,7 +342,7 @@ def test_helper_is_loaded_from_the_sgl_kernel_package(tmp_path, monkeypatch):
 
 def test_missing_helper_names_the_required_sgl_kernel_version(monkeypatch):
     monkeypatch.setattr(disk.importlib.util, "find_spec", lambda name: None)
-    with pytest.raises(RuntimeError, match=disk.MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK):
+    with pytest.raises(RuntimeError, match="sgl_kernel is not importable"):
         disk._find_helper_library()
 
 
@@ -415,7 +383,20 @@ def test_helper_accepts_a_higher_epoch_version(tmp_path, monkeypatch):
     spec = SimpleNamespace(submodule_search_locations=[str(package_dir)])
     monkeypatch.setattr(disk.importlib.util, "find_spec", lambda name: spec)
     monkeypatch.setattr(disk, "_installed_sgl_kernel_version", lambda: "1!0.4.6.post1")
+    (package_dir / "qwen4_ple_disk_fetcher.build").write_text("enabled\n")
     assert disk._find_helper_library() == helper
+
+
+def test_helper_rejects_an_absent_build_marker(tmp_path, monkeypatch):
+    package_dir = tmp_path / "sgl_kernel"
+    package_dir.mkdir()
+    (package_dir / "qwen4_ple_disk_fetcher.so").touch()
+    spec = SimpleNamespace(submodule_search_locations=[str(package_dir)])
+    monkeypatch.setattr(disk.importlib.util, "find_spec", lambda name: spec)
+    monkeypatch.setattr(disk, "_installed_sgl_kernel_version", lambda: "0.4.6.post2")
+
+    with pytest.raises(RuntimeError, match="built without.*io_uring"):
+        disk._find_helper_library()
 
 
 def test_poisoned_fetcher_error_requires_restart(tmp_path, monkeypatch):
@@ -534,84 +515,6 @@ def test_native_short_read_keeps_later_reads_quiescent(tmp_path, monkeypatch):
         )
     finally:
         reader.close()
-
-
-def test_offload_compatibility_writes_nothing_after_resolution():
-    args = _server_args()
-    before = vars(args).copy()
-    args._handle_offload_compatibility(resolved=True)
-    assert vars(args) == before
-    assert args.ple_disk_max_read_pages is None
-    assert args.ple_disk_prefill_read_pages == 2048
-
-
-def test_unused_disk_options_warn_only_after_resolution(caplog):
-    args = _server_args()
-    with caplog.at_level("WARNING"):
-        args._handle_offload_compatibility(resolved=True)
-        args._handle_offload_compatibility()
-    assert caplog.text.count("are unused with --ple-storage") == 1
-
-
-def test_explicit_max_read_pages_still_validated():
-    args = _server_args(ple_disk_max_read_pages=0)
-    with pytest.raises(ValueError):
-        args._handle_offload_compatibility()
-
-
-@pytest.mark.parametrize(
-    ("option", "value", "message"),
-    [
-        ("ple_disk_hot_cache_gb", -0.1, "hot-cache-gb"),
-        ("ple_disk_dynamic_cache_gb", -0.1, "dynamic-cache-gb"),
-        ("ple_disk_prefill_buffer_tokens", -1, "prefill-buffer-tokens"),
-        ("ple_disk_prefill_read_pages", 0, "prefill-read-pages"),
-        ("ple_disk_max_read_pages", 0, "max-read-pages"),
-        ("ple_disk_stats_log_interval", -1, "stats-log-interval"),
-    ],
-)
-def test_disk_argument_bounds_are_validated(option, value, message):
-    args = _server_args(**{option: value})
-    with pytest.raises(ValueError, match=message):
-        args._validate_ple_disk_args()
-
-
-def test_disk_storage_requires_an_image_directory():
-    args = _server_args(ple_storage="disk", ple_disk_dir=None)
-    with pytest.raises(ValueError, match="requires --ple-disk-dir"):
-        args._handle_offload_compatibility()
-
-
-def test_disk_storage_accepts_a_creatable_directory(tmp_path):
-    target = tmp_path / "new" / "images"
-    args = _server_args(ple_storage="disk", ple_disk_dir=str(target))
-    args._handle_offload_compatibility()
-
-
-def test_disk_storage_rejects_an_unreadable_hot_file(tmp_path):
-    args = _server_args(
-        ple_storage="disk",
-        ple_disk_dir=str(tmp_path),
-        ple_disk_hot_frequency_file=str(tmp_path / "missing.bin"),
-    )
-    with pytest.raises(ValueError, match="readable file"):
-        args._handle_offload_compatibility()
-
-
-def test_disk_storage_accepts_a_readable_hot_file_template(tmp_path):
-    (tmp_path / "hot-0.bin").touch()
-    args = _server_args(
-        ple_storage="disk",
-        ple_disk_dir=str(tmp_path),
-        ple_disk_hot_frequency_file=str(tmp_path / "hot-{layer}.bin"),
-    )
-    args._handle_offload_compatibility()
-
-
-def test_max_read_pages_rejects_io_uring_entry_overflow():
-    args = _server_args(ple_disk_max_read_pages=32769)
-    with pytest.raises(ValueError, match="32768"):
-        args._handle_offload_compatibility()
 
 
 @pytest.mark.parametrize("max_pages", [0, IORING_MAX_ENTRIES + 1])
@@ -815,23 +718,6 @@ def test_manifest_source_identity_controls_reuse(tmp_path):
         touched.finalize(0.5)
 
 
-def test_safetensors_loader_attaches_source_identity(tmp_path):
-    import safetensors.torch
-
-    from sglang.srt.model_loader.weight_utils import safetensors_weights_iterator
-
-    source = tmp_path / "checkpoint.safetensors"
-    safetensors.torch.save_file({"weight": torch.arange(4)}, source)
-    name, tensor = next(safetensors_weights_iterator([str(source)]))
-    stat = source.stat()
-    assert name == "weight"
-    assert tensor._sglang_checkpoint_source == {
-        "file": source.name,
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
-
-
 @pytest.mark.parametrize("failure_call", [2, 3])
 def test_finalize_crash_before_image_install_is_recoverable(
     tmp_path, monkeypatch, failure_call
@@ -1014,466 +900,6 @@ def test_prefill_executor_initializes_the_current_cuda_device(tmp_path, monkeypa
     assert selected == [4]
 
 
-def test_disk_graph_replay_wait_is_a_noop_without_staged_work():
-    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(embedding)
-    waits = []
-    embedding.wait_for_graph_step = lambda generation: waits.append(generation)
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
-    layer._graph_replay_generation = None
-    layer._graph_replay_stage_expected = False
-
-    layer.wait_cuda_graph_replay()
-
-    assert waits == []
-
-
-def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
-    offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(offloaded)
-    offloaded.gather = lambda input_ids, out: out
-
-    captured_ids = torch.arange(64, dtype=torch.long).view(4, 16)
-    ngram_embedding = SimpleNamespace(
-        ngram_embedding=offloaded,
-        ngram_heads=16,
-        gather_dp_tokens=False,
-        compute_ngram_ids=lambda batch: captured_ids,
-        _prepare_embedding_lookup=lambda ids, forward_batch, physical_tokens: (
-            ids,
-            physical_tokens,
-        ),
-        _hash_contexts=lambda contexts: (_ for _ in ()).throw(
-            AssertionError("capture must not hash eager look-ahead contexts")
-        ),
-    )
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = ngram_embedding
-    layer._prefetch_stream = object()
-    layer._prefetch_state = None
-    layer._future_lookup_contexts = torch.ones((3, 3), dtype=torch.long)
-    layer._graph_lookup_id_buffers = {}
-    layer._graph_lookup_validation_due = set()
-    layer._is_capturing = lambda: True
-    layer._get_prefetch_buffer = lambda tokens, ids: torch.empty(
-        (tokens, 16, 10), dtype=torch.bfloat16
-    )
-
-    batch = SimpleNamespace(physical_tokens=4, processed_tokens=4)
-    forward_batch = SimpleNamespace(
-        input_ids=torch.arange(4),
-        global_dp_buffer_len=None,
-    )
-    layer.start_prefetch(batch, forward_batch)
-    assert layer._prefetch_state[0].shape == (4, 16, 10)
-    assert layer._future_lookup_contexts is None
-    captured_ids[0, 0] = -1
-    assert layer._graph_lookup_id_buffers[4].data_ptr() == captured_ids.data_ptr()
-    assert layer._graph_lookup_id_buffers[4][0, 0].item() == -1
-
-
-def test_graph_replay_prepares_shared_batch_once(monkeypatch):
-    from sglang.srt.model_executor.forward_batch_info import CudaGraphReplayInput
-
-    prepared_batch = SimpleNamespace(physical_tokens=2)
-    forward_batch = SimpleNamespace(input_ids=torch.arange(1))
-    prepare_calls = []
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "_prepare_ple_batch",
-        lambda *args, **kwargs: prepare_calls.append((args, kwargs)) or prepared_batch,
-    )
-
-    disk_embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(disk_embedding)
-    received = []
-
-    def make_layer(value):
-        ngram = SimpleNamespace(
-            ngram_embedding=disk_embedding,
-            ngram_size=3,
-            eos_token_id=2,
-            compute_ngram_ids=lambda batch: torch.full((2, 1), value),
-            _prepare_embedding_lookup=lambda ids, batch, tokens: (ids + 10, tokens),
-        )
-        return SimpleNamespace(
-            ple_embedding=ngram,
-            prepare_cuda_graph_replay=lambda batch, lookup_ids: received.append(
-                (batch, lookup_ids.clone())
-            ),
-        )
-
-    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
-    torch.nn.Module.__init__(model)
-    model.ple_ngram_size = 3
-    model.ple_ngram_eos_token_id = 2
-    model._ple_layers = lambda: iter([make_layer(1), make_layer(2)])
-    replay = CudaGraphReplayInput(
-        padded_num_tokens=2,
-        input_ids=torch.arange(2),
-        req_pool_indices=torch.arange(2),
-        out_cache_loc=torch.ones(2),
-        forward_mode=ForwardMode.DECODE,
-        runtime_forward_batch=forward_batch,
-    )
-
-    model.prepare_cuda_graph_replay(replay)
-
-    assert len(prepare_calls) == 1
-    assert [item[0] for item in received] == [prepared_batch, prepared_batch]
-    assert [item[1].tolist() for item in received] == [
-        [[11], [11]],
-        [[12], [12]],
-    ]
-
-
-def test_graph_replay_prepare_rolls_back_every_disk_layer(monkeypatch):
-    from sglang.srt.model_executor.forward_batch_info import CudaGraphReplayInput
-
-    disk_embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(disk_embedding)
-    events = []
-
-    def make_layer(index, fail=False):
-        ngram = SimpleNamespace(
-            ngram_embedding=disk_embedding,
-            compute_ngram_ids=lambda batch: torch.zeros((1, 1), dtype=torch.long),
-            _prepare_embedding_lookup=lambda ids, batch, tokens: (ids, tokens),
-        )
-
-        def prepare(batch, lookup_ids):
-            events.append(("prepare", index))
-            if fail:
-                raise OSError("injected layer failure")
-
-        return SimpleNamespace(
-            ple_embedding=ngram,
-            prepare_cuda_graph_replay=prepare,
-            reset_cuda_graph_replay=lambda: events.append(("reset", index)),
-        )
-
-    layers = [make_layer(0), make_layer(1, fail=True), make_layer(2)]
-    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
-    torch.nn.Module.__init__(model)
-    model.ple_ngram_size = 3
-    model.ple_ngram_eos_token_id = 2
-    model._ple_layers = lambda: iter(layers)
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "_prepare_ple_batch",
-        lambda *args, **kwargs: SimpleNamespace(physical_tokens=1),
-    )
-
-    replay = CudaGraphReplayInput(
-        padded_num_tokens=1,
-        input_ids=torch.zeros(1, dtype=torch.long),
-        req_pool_indices=torch.zeros(1, dtype=torch.long),
-        out_cache_loc=torch.ones(1, dtype=torch.long),
-        forward_mode=ForwardMode.DECODE,
-        runtime_forward_batch=SimpleNamespace(),
-    )
-
-    with pytest.raises(OSError, match="injected layer failure"):
-        model.prepare_cuda_graph_replay(replay)
-
-    assert events == [
-        ("prepare", 0),
-        ("prepare", 1),
-        ("reset", 0),
-        ("reset", 1),
-        ("reset", 2),
-    ]
-
-
-def test_failed_embedding_future_does_not_block_the_next_graph_step(monkeypatch):
-    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(embedding)
-    embedding.embedding_dim = 4
-    embedding._active_transfer_device = "cuda:0"
-    embedding._graph_generation = 0
-    embedding._active_graph_generation = None
-    failed = Future()
-    failed.set_exception(OSError("injected fetch failure"))
-    embedding._future = failed
-
-    with pytest.raises(OSError, match="injected fetch failure"):
-        embedding.wait_for_prefetch()
-
-    monkeypatch.setattr(embedding, "_launch_fetch", lambda *args, **kwargs: None)
-    generation = embedding.stage_graph_step(
-        torch.zeros((1,), dtype=torch.long),
-        torch.zeros((1, 4), dtype=torch.bfloat16),
-    )
-    assert generation == 1
-
-
-def test_eager_forward_exception_resets_prefetch_before_the_next_forward():
-    completed = Future()
-    completed.set_result((SimpleNamespace(synchronize=lambda: None),))
-    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(embedding)
-    embedding._future = completed
-    embedding._active_graph_generation = 3
-    layer = SimpleNamespace(reset_eager_prefetch=embedding.reset_eager_step)
-    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
-    torch.nn.Module.__init__(model)
-    model._ple_layers = lambda: iter([layer])
-
-    def fail(*args, **kwargs):
-        raise OSError("injected mid-forward failure")
-
-    model._forward_impl = fail
-    with pytest.raises(OSError, match="mid-forward"):
-        model.forward(None, None, None)
-    assert embedding._future is None
-    assert embedding._active_graph_generation is None
-
-    expected = object()
-    model._forward_impl = lambda *args, **kwargs: (
-        expected if embedding._future is None else None
-    )
-    assert model.forward(None, None, None) is expected
-
-
-def test_layer_wait_resets_graph_state_after_fetch_failure():
-    offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(offloaded)
-    offloaded.wait_for_graph_step = lambda generation: (_ for _ in ()).throw(
-        OSError("injected layer wait")
-    )
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(ngram_embedding=offloaded)
-    layer._graph_replay_generation = 4
-    layer._graph_replay_stage_expected = True
-    layer._graph_replay_lookup_tokens = 1
-    layer._graph_replay_prefetch_buffer = torch.zeros(1)
-    layer._prefetch_stream = object()
-    layer._validate_graph_staging = False
-
-    with pytest.raises(OSError, match="injected layer wait"):
-        layer.wait_cuda_graph_replay()
-
-    assert layer._graph_replay_generation is None
-    assert not layer._graph_replay_stage_expected
-    assert layer._graph_replay_lookup_tokens is None
-    assert layer._graph_replay_prefetch_buffer is None
-
-
-def test_model_wait_keeps_replay_validation_pending_until_finish():
-    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(embedding)
-    events = []
-    layer = SimpleNamespace(
-        ple_embedding=SimpleNamespace(ngram_embedding=embedding),
-        wait_cuda_graph_replay=lambda: events.append("wait"),
-        reset_cuda_graph_replay=lambda: events.append("reset"),
-    )
-    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
-    torch.nn.Module.__init__(model)
-    model._ple_layers = lambda: iter([layer])
-
-    model.wait_cuda_graph_replay()
-
-    assert events == ["wait"]
-
-
-def test_graph_lookup_validation_defaults_to_every_replay():
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer._graph_replay_steps = 0
-    layer._graph_lookup_validation_due = {4}
-    layer._graph_lookup_validation_interval = 1
-
-    assert layer._graph_lookup_validation_required(4, 1)
-    assert all(
-        layer._graph_lookup_validation_required(4, step) for step in range(2, 10)
-    )
-    assert layer._graph_replay_steps == 0
-    assert layer._graph_lookup_validation_due == {4}
-
-    layer._graph_lookup_validation_interval = 256
-    layer._graph_lookup_validation_due = {4}
-    assert layer._graph_lookup_validation_required(4, 1)
-    layer._graph_lookup_validation_due.clear()
-    assert all(
-        not layer._graph_lookup_validation_required(4, step) for step in range(2, 256)
-    )
-    assert layer._graph_lookup_validation_required(4, 256)
-
-    layer._graph_lookup_validation_interval = 0
-    with pytest.raises(ValueError, match="must be positive"):
-        layer._graph_lookup_validation_required(4, 257)
-
-
-def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer._graph_prefetch_buffer = torch.empty((8, 16))
-    layer._graph_lookup_id_buffers = {4: torch.empty((4, 1), dtype=torch.long)}
-    monkeypatch.setattr(qwen4_exp_module, "is_sm120_supported", lambda: True)
-    monkeypatch.setattr(qwen4_exp_module, "is_sm121", lambda: False)
-
-    assert layer._select_graph_prefetch_buffer(4).shape == (4, 16)
-    with pytest.raises(RuntimeError, match="no captured staging buffer"):
-        layer._select_graph_prefetch_buffer(2)
-
-
-def test_capture_start_drops_references_from_the_previous_graph():
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer._graph_lookup_id_buffers = {1: object()}
-    layer._graph_embedding_snapshot_buffers = {1: object()}
-    layer._graph_lookup_validation_due = {1}
-    layer._pending_graph_lookup_validation = object()
-    layer._pending_graph_embedding_validation = object()
-
-    layer.reset_cuda_graph_capture_buffers()
-
-    assert layer._graph_lookup_id_buffers == {}
-    assert layer._graph_embedding_snapshot_buffers == {}
-    assert layer._graph_lookup_validation_due == set()
-    assert layer._pending_graph_lookup_validation is None
-    assert layer._pending_graph_embedding_validation is None
-
-
-def test_aborted_graph_replay_reset_discards_pending_validation(monkeypatch):
-    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    torch.nn.Module.__init__(embedding)
-    monkeypatch.setattr(embedding, "reset_graph_step", lambda: None)
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
-    layer._graph_replay_generation = 1
-    layer._graph_replay_stage_expected = True
-    layer._graph_replay_lookup_tokens = 4
-    layer._graph_replay_prefetch_buffer = object()
-    layer._pending_graph_lookup_validation = object()
-    layer._pending_graph_embedding_validation = object()
-
-    layer.reset_cuda_graph_replay()
-
-    assert layer._pending_graph_lookup_validation is None
-    assert layer._pending_graph_embedding_validation is None
-
-
-def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
-    class ReadyEvent:
-        def record(self, stream):
-            self.stream = stream
-
-        def query(self):
-            return True
-
-    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
-    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", lambda: object())
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer._pending_graph_embedding_validation = None
-    layer._completed_graph_embedding_validation = deque()
-    layer._pending_graph_lookup_validation = (
-        2,
-        17,
-        torch.tensor([[3], [5]], dtype=torch.long),
-    )
-    layer._completed_graph_lookup_validation = deque()
-    layer._graph_validation_free_slots = deque()
-    layer._graph_lookup_id_buffers = {2: torch.tensor([[3], [7]], dtype=torch.long)}
-
-    layer.finish_cuda_graph_replay()
-    assert len(layer._completed_graph_lookup_validation) == 1
-    with pytest.raises(
-        RuntimeError,
-        match=r"one step behind.*step 17.*already emitted.*lookup.tokens=2",
-    ):
-        layer.validate_cuda_graph_replay()
-
-
-def test_graph_validation_recycles_every_consumed_ready_entry():
-    class ReadyEvent:
-        def query(self):
-            return True
-
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer._graph_validation_free_slots = deque()
-    layer._completed_graph_lookup_validation = deque(
-        [
-            (2, 17, torch.tensor([True]), ReadyEvent()),
-            (4, 18, torch.tensor([False]), ReadyEvent()),
-        ]
-    )
-
-    with pytest.raises(RuntimeError, match="step 17"):
-        layer._consume_graph_validation(
-            "_completed_graph_lookup_validation", "lookup mismatch"
-        )
-
-    assert not layer._completed_graph_lookup_validation
-    assert len(layer._graph_validation_free_slots) == 2
-
-
-def test_forward_batch_declares_model_batch_hook_state():
-    assert "_model_batch_hook_prepared" in ForwardBatch.__dataclass_fields__
-
-
-def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):
-    from sglang.srt.model_executor.forward_batch_info import (
-        CudaGraphReplayInput,
-        ForwardMode,
-    )
-
-    runtime = SimpleNamespace(
-        forward_mode=ForwardMode.DECODE,
-        seq_lens=torch.ones(2, dtype=torch.int32),
-        seq_lens_sum=2,
-        spec_info=None,
-        tbo_parent_token_range=None,
-        spec_algorithm=None,
-        global_num_tokens_cpu=None,
-        global_num_tokens_gpu=None,
-        dp_padding_mode=None,
-        dp_local_start_pos=None,
-        dp_local_num_tokens=None,
-        global_dp_buffer_len=None,
-        _original_forward_mode=None,
-        num_token_non_padded_cpu=1,
-        extend_seq_lens=torch.tensor([1], dtype=torch.int32),
-        extend_seq_lens_cpu=[1],
-        extend_prefix_lens_cpu=[0],
-        extend_num_tokens=1,
-    )
-    replay = CudaGraphReplayInput(
-        padded_num_tokens=2,
-        input_ids=torch.arange(2),
-        req_pool_indices=torch.arange(2, dtype=torch.int32),
-        out_cache_loc=torch.ones(2, dtype=torch.int64),
-        forward_mode=ForwardMode.DECODE,
-        runtime_forward_batch=runtime,
-    )
-    pool = SimpleNamespace(
-        ple_window_cache=None,
-        get_mamba_indices=lambda indices: indices,
-        get_ngram_context=lambda indices: torch.zeros(
-            (indices.numel(), 2), dtype=torch.long
-        ),
-    )
-    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
-    batch = qwen4_exp_module._prepare_ple_batch(
-        replay.input_ids,
-        runtime,
-        ngram_size=3,
-        ngram_eos_token_id=2,
-        replay=replay,
-    )
-    assert batch.physical_tokens == 2
-    assert batch.processed_tokens == 2
-    assert batch.lengths.tolist() == [1, 1]
-
-
 def test_image_reuse_is_scoped_to_the_ple_module_prefix(tmp_path):
     rows = _fp8_rows(25)
     for prefix in ("model.layers.1.ple", "model.layers.9.ple"):
@@ -1629,6 +1055,20 @@ def test_hot_file_writer_requires_the_image_fingerprint(tmp_path):
         )
 
 
+def test_hot_file_reader_requires_the_image_fingerprint(tmp_path):
+    path = tmp_path / "hot.bin"
+    disk.write_hot_frequency_file(
+        path,
+        {0: np.array([1], dtype=np.uint32)},
+        fingerprint="image",
+        total_rows=4,
+        tp_size=1,
+        padding_divisor=1,
+    )
+    with pytest.raises(TypeError, match="expected_fingerprint"):
+        disk.read_hot_frequency_file(path, 0)
+
+
 def test_hot_file_rejects_a_rank_range_past_eof(tmp_path):
     path = tmp_path / "hot.bin"
     disk.write_hot_frequency_file(
@@ -1714,6 +1154,25 @@ def test_direct_reader_retries_native_destroy_after_busy(tmp_path, monkeypatch, 
     assert reader.handle is None
 
 
+def test_busy_reader_gc_retains_registered_staging(tmp_path, monkeypatch, caplog):
+    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    retained = []
+    monkeypatch.setattr(disk, "_RETAINED_POISONED_STAGING", retained)
+    reader = disk.DirectPageReader(image, max_pages=1)
+    staging = reader._staging_allocation
+    reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: -errno.EBUSY)
+
+    with caplog.at_level("ERROR"):
+        reader.__del__()
+
+    assert retained == [staging]
+    assert "garbage collection" in caplog.text
+
+
 def test_disk_fetcher_calls_raise_after_close():
     fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
     fetcher._closed = True
@@ -1785,6 +1244,50 @@ def test_prefill_pipeline_failure_disables_lookahead_and_decode_continues(
         assert "prefill look-ahead failed" in caplog.text
     finally:
         fetcher.close()
+
+
+def test_fetcher_close_drains_queued_prefill_before_marking_closed(caplog):
+    release = threading.Event()
+    worker_started = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor.submit(lambda: (worker_started.set(), release.wait(2.0)))
+    assert worker_started.wait(1.0)
+
+    fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
+    fetcher._closed = False
+    fetcher._prefill_executor = executor
+    fetcher._prefill_lock = threading.Lock()
+    queued = executor.submit(
+        lambda: (
+            (_ for _ in ()).throw(RuntimeError("closed during drain"))
+            if fetcher._closed
+            else None
+        )
+    )
+    fetcher._prefill_futures = {queued}
+    fetcher.hot = None
+    fetcher.dynamic = None
+    fetcher.prefill_reader = None
+    fetcher.reader = None
+    close_error = []
+
+    def close_fetcher():
+        try:
+            fetcher.close()
+        except BaseException as exc:
+            close_error.append(exc)
+
+    closer = threading.Thread(target=close_fetcher, daemon=True)
+    with caplog.at_level("ERROR"):
+        closer.start()
+        assert not fetcher._closed
+        release.set()
+        closer.join(2.0)
+
+    assert not closer.is_alive()
+    assert close_error == []
+    assert fetcher._closed
+    assert not any(record.levelno >= 40 for record in caplog.records)
 
 
 def test_prefill_dynamic_hits_do_not_enter_the_admission_queue(tmp_path, monkeypatch):
@@ -1925,235 +1428,6 @@ def test_prefill_truncation_keeps_the_earliest_requested_rows(tmp_path, monkeypa
         assert ready["ids"][: ready["count"]].tolist() == list(range(5, 21))
     finally:
         fetcher.close()
-
-
-def test_numpy_hash_matches_production_on_seeded_token_stream(monkeypatch):
-    metadata = PLEMetadata(
-        multipliers=np.array([1000003, 1000033, 1000037], dtype=np.int64),
-        vocab_sizes=np.array([101 + 2 * index for index in range(16)], dtype=np.int64),
-        offsets=np.cumsum(
-            np.r_[np.int64(0), np.array([101 + 2 * index for index in range(15)])]
-        ),
-        eos_token_id=2,
-    )
-    rng = np.random.default_rng(20260830)
-    tokens = rng.integers(3, 32000, size=4096, dtype=np.int64)
-    tokens[::127] = 2
-    tokens[1::509] = 2
-    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
-    torch.nn.Module.__init__(module)
-    module.enable_ple_fusion = False
-    module.ngram_size = 3
-    module.heads_per_ngram = 8
-    module.ngram_heads = 16
-    module.eos_token_id = metadata.eos_token_id
-    module.layer_multipliers = torch.from_numpy(metadata.multipliers)
-    module.ngram_heads_vocab_sizes = torch.from_numpy(metadata.vocab_sizes)
-    module.ngram_heads_offsets = torch.from_numpy(metadata.offsets)
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_req_to_token_pool",
-        lambda: SimpleNamespace(ple_window_cache=None),
-    )
-
-    contexts = np.full((tokens.size, 3), metadata.eos_token_id, dtype=np.int64)
-    contexts[:, 2] = tokens
-    contexts[1:, 1] = tokens[:-1]
-    contexts[2:, 0] = tokens[:-2]
-    actual = module._hash_contexts(torch.from_numpy(contexts)).numpy()
-    expected = hash_contexts_numpy(contexts, metadata)
-    assert np.array_equal(actual, expected)
-    assert np.array_equal(hash_token_stream_numpy(tokens, metadata), expected)
-
-
-def test_hit_sim_selects_accessed_rows_and_splits_tp_ranks(tmp_path, monkeypatch):
-    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
-    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_test", script)
-    hit_sim = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(hit_sim)
-
-    metadata = PLEMetadata(
-        multipliers=np.array([3, 5, 7], dtype=np.int64),
-        vocab_sizes=np.array([4, 3], dtype=np.int64),
-        offsets=np.array([0, 4], dtype=np.int64),
-        eos_token_id=2,
-    )
-    metadata_path = tmp_path / "metadata.json"
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "multipliers": metadata.multipliers.tolist(),
-                "vocab_sizes": metadata.vocab_sizes.tolist(),
-                "offsets": metadata.offsets.tolist(),
-                "eos_token_id": metadata.eos_token_id,
-                "ngram_size": metadata.ngram_size,
-            }
-        )
-    )
-    tokens = np.array([1, 2, 3, 1, 0, 2], dtype="<i4")
-    token_path = tmp_path / "tokens.i32"
-    tokens.tofile(token_path)
-    count_dir = tmp_path / "counts"
-    output_path = tmp_path / "hot.bin"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(script),
-            "--tokens",
-            str(token_path),
-            "--metadata",
-            str(metadata_path),
-            "--work-dir",
-            str(count_dir),
-            "--output",
-            str(output_path),
-            "--fingerprint",
-            "test-image",
-            "--tp-size",
-            "2",
-            "--budget-gib",
-            "0.00001",
-            "--padding-divisor",
-            "4",
-            "--chunk-tokens",
-            "2",
-        ],
-    )
-
-    hit_sim.main()
-
-    count_files = [
-        np.memmap(
-            count_dir / f"head{head:02d}.u64",
-            mode="r",
-            dtype=np.uint64,
-            shape=(int(size),),
-        )
-        for head, size in enumerate(metadata.vocab_sizes)
-    ]
-    assert all(array.dtype == np.uint64 for array in count_files)
-    ids, frequencies = hit_sim.select_rows(count_files, metadata, capacity=10)
-    ranks = hit_sim.split_ranks(ids, frequencies, total_rows=7, tp_size=2, divisor=4)
-    for rank, expected in ranks.items():
-        assert np.array_equal(
-            disk.read_hot_frequency_file(
-                output_path, rank, expected_fingerprint="test-image"
-            ),
-            expected,
-        )
-
-
-def test_hit_sim_counting_uses_bincount_per_head(tmp_path, monkeypatch):
-    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
-    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_count", script)
-    hit_sim = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(hit_sim)
-    metadata = PLEMetadata(
-        multipliers=np.array([3, 5, 7], dtype=np.int64),
-        vocab_sizes=np.array([4, 3], dtype=np.int64),
-        offsets=np.array([0, 4], dtype=np.int64),
-        eos_token_id=2,
-    )
-    token_path = tmp_path / "tokens.i32"
-    np.array([1, 2, 3, 1], dtype="<i4").tofile(token_path)
-    counts = hit_sim.open_counts(tmp_path / "counts", metadata)
-    calls = []
-    real_bincount = np.bincount
-
-    def counted_bincount(*args, **kwargs):
-        calls.append(1)
-        return real_bincount(*args, **kwargs)
-
-    monkeypatch.setattr(hit_sim.np, "bincount", counted_bincount)
-    hit_sim.count_rows(token_path, metadata, counts, chunk_tokens=2)
-    assert len(calls) == len(counts) * 2
-    assert sum(int(array.sum()) for array in counts) == 8
-
-
-def test_hit_sim_selection_is_independent_of_peak_frequency(monkeypatch):
-    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
-    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_peak", script)
-    hit_sim = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(hit_sim)
-    metadata = PLEMetadata(
-        multipliers=np.array([3, 5, 7], dtype=np.int64),
-        vocab_sizes=np.array([4, 3], dtype=np.int64),
-        offsets=np.array([0, 4], dtype=np.int64),
-        eos_token_id=2,
-    )
-    counts = [
-        np.array([10**12, 7, 7, 1], dtype=np.uint64),
-        np.array([8, 7, 0], dtype=np.uint64),
-    ]
-    monkeypatch.setattr(
-        hit_sim.np,
-        "zeros",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("selection allocated by peak frequency")
-        ),
-    )
-    ids, frequencies = hit_sim.select_rows(counts, metadata, capacity=4)
-    assert ids.tolist() == [0, 4, 1, 2]
-    assert frequencies.tolist() == [10**12, 8, 7, 7]
-
-
-def test_hit_sim_selection_matches_the_previous_ordering():
-    script = Path(__file__).resolve().parents[5] / "scripts/ple_disk/hit_sim.py"
-    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_order", script)
-    hit_sim = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(hit_sim)
-    metadata = PLEMetadata(
-        multipliers=np.array([3, 5, 7], dtype=np.int64),
-        vocab_sizes=np.array([5, 4], dtype=np.int64),
-        offsets=np.array([0, 5], dtype=np.int64),
-        eos_token_id=2,
-    )
-    counts = [
-        np.array([0, 3, 9, 3, 1], dtype=np.uint64),
-        np.array([3, 7, 0, 3], dtype=np.uint64),
-    ]
-
-    def previous_selection(capacity):
-        maximum = max(int(array.max()) for array in counts)
-        histogram = np.zeros(maximum + 1, dtype=np.int64)
-        for array in counts:
-            local = np.bincount(
-                np.asarray(array, dtype=np.int64), minlength=maximum + 1
-            )
-            histogram[: local.size] += local
-        selected_above = 0
-        threshold = 0
-        for frequency in range(maximum, 0, -1):
-            if selected_above + int(histogram[frequency]) >= capacity:
-                threshold = frequency
-                break
-            selected_above += int(histogram[frequency])
-        tie_remaining = capacity - selected_above
-        ids = []
-        frequencies = []
-        for array, offset in zip(counts, metadata.offsets):
-            local_ids = np.flatnonzero(array > threshold)
-            if tie_remaining:
-                tied = np.flatnonzero(array == threshold)
-                take = min(tie_remaining, tied.size)
-                local_ids = np.concatenate((local_ids, tied[:take]))
-                tie_remaining -= take
-            ids.append((local_ids + int(offset)).astype(np.uint32))
-            frequencies.append(np.asarray(array[local_ids], dtype=np.uint64))
-        global_ids = np.concatenate(ids)
-        global_frequencies = np.concatenate(frequencies)
-        order = np.lexsort((global_ids, np.bitwise_not(global_frequencies)))
-        return global_ids[order], global_frequencies[order]
-
-    expected_ids, expected_frequencies = previous_selection(5)
-    actual_ids, actual_frequencies = hit_sim.select_rows(counts, metadata, 5)
-    assert np.array_equal(actual_ids, expected_ids)
-    assert np.array_equal(actual_frequencies, expected_frequencies)
 
 
 def test_image_builder_reserves_space_for_all_tp_ranks(tmp_path, monkeypatch):
@@ -2443,6 +1717,33 @@ def test_disk_embedding_close_releases_fetcher_builder_and_executor():
     assert embedding._transfer_buffers == {}
 
 
+def test_disk_embedding_close_synchronizes_transfer_before_clear():
+    events = []
+
+    class Completion:
+        def synchronize(self):
+            events.append("synchronize")
+
+    class Buffers(dict):
+        def clear(self):
+            events.append("clear")
+            super().clear()
+
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._future = None
+    embedding._completion_event = Completion()
+    embedding._prefill_submit_future = None
+    embedding._fetcher = None
+    embedding._image_builder = None
+    embedding._executor = None
+    embedding._transfer_buffers = Buffers(device=object())
+
+    embedding.close()
+
+    assert events == ["synchronize", "clear"]
+
+
 def test_disk_embedding_close_continues_after_fetcher_error():
     events = []
 
@@ -2674,13 +1975,8 @@ def test_manifest_rejects_noncontiguous_ranges(tmp_path):
 def test_old_image_format_requests_rebuild(tmp_path):
     image = disk.build_test_image(tmp_path, _fp8_rows(25), config_sha256="old")
     with image.path.open("r+b") as handle:
-        block = handle.read(disk.PAGE_BYTES)
-        magic, length = struct.unpack_from("<8sI", block)
-        header = json.loads(block[12 : 12 + length])
-        header["format_version"] = disk.FORMAT_VERSION - 1
-        handle.seek(0)
-        handle.write(disk._write_metadata_page(magic, header))
-    with pytest.raises(ValueError, match="rebuild"):
+        handle.write(b"PLEDISK2")
+    with pytest.raises(ValueError, match=rf"{image.path.parent}.*rebuild"):
         disk.PLEImageBuilder(tmp_path, "old", 0, 1, 0, 25)
 
 

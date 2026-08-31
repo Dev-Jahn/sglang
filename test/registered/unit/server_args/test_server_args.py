@@ -90,7 +90,7 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "cuda-graph-backend-prefill"):
                 args._handle_cuda_graph_config()
 
-    def test_ple_disk_warns_when_disabling_prefill_cuda_graph(self):
+    def test_ple_disk_logs_prefill_cuda_graph_disable(self):
         with tempfile.TemporaryDirectory() as disk_dir:
             args = ServerArgs(
                 model_path="dummy",
@@ -108,7 +108,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 patch.object(ServerArgs, "_apply_cuda_graph_disaggregation_roles"),
                 patch.object(ServerArgs, "_validate_cuda_graph_config"),
                 patch("sglang.srt.arg_groups.kimi_k3_hook.disable_kimi_k3_symm_mem"),
-                self.assertLogs(server_args_module.logger, level="WARNING") as logs,
+                self.assertLogs(server_args_module.logger, level="INFO") as logs,
             ):
                 args._handle_cuda_graph_config()
 

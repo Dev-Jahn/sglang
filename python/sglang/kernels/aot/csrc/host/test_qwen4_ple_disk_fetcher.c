@@ -255,7 +255,14 @@ int main(void) {
   }
 
   int result = run_scenarios(file_fd, page, 0);
-  if (result == 0) result = run_scenarios(file_fd, page, 1);
+  if (result == 0) {
+    int registered_result = run_scenarios(file_fd, page, 1);
+    if (registered_result == 77) {
+      printf("PLE fetcher unregistered-buffer scenarios passed; registered-buffer scenarios skipped\n");
+    } else {
+      result = registered_result;
+    }
+  }
   close(file_fd);
   return result;
 }

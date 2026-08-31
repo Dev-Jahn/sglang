@@ -17,9 +17,14 @@ import torch
 
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.hyperconnection import GatedResidual
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbeddingShardIndices,
+)
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpDiskEmbedding,
     Qwen4ExpModel,
+    Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLEGroupedNorm,
     Qwen4ExpPLELayer,
 )
@@ -282,6 +287,71 @@ def test_non_sm120_disk_graph_replay_matches_pinned_gather(monkeypatch):
 
     pinned = table.index_select(0, ids)
     torch.testing.assert_close(graph_output, pinned, rtol=0, atol=0)
+
+
+def test_non_sm120_pinned_graph_replay_matches_eager_gather(monkeypatch):
+    _require_cuda()
+    monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: False)
+    rows = 16
+    table = (
+        torch.arange(rows * EMBED_DIM, dtype=torch.float32, device="cuda")
+        .reshape(rows, EMBED_DIM)
+        .remainder(16)
+        .to(torch.float8_e4m3fn)
+    )
+    indices = VocabParallelEmbeddingShardIndices(
+        padded_org_vocab_start_index=0,
+        padded_org_vocab_end_index=rows,
+        padded_added_vocab_start_index=rows,
+        padded_added_vocab_end_index=rows,
+        org_vocab_start_index=0,
+        org_vocab_end_index=rows,
+        added_vocab_start_index=rows,
+        added_vocab_end_index=rows,
+    )
+    source = SimpleNamespace(
+        weight=torch.nn.Parameter(table, requires_grad=False),
+        quant_method=UnquantizedEmbeddingMethod(),
+        quant_config=None,
+        enable_tp=True,
+        use_attn_tp_group=False,
+        tp_size=1,
+        num_embeddings=rows,
+        org_vocab_size=rows,
+        padding_size=1,
+        num_added_embeddings=0,
+        use_presharded_weights=False,
+        org_vocab_size_padded=rows,
+        num_embeddings_padded=rows,
+        shard_indices=indices,
+        embedding_dim=EMBED_DIM,
+        num_embeddings_per_partition=rows,
+        num_org_embeddings_per_partition=rows,
+        num_added_embeddings_per_partition=0,
+        weight_scale=torch.ones(1, dtype=torch.bfloat16, device="cuda"),
+    )
+    pinned = Qwen4ExpPinnedHostEmbedding(source)
+    pinned.weight.data.copy_(table.cpu())
+    ids = torch.tensor([1, 3, 7, 11], dtype=torch.long, device="cuda")
+    pinned.gather(ids)
+    torch.cuda.synchronize()
+
+    layer = _Stub()
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=pinned)
+    layer.prepare_cuda_graph_prefetch_buffer(4, torch.device("cuda"))
+    graph_output = torch.empty((4, EMBED_DIM), dtype=torch.bfloat16, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        staging = layer._get_prefetch_buffer(4, ids)
+        pinned.gather(ids, out=staging)
+        graph_output.copy_(staging)
+
+    layer._get_prefetch_buffer(8, torch.arange(8, device="cuda"))
+    graph.replay()
+    expected = pinned.gather(ids)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
 
 
 def test_jit_prewarm_uses_runtime_eligible_specializations(monkeypatch):

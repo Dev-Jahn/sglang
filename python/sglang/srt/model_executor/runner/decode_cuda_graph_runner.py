@@ -1442,7 +1442,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     replay_hook.finish_cuda_graph_replay()
             finally:
                 if replay_hook is not None:
-                    replay_hook.reset_cuda_graph_replay()
+                    replay_hook.release_cuda_graph_replay()
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

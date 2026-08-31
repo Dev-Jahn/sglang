@@ -33,6 +33,7 @@ class PLEMetadata:
     offsets: np.ndarray
     eos_token_id: int
     ngram_size: int = 3
+    fingerprint: str = ""
 
 
 def _splitmix64(value: int) -> int:

@@ -91,15 +91,6 @@ def _set_checkpoint_source(tensor: torch.Tensor, source: dict) -> torch.Tensor:
     return tensor
 
 
-def _safetensors_sources_by_key(paths: List[str]) -> Dict[str, dict]:
-    sources = {}
-    for path in paths:
-        source = _checkpoint_source_identity(path)
-        with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
-            sources.update((name, source) for name in handle.keys())
-    return sources
-
-
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
 # layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
@@ -1191,7 +1182,6 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        sources = _safetensors_sources_by_key(f_list)
         loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
@@ -1201,7 +1191,7 @@ def fastsafetensors_weights_iterator(
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
                     t = fb.get_tensor(k)
-                    yield k, _set_checkpoint_source(t, sources[k])
+                    yield k, t
             finally:
                 pass
         finally:
@@ -1248,9 +1238,8 @@ def multi_thread_safetensors_weights_iterator(
 
         for future in futures_iter:
             st_file, state_dict = future.result()
-            source = _checkpoint_source_identity(st_file)
             for name, param in state_dict.items():
-                yield name, _set_checkpoint_source(param, source)
+                yield name, param
             del state_dict
             if drop_cache_after_load:
                 _drop_file_cache_after_load(st_file)
@@ -1309,7 +1298,6 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 st_file, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
-                source = _checkpoint_source_identity(st_file)
 
                 # Replenish: submit the next file to keep the buffer full.
                 next_file = next(file_iter, None)
@@ -1317,7 +1305,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     pending.append((next_file, executor.submit(_load_file, next_file)))
 
                 for name in sorted(state_dict.keys()):
-                    yield name, _set_checkpoint_source(state_dict[name], source)
+                    yield name, state_dict[name]
                 del state_dict
                 if drop_cache_after_load:
                     # DONTNEED reduces page-cache pressure after copying weights,
@@ -1617,7 +1605,6 @@ def runai_safetensors_weights_iterator(
     )
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
-    sources = _safetensors_sources_by_key(hf_weights_files)
     with SafetensorsStreamer() as streamer:
 
         streamer.stream_files(
@@ -1641,7 +1628,7 @@ def runai_safetensors_weights_iterator(
 
         for name, tensor in tensor_iter:
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
-            yield name, _set_checkpoint_source(tensor, sources[name])
+            yield name, tensor
 
 
 def set_runai_streamer_env(load_config: LoadConfig):

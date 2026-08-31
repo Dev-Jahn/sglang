@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import (
     CudaGraphReplayInput,
@@ -105,7 +106,7 @@ class TestModelReplayHooks(CustomTestCase):
                 wait_cuda_graph_replay=wait,
                 finish_cuda_graph_replay=finish,
                 validate_cuda_graph_replay=validate,
-                reset_cuda_graph_replay=reset,
+                release_cuda_graph_replay=reset,
             ),
             spec_algorithm="spec",
             is_draft_worker=False,
@@ -182,7 +183,7 @@ class TestModelReplayHooks(CustomTestCase):
                 wait_cuda_graph_replay=fail_wait,
                 finish_cuda_graph_replay=lambda: events.append("finish"),
                 validate_cuda_graph_replay=lambda: events.append("validate"),
-                reset_cuda_graph_replay=lambda: events.append("reset"),
+                release_cuda_graph_replay=lambda: events.append("reset"),
             ),
             spec_algorithm=None,
             is_draft_worker=False,

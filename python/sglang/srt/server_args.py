@@ -111,6 +111,8 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+PLE_DISK_MAX_PREFILL_BUFFER_TOKENS = 65536
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
@@ -1891,14 +1893,10 @@ class ServerArgs:
         NS("exec.graph"),
     ] = None
     disable_prefill_cuda_graph: A[
-        Optional[bool],
+        bool,
         "Disable the prefill-phase CUDA graph. Convenience for --cuda-graph-backend-prefill=disabled.",
         NS("exec.graph"),
-    ] = None
-    # Preserve whether False came from the user after the public field is resolved.
-    _disable_prefill_cuda_graph_explicitly_set: A[
-        Optional[bool], Arg(no_cli=True), NS("exec.graph")
-    ] = None
+    ] = False
     disable_decode_cuda_graph: A[
         bool,
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
@@ -2638,7 +2636,7 @@ class ServerArgs:
     ple_disk_hot_cache_gb: A[
         float,
         "Maximum GiB of exact static PLE rows to pin across all TP ranks and "
-        "PLE layers in disk mode.",
+        "PLE layers and attention-DP replicas in disk mode.",
         NS("exec.offload"),
     ] = 8.0
     ple_disk_hot_frequency_file: A[
@@ -2650,13 +2648,14 @@ class ServerArgs:
     ple_disk_dynamic_cache_gb: A[
         float,
         "GiB of exact rows managed by asynchronous W-TinyLFU admission across "
-        "all TP ranks and PLE layers.",
+        "all TP ranks, PLE layers, and attention-DP replicas.",
         NS("exec.offload"),
     ] = 2.0
     ple_disk_prefill_buffer_tokens: A[
         int,
         "Maximum prompt tokens held in each of two exact PLE prefill buffers. "
-        "Each token reserves one row for every PLE n-gram head.",
+        "Each token reserves one row for every PLE n-gram head; the maximum is "
+        f"{PLE_DISK_MAX_PREFILL_BUFFER_TOKENS} tokens.",
         NS("exec.offload"),
     ] = 8192
     ple_disk_prefill_read_pages: A[
@@ -3842,7 +3841,10 @@ class ServerArgs:
         self._handle_offload_compatibility(resolved=True)
 
     def _validate_ple_disk_args(self):
-        from sglang.srt.utils.ple_disk import validate_max_read_pages
+        from sglang.srt.utils.ple_disk import (
+            IORING_MAX_ENTRIES,
+            validate_max_read_pages,
+        )
 
         if self.ple_disk_hot_cache_gb < 0:
             raise ValueError("--ple-disk-hot-cache-gb must be non-negative")
@@ -3850,24 +3852,26 @@ class ServerArgs:
             raise ValueError("--ple-disk-dynamic-cache-gb must be non-negative")
         if self.ple_disk_prefill_buffer_tokens < 0:
             raise ValueError("--ple-disk-prefill-buffer-tokens must be non-negative")
+        if self.ple_disk_prefill_buffer_tokens > PLE_DISK_MAX_PREFILL_BUFFER_TOKENS:
+            pinned_bytes = self.ple_disk_prefill_buffer_tokens * 2 * 16 * 160
+            raise ValueError(
+                "--ple-disk-prefill-buffer-tokens must not exceed "
+                f"{PLE_DISK_MAX_PREFILL_BUFFER_TOKENS}; the requested Qwen3.8 "
+                f"buffers reserve {pinned_bytes} pinned bytes per PLE instance"
+            )
         if self.ple_disk_prefill_read_pages <= 0:
             raise ValueError("--ple-disk-prefill-read-pages must be positive")
+        if self.ple_disk_prefill_read_pages > IORING_MAX_ENTRIES:
+            raise ValueError(
+                "--ple-disk-prefill-read-pages must not exceed "
+                f"{IORING_MAX_ENTRIES}, got {self.ple_disk_prefill_read_pages}"
+            )
         if self.ple_disk_max_read_pages is not None:
             validate_max_read_pages(self.ple_disk_max_read_pages)
         if self.ple_disk_stats_log_interval < 0:
             raise ValueError("--ple-disk-stats-log-interval must be non-negative")
 
     def _handle_offload_compatibility(self, *, resolved=False):
-        if not resolved:
-            if (
-                getattr(self, "_disable_prefill_cuda_graph_explicitly_set", None)
-                is None
-            ):
-                self._disable_prefill_cuda_graph_explicitly_set = (
-                    getattr(self, "disable_prefill_cuda_graph", None) is not None
-                )
-            if getattr(self, "disable_prefill_cuda_graph", None) is None:
-                self.disable_prefill_cuda_graph = False
         self._validate_ple_disk_args()
         storage = self.ple_storage
         changed_disk_options = []
@@ -4622,14 +4626,6 @@ class ServerArgs:
                 "disabled and --disable-prefill-cuda-graph"
             )
             self.cuda_graph_backend_prefill = Backend.DISABLED
-            if (
-                self._disable_prefill_cuda_graph_explicitly_set
-                and not self.disable_prefill_cuda_graph
-            ):
-                logger.warning(
-                    "--ple-storage disk overrides disable_prefill_cuda_graph=False "
-                    "because disk prefill I/O cannot run inside prefill CUDA graphs"
-                )
             self.disable_prefill_cuda_graph = True
         self._parse_cuda_graph_config()
         # Reads the resolved per-phase backends; must precede the compat rules
