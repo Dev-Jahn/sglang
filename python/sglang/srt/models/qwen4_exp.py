@@ -1412,7 +1412,8 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             self._future = None
             self._active_transfer_device = None
         wait_us = (time.perf_counter_ns() - wait_started) / 1000.0
-        torch.cuda.current_stream(active_device).wait_event(self._completion_event)
+        with torch.cuda.device(active_device):
+            torch.cuda.current_stream().wait_event(self._completion_event)
         stats = self._stats
         stats["steps"] += 1
         stats["rows_requested"] += fetch_stats.rows_requested

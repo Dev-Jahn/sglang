@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def test_transfer_device_records_the_prefetch_stream(monkeypatch):
+def test_transfer_records_completion_on_the_prefetch_stream(monkeypatch):
     events = []
 
     class DeviceBuffer:
@@ -60,9 +60,10 @@ def test_transfer_device_records_the_prefetch_stream(monkeypatch):
         True,
     )
 
-    assert events[1:3] == [
+    assert events[1:] == [
         ("record_stream", stream),
         ("copy", raw_host, True),
+        ("completion", stream),
     ]
 
 
@@ -314,23 +315,33 @@ def test_failed_embedding_future_does_not_block_the_next_graph_step(monkeypatch)
     assert generation == 1
 
 
-def test_prefetch_completion_joins_the_transfer_device_stream(monkeypatch):
+def test_prefetch_completion_joins_consumer_stream_on_transfer_device(monkeypatch):
     class ComputeStream:
-        def __init__(self):
-            self.events = []
-
         def wait_event(self, event):
-            self.events.append(event)
+            ordering.append(("wait_event", event))
 
     completion = object()
     transfer_device = torch.device("cuda:5")
     compute_stream = ComputeStream()
-    current_stream_devices = []
+    ordering = []
+
+    class DeviceContext:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            ordering.append(("enter_device", self.device))
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            ordering.append(("exit_device", self.device))
 
     def current_stream(device=None):
-        current_stream_devices.append(device)
+        ordering.append(("current_stream", device))
         return compute_stream
 
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda, "device", lambda device: DeviceContext(device)
+    )
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", current_stream)
     future = Future()
     future.set_result(
@@ -360,8 +371,12 @@ def test_prefetch_completion_joins_the_transfer_device_stream(monkeypatch):
 
     embedding.wait_for_prefetch()
 
-    assert current_stream_devices == [transfer_device]
-    assert compute_stream.events == [completion]
+    assert ordering == [
+        ("enter_device", transfer_device),
+        ("current_stream", None),
+        ("wait_event", completion),
+        ("exit_device", transfer_device),
+    ]
 
 
 def test_eager_forward_exception_resets_prefetch_before_the_next_forward():
