@@ -98,21 +98,12 @@ class TestPrepareServerArgs(CustomTestCase):
                 ple_disk_dir=disk_dir,
                 disable_prefill_cuda_graph=False,
             )
-            args.cuda_graph_config = SimpleNamespace(
-                prefill=SimpleNamespace(backend=Backend.DISABLED)
-            )
-            with (
-                patch.object(ServerArgs, "_parse_cuda_graph_config"),
-                patch.object(ServerArgs, "_apply_cuda_graph_compatibility"),
-                patch.object(ServerArgs, "_apply_deepep_adjustments"),
-                patch.object(ServerArgs, "_apply_cuda_graph_disaggregation_roles"),
-                patch.object(ServerArgs, "_validate_cuda_graph_config"),
-                patch("sglang.srt.arg_groups.kimi_k3_hook.disable_kimi_k3_symm_mem"),
-                self.assertLogs(server_args_module.logger, level="INFO") as logs,
-            ):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
                 args._handle_cuda_graph_config()
 
             self.assertIn("prefill CUDA graphs", "\n".join(logs.output))
+            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+            self.assertTrue(args.disable_prefill_cuda_graph)
 
     def test_ple_disk_omitted_prefill_disable_has_no_override_warning(self):
         with tempfile.TemporaryDirectory() as disk_dir:
@@ -121,21 +112,17 @@ class TestPrepareServerArgs(CustomTestCase):
                 ple_storage="disk",
                 ple_disk_dir=disk_dir,
             )
-            args.cuda_graph_config = SimpleNamespace(
-                prefill=SimpleNamespace(backend=Backend.DISABLED)
-            )
-            with (
-                patch.object(ServerArgs, "_parse_cuda_graph_config"),
-                patch.object(ServerArgs, "_apply_cuda_graph_compatibility"),
-                patch.object(ServerArgs, "_apply_deepep_adjustments"),
-                patch.object(ServerArgs, "_apply_cuda_graph_disaggregation_roles"),
-                patch.object(ServerArgs, "_validate_cuda_graph_config"),
-                patch("sglang.srt.arg_groups.kimi_k3_hook.disable_kimi_k3_symm_mem"),
-                patch.object(server_args_module.logger, "warning") as warning,
-            ):
+            with patch.object(server_args_module.logger, "warning") as warning:
                 args._handle_cuda_graph_config()
 
-            warning.assert_not_called()
+            messages = [str(call.args[0]) for call in warning.call_args_list]
+            self.assertFalse(
+                any(
+                    "prefill].backend='full' is experimental" in msg for msg in messages
+                )
+            )
+            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+            self.assertTrue(args.disable_prefill_cuda_graph)
 
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")

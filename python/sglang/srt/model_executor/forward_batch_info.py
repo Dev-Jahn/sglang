@@ -381,6 +381,7 @@ class CudaGraphReplayInput:
     req_pool_indices: torch.Tensor
     out_cache_loc: torch.Tensor
     forward_mode: ForwardMode
+    batch_size: int
     runtime_forward_batch: Any
 
 

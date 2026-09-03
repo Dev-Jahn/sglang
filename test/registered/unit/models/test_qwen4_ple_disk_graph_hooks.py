@@ -298,6 +298,7 @@ def test_graph_replay_prepares_shared_batch_once(monkeypatch):
         req_pool_indices=torch.arange(2),
         out_cache_loc=torch.ones(2),
         forward_mode=ForwardMode.DECODE,
+        batch_size=2,
         runtime_forward_batch=forward_batch,
     )
 
@@ -354,6 +355,7 @@ def test_graph_replay_prepare_rolls_back_every_disk_layer(monkeypatch):
         req_pool_indices=torch.zeros(1, dtype=torch.long),
         out_cache_loc=torch.ones(1, dtype=torch.long),
         forward_mode=ForwardMode.DECODE,
+        batch_size=1,
         runtime_forward_batch=SimpleNamespace(),
     )
 
@@ -722,6 +724,7 @@ def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int32),
         out_cache_loc=torch.ones(2, dtype=torch.int64),
         forward_mode=ForwardMode.DECODE,
+        batch_size=2,
         runtime_forward_batch=runtime,
     )
     pool = SimpleNamespace(
@@ -742,6 +745,43 @@ def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):
     assert batch.physical_tokens == 2
     assert batch.processed_tokens == 2
     assert batch.lengths.tolist() == [1, 1]
+
+
+def test_graph_replay_rejects_ragged_verify_sequence_count(monkeypatch):
+    runtime = SimpleNamespace(
+        tbo_parent_token_range=None,
+        spec_algorithm=None,
+        spec_info=SimpleNamespace(topk=1, draft_token_num=4),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        _original_forward_mode=None,
+        extend_seq_lens=None,
+    )
+    replay = SimpleNamespace(
+        padded_num_tokens=8,
+        input_ids=torch.arange(8),
+        req_pool_indices=torch.arange(4, dtype=torch.int32),
+        out_cache_loc=torch.ones(8, dtype=torch.int64),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        runtime_forward_batch=runtime,
+        batch_size=3,
+    )
+    pool = SimpleNamespace(
+        ple_window_cache=None,
+        get_mamba_indices=lambda indices: indices,
+        get_ngram_context=lambda indices: torch.zeros(
+            (indices.numel(), 2), dtype=torch.long
+        ),
+    )
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+
+    with pytest.raises(RuntimeError, match="sequence count.*replay batch size"):
+        qwen4_exp_module._prepare_ple_batch(
+            replay.input_ids,
+            runtime,
+            ngram_size=3,
+            ngram_eos_token_id=2,
+            replay=replay,
+        )
 
 
 if __name__ == "__main__":

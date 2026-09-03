@@ -31,7 +31,7 @@ from sglang.srt.models.qwen4_exp import (
 from sglang.srt.utils.ple_disk import IORING_MAX_ENTRIES
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _REAL_ALLOCATE_HOST_TENSOR = disk._allocate_host_tensor
 
@@ -62,7 +62,7 @@ def test_host_tensor_allocator_pins_the_cpu_device(monkeypatch):
 
 def test_sgl_kernel_version_survives_missing_distribution_metadata(monkeypatch):
     version_file = (
-        Path(__file__).parents[5]
+        Path(__file__).parents[4]
         / "python/sglang/kernels/aot/python/sgl_kernel/version.py"
     )
     monkeypatch.setattr(
@@ -189,6 +189,56 @@ def test_disk_target_verify_masks_invalid_graph_slots(monkeypatch):
     assert batch.valid_tokens.tolist() == [True, False, True, False]
 
 
+def test_disk_decode_masks_padding_when_fusion_is_disabled(monkeypatch):
+    pool = SimpleNamespace(
+        ple_window_cache=None,
+        get_mamba_indices=lambda indices: indices,
+    )
+    monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+    monkeypatch.setattr(
+        qwen4_exp_module.envs.SGLANG_ENABLE_QWEN4_PLE_FUSION,
+        "get",
+        lambda: False,
+    )
+    forward_batch = SimpleNamespace(
+        tbo_parent_token_range=None,
+        spec_algorithm=None,
+        spec_info=None,
+        forward_mode=ForwardMode.DECODE,
+        _original_forward_mode=None,
+        extend_seq_lens=None,
+        out_cache_loc=torch.tensor([7, 0], dtype=torch.long),
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.long),
+        num_token_non_padded_cpu=2,
+    )
+
+    batch = _prepare_ple_batch(
+        torch.arange(2),
+        forward_batch,
+        ngram_size=None,
+        ngram_eos_token_id=None,
+        mask_invalid_tokens=True,
+    )
+
+    assert batch.valid_tokens.tolist() == [True, False]
+
+
+def test_disk_padding_slot_must_be_absent_from_allocator_free_lists():
+    from sglang.srt.mem_cache.allocator.base import allocator_reserves_token_slot
+
+    valid = SimpleNamespace(
+        free_pages=torch.tensor([1, 2]),
+        release_pages=torch.tensor([], dtype=torch.long),
+    )
+    invalid = SimpleNamespace(
+        free_pages=torch.tensor([0, 1]),
+        release_pages=torch.tensor([], dtype=torch.long),
+    )
+
+    assert allocator_reserves_token_slot(valid, 0)
+    assert not allocator_reserves_token_slot(invalid, 0)
+
+
 def test_checkpoint_ple_offload_embedding_maps_to_storage_with_warning():
     from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 
@@ -196,6 +246,21 @@ def test_checkpoint_ple_offload_embedding_maps_to_storage_with_warning():
         with pytest.warns(FutureWarning, match="ple_offload_embedding"):
             config = Qwen4ExpTextConfig(ple_offload_embedding=legacy)
         assert config.ple_storage == expected
+
+
+def test_checkpoint_config_uses_server_disk_defaults():
+    from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+    from sglang.srt.server_args import ServerArgs
+
+    config = Qwen4ExpTextConfig()
+
+    assert config.ple_disk_hot_cache_gb == ServerArgs.ple_disk_hot_cache_gb
+    assert config.ple_disk_dynamic_cache_gb == ServerArgs.ple_disk_dynamic_cache_gb
+    assert (
+        config.ple_disk_prefill_buffer_tokens
+        == ServerArgs.ple_disk_prefill_buffer_tokens
+    )
+    assert config.ple_disk_prefill_read_pages == ServerArgs.ple_disk_prefill_read_pages
 
 
 def _fp8_rows(count: int) -> torch.Tensor:
@@ -284,6 +349,10 @@ def _patch_fetcher_library(monkeypatch, image: disk.PLEImage, **kwargs):
     library = _FakeFetcherLibrary(image.path.read_bytes(), **kwargs)
     monkeypatch.setattr(disk, "_find_helper_library", lambda: Path("fake-fetcher.so"))
     monkeypatch.setattr(disk.ctypes, "CDLL", lambda *args, **opts: library)
+    monkeypatch.setattr(disk, "_logical_block_size", lambda path: disk.PAGE_BYTES)
+    monkeypatch.setattr(
+        disk, "_open_direct_file", lambda path: os.open(path, os.O_RDONLY)
+    )
     return library
 
 
@@ -583,6 +652,34 @@ def test_read_abi_passes_the_staging_buffer_length(tmp_path, monkeypatch):
         reader.close()
 
 
+def test_locked_pages_returns_the_crc_checked_staging_view(tmp_path, monkeypatch):
+    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    reader = disk.DirectPageReader(image, max_pages=1)
+    try:
+        with reader.locked_pages(np.array([0], dtype=np.int64)) as pages:
+            assert np.shares_memory(pages, reader.staging.numpy())
+    finally:
+        reader.close()
+
+
+def test_direct_reader_waits_for_a_concurrent_caller_with_a_budget(monkeypatch):
+    reader = disk.DirectPageReader.__new__(disk.DirectPageReader)
+    reader._read_lock = threading.Lock()
+    reader.max_pages = 1
+    monkeypatch.setattr(disk, "DIRECT_READER_LOCK_TIMEOUT_SECONDS", 0.01)
+    reader._read_lock.acquire()
+    try:
+        with pytest.raises(TimeoutError, match="timed out waiting"):
+            with reader.locked_pages(np.array([], dtype=np.int64)):
+                pass
+    finally:
+        reader._read_lock.release()
+
+
 def test_installed_fetcher_create_rejects_an_invalid_buffer():
     spec = importlib.util.find_spec("sgl_kernel")
     locations = list(spec.submodule_search_locations or ()) if spec is not None else []
@@ -663,6 +760,22 @@ def test_blocked_io_uring_error_has_operator_actions(
     assert "--ple-storage pinned" in message
 
 
+def test_old_kernel_io_uring_error_names_the_minimum_version(tmp_path, monkeypatch):
+    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    _patch_fetcher_library(
+        monkeypatch,
+        image,
+        create_errno=errno.EOPNOTSUPP,
+        failure_stage=disk.FETCHER_FAILURE_SETUP,
+    )
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+
+    with pytest.raises(OSError, match="Linux kernel 5.11 or later"):
+        disk.DirectPageReader(image, max_pages=2)
+
+
 def test_registration_permission_error_is_not_reported_as_blocked_setup(
     tmp_path, monkeypatch
 ):
@@ -700,6 +813,24 @@ def test_manifest_records_ranges_and_rejects_missing_ranges(tmp_path):
         disk.open_ple_image(image.path)
     with pytest.raises(ValueError, match="rebuild"):
         disk.PLEImageBuilder(tmp_path, "ranges", 0, 1, 0, 100)
+
+
+def test_manifest_install_is_read_back_and_compared(tmp_path, monkeypatch):
+    rows = _fp8_rows(25)
+    real_replace = disk.os.replace
+
+    def corrupt_manifest_after_install(source, destination):
+        real_replace(source, destination)
+        destination = Path(destination)
+        if destination.name == "manifest.json":
+            destination.write_text('{"corrupt": true}\n')
+
+    monkeypatch.setattr(disk.os, "replace", corrupt_manifest_after_install)
+    builder = disk.PLEImageBuilder(tmp_path, "manifest-readback", 0, 1, 0, 25)
+    builder.add_shard("shard", rows, 0, 25)
+
+    with pytest.raises(RuntimeError, match="manifest changed after install"):
+        builder.finalize(0.5)
 
 
 def test_manifest_from_newer_install_rejects_older_image(tmp_path):
@@ -868,9 +999,11 @@ def test_transfer_buffers_keep_only_largest_shape_per_device():
     )
 
 
-def test_transfer_buffer_retains_the_configured_prefill_working_set():
-    retain_rows = qwen4_exp_module._ple_transfer_buffer_retain_rows(8192, 16)
-    assert retain_rows == 131072
+def test_transfer_buffer_retains_the_largest_prefill_chunk():
+    retain_rows = qwen4_exp_module._ple_transfer_buffer_retain_rows(
+        8192, 16, max_prefill_chunk_tokens=16384
+    )
+    assert retain_rows == 262144
 
 
 def test_rank_executor_initializes_its_cuda_device(monkeypatch):
@@ -1297,45 +1430,63 @@ def test_prefill_pipeline_failure_disables_lookahead_and_decode_continues(
 def test_fetcher_close_drains_queued_prefill_before_marking_closed(caplog):
     release = threading.Event()
     worker_started = threading.Event()
+    close_waiting = threading.Event()
     executor = ThreadPoolExecutor(max_workers=1)
-    executor.submit(lambda: (worker_started.set(), release.wait(2.0)))
-    assert worker_started.wait(1.0)
+    closer = None
+    try:
+        executor.submit(lambda: (worker_started.set(), release.wait()))
+        assert worker_started.wait(1.0)
 
-    fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
-    fetcher._closed = False
-    fetcher._prefill_executor = executor
-    fetcher._prefill_lock = threading.Lock()
-    queued = executor.submit(
-        lambda: (
-            (_ for _ in ()).throw(RuntimeError("closed during drain"))
-            if fetcher._closed
-            else None
+        fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
+        fetcher._closed = False
+        fetcher._prefill_executor = executor
+        fetcher._prefill_lock = threading.Lock()
+        queued = executor.submit(
+            lambda: (
+                (_ for _ in ()).throw(RuntimeError("closed during drain"))
+                if fetcher._closed
+                else None
+            )
         )
-    )
-    fetcher._prefill_futures = {queued}
-    fetcher.hot = None
-    fetcher.dynamic = None
-    fetcher.prefill_reader = None
-    fetcher.reader = None
-    close_error = []
 
-    def close_fetcher():
-        try:
-            fetcher.close()
-        except BaseException as exc:
-            close_error.append(exc)
+        class TrackedFuture:
+            def result(self):
+                close_waiting.set()
+                return queued.result()
 
-    closer = threading.Thread(target=close_fetcher, daemon=True)
-    with caplog.at_level("ERROR"):
-        closer.start()
-        assert not fetcher._closed
+        fetcher._prefill_futures = {TrackedFuture()}
+        fetcher.hot = None
+        fetcher.dynamic = None
+        fetcher.prefill_reader = None
+        fetcher.reader = None
+        close_result = {}
+
+        def close_fetcher():
+            try:
+                fetcher.close()
+            except BaseException as exc:
+                close_result["error"] = exc
+
+        closer = threading.Thread(target=close_fetcher, daemon=True)
+        with caplog.at_level("ERROR", logger=disk.__name__):
+            closer.start()
+            assert close_waiting.wait(1.0)
+            assert not fetcher._closed
+            release.set()
+            closer.join(2.0)
+
+        assert not closer.is_alive()
+        assert "error" not in close_result
+        assert fetcher._closed
+        assert not any(
+            record.levelno >= 40 and record.name == disk.__name__
+            for record in caplog.records
+        )
+    finally:
         release.set()
-        closer.join(2.0)
-
-    assert not closer.is_alive()
-    assert close_error == []
-    assert fetcher._closed
-    assert not any(record.levelno >= 40 for record in caplog.records)
+        if closer is not None:
+            closer.join(2.0)
+        executor.shutdown(wait=True)
 
 
 def test_prefill_dynamic_hits_do_not_enter_the_admission_queue(tmp_path, monkeypatch):
@@ -1381,17 +1532,30 @@ def test_prefill_disable_waits_for_the_teardown_owner(monkeypatch):
     entered_close = threading.Event()
     release_close = threading.Event()
     waiter_done = threading.Event()
+    waiter_started = threading.Event()
     executor_calls = []
+    results = {}
+
+    class TrackedEvent:
+        def __init__(self):
+            self.event = threading.Event()
+
+        def wait(self):
+            waiter_started.set()
+            return self.event.wait()
+
+        def set(self):
+            self.event.set()
 
     class BlockingReader:
         def close(self):
             entered_close.set()
-            assert release_close.wait(1.0)
+            results["reader_released"] = release_close.wait(1.0)
 
     fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
     fetcher._prefill_lock = threading.Lock()
     fetcher._prefill_disabled = False
-    fetcher._prefill_disable_done = threading.Event()
+    fetcher._prefill_disable_done = TrackedEvent()
     fetcher._prefill_slots = [{"state": "ready", "count": 1}]
     fetcher.prefill_reader = BlockingReader()
     fetcher._prefill_executor = SimpleNamespace(
@@ -1409,15 +1573,18 @@ def test_prefill_disable_waits_for_the_teardown_owner(monkeypatch):
     waiter = threading.Thread(
         target=lambda: (fetcher._disable_prefill(error), waiter_done.set())
     )
-    waiter.start()
-    assert not waiter_done.wait(0.05)
-
-    release_close.set()
-    owner.join(1.0)
-    waiter.join(1.0)
+    try:
+        waiter.start()
+        assert waiter_started.wait(1.0)
+        assert not waiter_done.is_set()
+    finally:
+        release_close.set()
+        owner.join(1.0)
+        waiter.join(1.0)
     assert not owner.is_alive()
     assert not waiter.is_alive()
     assert waiter_done.is_set()
+    assert results == {"reader_released": True}
     assert executor_calls == [(False, True)]
 
 
@@ -1613,15 +1780,44 @@ def test_fetch_clears_only_rows_outside_the_local_shard(tmp_path, monkeypatch):
         fetcher.close()
 
 
-def test_dynamic_cache_reports_a_full_admission_queue(monkeypatch, caplog):
-    monkeypatch.setattr(
-        threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None)
-    )
+def test_dynamic_cache_reports_a_full_admission_queue(caplog):
+    cache = disk.WTinyLFURowCache(capacity_rows=8, queue_batches=1, start_worker=False)
+    try:
+        cache._queue.put_nowait(object())
+        with caplog.at_level("WARNING"):
+            cache.record(np.array([1]), np.zeros((1, disk.ROW_BYTES), dtype=np.uint8))
+        assert "dropped 1 admission batches" in caplog.text
+    finally:
+        cache.close()
+
+
+def test_dynamic_cache_hits_do_not_displace_an_admission(monkeypatch):
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    original_loop = disk.WTinyLFURowCache._admission_loop
+
+    def blocked_loop(cache):
+        worker_entered.set()
+        release_worker.wait()
+        original_loop(cache)
+
+    monkeypatch.setattr(disk.WTinyLFURowCache, "_admission_loop", blocked_loop)
     cache = disk.WTinyLFURowCache(capacity_rows=8, queue_batches=1)
-    cache._queue.put_nowait(object())
-    with caplog.at_level("WARNING"):
-        cache.record(np.array([1]), np.zeros((1, disk.ROW_BYTES), dtype=np.uint8))
-    assert "dropped 1 admission batches" in caplog.text
+    row = np.arange(disk.ROW_BYTES, dtype=np.uint8)
+    cache._insert(3, row)
+    output = np.zeros((1, disk.ROW_BYTES), dtype=np.uint8)
+    try:
+        assert worker_entered.wait(1.0)
+        assert cache.lookup_into(np.array([3]), output).tolist() == [True]
+        cache.record(np.array([4]), row.reshape(1, -1))
+
+        queued = list(cache._queue.queue)
+        assert cache._dropped_batches == 0
+        assert len(queued) == 1
+        assert queued[0][1] is not None
+    finally:
+        release_worker.set()
+        cache.close()
 
 
 def test_dynamic_cache_lookup_waits_for_admission_batch_lock():
@@ -1630,23 +1826,53 @@ def test_dynamic_cache_lookup_waits_for_admission_batch_lock():
     cache._insert(3, row)
     output = np.zeros((1, disk.ROW_BYTES), dtype=np.uint8)
     finished = threading.Event()
+    lock_attempted = threading.Event()
+    result = {}
+    main_thread = threading.get_ident()
+
+    class SignalingLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def acquire(self, *args, **kwargs):
+            if threading.get_ident() != main_thread:
+                lock_attempted.set()
+            return self.lock.acquire(*args, **kwargs)
+
+        def release(self):
+            self.lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    cache._lock = SignalingLock()
 
     def lookup():
-        hit = cache.lookup_into(
-            np.array([3], dtype=np.int64), output, record_hits=False
-        )
-        assert hit.tolist() == [True]
-        finished.set()
+        try:
+            result["hit"] = cache.lookup_into(
+                np.array([3], dtype=np.int64), output, record_hits=False
+            )
+        except BaseException as exc:
+            result["error"] = exc
+        finally:
+            finished.set()
 
     cache._lock.acquire()
     thread = threading.Thread(target=lookup)
     thread.start()
     try:
-        assert not finished.wait(0.1)
+        assert lock_attempted.wait(1.0)
+        assert not finished.is_set()
     finally:
         cache._lock.release()
         thread.join(timeout=1.0)
         cache.close()
+    assert "error" not in result
+    assert result["hit"].tolist() == [True]
     assert np.array_equal(output[0], row)
 
 
@@ -1905,7 +2131,7 @@ def test_weight_reload_without_ple_rows_keeps_the_live_image():
     assert not executor.closed
 
 
-def test_weight_reload_tears_down_when_the_first_ple_row_arrives(monkeypatch):
+def test_weight_reload_builds_replacement_while_live_image_serves(monkeypatch):
     created = []
 
     class Builder:
@@ -1936,10 +2162,11 @@ def test_weight_reload_tears_down_when_the_first_ple_row_arrives(monkeypatch):
     monkeypatch.setattr(disk, "PLEImageBuilder", Builder)
     old_fetcher = Closeable()
     old_executor = Executor()
+    old_image = object()
     embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
     torch.nn.Module.__init__(embedding)
     embedding._fetcher = old_fetcher
-    embedding._image = object()
+    embedding._image = old_image
     embedding._image_builder = None
     embedding._executor = old_executor
     embedding._future = None
@@ -1954,11 +2181,147 @@ def test_weight_reload_tears_down_when_the_first_ple_row_arrives(monkeypatch):
     assert not old_fetcher.closed
     embedding.add_checkpoint_shard("shard_0.weight", _fp8_rows(1), 0, 1)
 
-    assert old_fetcher.closed
-    assert old_executor.closed
-    assert embedding._image is None
+    assert not old_fetcher.closed
+    assert not old_executor.closed
+    assert embedding._image is old_image
+    assert embedding._fetcher is old_fetcher
     assert len(created) == 1
     assert created[0].shards[0][0] == "shard_0.weight"
+
+
+def test_failed_weight_reload_keeps_the_previous_image_serving(monkeypatch):
+    class Builder:
+        def __init__(self, **kwargs):
+            self.shards = []
+
+        def add_shard(self, *args):
+            self.shards.append(args)
+
+        def close(self):
+            pass
+
+    class Closeable:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Executor:
+        def shutdown(self, wait=True):
+            pass
+
+    monkeypatch.setattr(disk, "PLEImageBuilder", Builder)
+    old_fetcher = Closeable()
+    old_image = object()
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding.embedding_dim = 4
+    embedding.tp_size = 1
+    embedding._fetcher = old_fetcher
+    embedding._image = old_image
+    embedding._image_builder = None
+    embedding._executor = Executor()
+    embedding._future = None
+    embedding._prefill_submit_future = None
+    embedding._transfer_buffers = {}
+    embedding._active_transfer_device = None
+    embedding._prefill_host_ids = None
+    embedding._builder_args = {}
+    embedding._new_executor = Executor
+    embedding.allocate_output = lambda shape, device: torch.empty(
+        shape, dtype=torch.bfloat16
+    )
+    embedding._launch_fetch = lambda ids, output, **kwargs: output.fill_(7)
+    embedding.wait_for_prefetch = lambda: None
+    embedding.reduce = lambda output: output
+
+    def fake_loader():
+        yield "shard_0.weight", _fp8_rows(1)
+        raise OSError("fake loader failed")
+
+    embedding.prepare_weight_reload()
+    with pytest.raises(OSError, match="fake loader failed"):
+        for name, loaded_weight in fake_loader():
+            embedding.add_checkpoint_shard(name, loaded_weight, 0, 1)
+
+    assert embedding._fetcher is old_fetcher
+    assert embedding._image is old_image
+    assert not old_fetcher.closed
+    embedding.resume_storage()
+    assert torch.all(embedding.forward(torch.tensor([0])) == 7)
+
+
+def test_partial_weight_reload_names_filtered_updates():
+    class Builder:
+        def finalize(self, weight_scale):
+            raise ValueError(
+                "PLE checkpoint shards do not exactly cover TP rank 0: [[0, 1]]"
+            )
+
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._weight_reload_pending = False
+    embedding._image_builder = Builder()
+    embedding._image = object()
+    embedding._fetcher = object()
+    embedding.weight_scale = torch.tensor(0.5)
+
+    with pytest.raises(ValueError, match="filtered updates"):
+        embedding.finalize_image()
+
+
+def test_successful_weight_reload_swaps_fetchers_after_replacement_opens():
+    image = SimpleNamespace(path=Path("replacement.bin"))
+
+    class Builder:
+        def finalize(self, weight_scale):
+            return (
+                image,
+                False,
+                {
+                    "conversion_seconds": 1.0,
+                    "conversion_gib_per_s": 2.0,
+                },
+            )
+
+    class Fetcher:
+        def __init__(self, with_stats=False):
+            self.closed = False
+            if with_stats:
+                self.hot = SimpleNamespace(
+                    rows=torch.empty(0, dtype=torch.uint8),
+                    bitmap=np.empty(0, dtype=np.uint64),
+                    rank_prefix=np.empty(0, dtype=np.uint32),
+                )
+                self.reader = SimpleNamespace(staging=torch.empty(0, dtype=torch.uint8))
+                self.dynamic = SimpleNamespace(rows=torch.empty(0, dtype=torch.uint8))
+                self._prefill_slots = []
+
+        def close(self):
+            self.closed = True
+
+    old_fetcher = Fetcher()
+    new_fetcher = Fetcher(with_stats=True)
+    old_image = object()
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._weight_reload_pending = False
+    embedding._image_builder = Builder()
+    embedding._image = old_image
+    embedding._fetcher = old_fetcher
+    embedding._build_fetcher = lambda candidate: new_fetcher
+    embedding.weight_scale = torch.tensor(0.5)
+    embedding._rank = 0
+    embedding._hot_frequency_file = None
+    embedding._hot_cache_gb = 0.0
+
+    embedding.finalize_image()
+
+    assert embedding._image is image
+    assert embedding._fetcher is new_fetcher
+    assert old_fetcher.closed
+    assert not new_fetcher.closed
 
 
 def test_future_contexts_follow_configured_ngram_size():

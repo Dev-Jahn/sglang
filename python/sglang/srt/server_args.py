@@ -50,6 +50,10 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+from sglang.srt.configs.qwen4_exp import (
+    PLE_DISK_DEFAULTS,
+    PLE_DISK_MAX_PREFILL_BUFFER_TOKENS,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -110,8 +114,6 @@ from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
-
-PLE_DISK_MAX_PREFILL_BUFFER_TOKENS = 65536
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -2632,49 +2634,50 @@ class ServerArgs:
         "Directory containing fingerprinted per-TP-rank PLE disk images. SGLang "
         "creates it for a first build; a complete existing image may be read-only.",
         NS("exec.offload"),
-    ] = None
+    ] = PLE_DISK_DEFAULTS["ple_disk_dir"]
     ple_disk_hot_cache_gb: A[
         float,
         "Maximum GiB of exact static PLE rows to pin across all TP ranks and "
         "PLE layers and attention-DP replicas in disk mode.",
         NS("exec.offload"),
-    ] = 8.0
+    ] = PLE_DISK_DEFAULTS["ple_disk_hot_cache_gb"]
     ple_disk_hot_frequency_file: A[
         Optional[str],
-        "Binary top-row file exported by scripts/ple_disk/hit_sim.py. Use "
-        "{layer} in the path for checkpoints with multiple PLE layers.",
+        "Binary top-row file exported by scripts/ple_disk/hit_sim.py in an "
+        "SGLang source checkout. Use {layer} in the path for checkpoints with "
+        "multiple PLE layers.",
         NS("exec.offload"),
-    ] = None
+    ] = PLE_DISK_DEFAULTS["ple_disk_hot_frequency_file"]
     ple_disk_dynamic_cache_gb: A[
         float,
         "GiB of exact rows managed by asynchronous W-TinyLFU admission across "
         "all TP ranks, PLE layers, and attention-DP replicas.",
         NS("exec.offload"),
-    ] = 2.0
+    ] = PLE_DISK_DEFAULTS["ple_disk_dynamic_cache_gb"]
     ple_disk_prefill_buffer_tokens: A[
         int,
         "Maximum prompt tokens held in each of two exact PLE prefill buffers. "
         "Each token reserves one row for every PLE n-gram head; the maximum is "
         f"{PLE_DISK_MAX_PREFILL_BUFFER_TOKENS} tokens.",
         NS("exec.offload"),
-    ] = 8192
+    ] = PLE_DISK_DEFAULTS["ple_disk_prefill_buffer_tokens"]
     ple_disk_prefill_read_pages: A[
         int,
         "Maximum pages per prefill io_uring submission; decode uses a separate "
         "ring. Values above --ple-disk-max-read-pages are clamped.",
         NS("exec.offload"),
-    ] = 128
+    ] = PLE_DISK_DEFAULTS["ple_disk_prefill_read_pages"]
     ple_disk_max_read_pages: A[
         Optional[int],
         "Maximum pages registered by the PLE disk decode io_uring. Defaults to "
         "1024 when the CUDA device uses host page tables and 4096 otherwise.",
         NS("exec.offload"),
-    ] = None
+    ] = PLE_DISK_DEFAULTS["ple_disk_max_read_pages"]
     ple_disk_stats_log_interval: A[
         int,
         "Log cumulative PLE disk per-step counters every N steps; zero disables it.",
         NS("exec.offload"),
-    ] = 0
+    ] = PLE_DISK_DEFAULTS["ple_disk_stats_log_interval"]
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -3958,6 +3961,16 @@ class ServerArgs:
         if storage in ("pinned", "disk") and (
             self.cpu_offload_gb > 0 or self.offload_group_size > 0
         ):
+            auto_selected = resolved and any(
+                "ple_storage" in fields
+                for _source, fields in getattr(self, "_resolved_overrides", ())
+            )
+            if storage == "pinned" and auto_selected:
+                raise ValueError(
+                    "Pinned PLE storage was selected automatically and cannot "
+                    "be combined with --cpu-offload-gb or --offload-group-size. "
+                    "Set --ple-storage gpu to keep generic layer offload enabled."
+                )
             option = f"--ple-storage {storage}"
             raise ValueError(
                 f"{option} cannot be combined with "
@@ -8973,6 +8986,15 @@ class ServerArgs:
             dest="incremental_streaming_output",
             new_flag="--incremental-streaming-output",
             help="[Deprecated] Use --incremental-streaming-output instead.",
+        )
+        parser.add_argument(
+            "--ple-offload-embedding",
+            action=DeprecatedStoreConstAction,
+            dest="ple_storage",
+            const_value="pinned",
+            new_flag="--ple-storage pinned",
+            default=argparse.SUPPRESS,
+            help="Deprecated alias for --ple-storage pinned.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",

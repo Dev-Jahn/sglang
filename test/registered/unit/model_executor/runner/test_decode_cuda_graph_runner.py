@@ -111,6 +111,7 @@ class TestModelReplayHooks(CustomTestCase):
             spec_algorithm="spec",
             is_draft_worker=False,
         )
+        runner._cuda_graph_replay_hook = runner.model_runner.model
         runner.backend = backend
         runner.load_batch = lambda forward_batch, pp_proxy_tensors: None
         runner._replay_attn_backend = lambda: object()
@@ -164,6 +165,8 @@ class TestModelReplayHooks(CustomTestCase):
         self.assertTrue(state.completed)
         self.assertIsInstance(prepared[0], CudaGraphReplayInput)
         self.assertEqual(prepared[0].padded_num_tokens, 2)
+        self.assertIs(prepared[0].req_pool_indices, runner.buffers.req_pool_indices)
+        self.assertEqual(prepared[0].batch_size, 2)
         self.assertIs(prepared[0].runtime_forward_batch, forward_batch)
         self.assertEqual(output.tensors["hidden"].tolist(), [0, 1])
 
@@ -188,6 +191,7 @@ class TestModelReplayHooks(CustomTestCase):
             spec_algorithm=None,
             is_draft_worker=False,
         )
+        runner._cuda_graph_replay_hook = runner.model_runner.model
         runner.backend = SimpleNamespace(
             replay_session=nullcontext,
             replay=lambda key, batch: events.append("replay"),

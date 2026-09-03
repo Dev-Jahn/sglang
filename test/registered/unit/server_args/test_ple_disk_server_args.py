@@ -222,5 +222,31 @@ def test_disk_storage_rejects_graph_hook_bypass_modes(tmp_path, option, message)
         args._handle_offload_compatibility()
 
 
+def test_auto_selected_pinned_storage_names_the_explicit_escape():
+    args = _server_args(ple_storage="pinned", cpu_offload_gb=1.0)
+    args._resolved_overrides = [("qwen4 automatic storage", {"ple_storage": "pinned"})]
+
+    with pytest.raises(ValueError) as exc_info:
+        args._handle_offload_compatibility(resolved=True)
+
+    message = str(exc_info.value)
+    assert "selected automatically" in message
+    assert "--ple-storage gpu" in message
+
+
+def test_deprecated_ple_offload_embedding_alias_maps_to_pinned(caplog):
+    parser = server_args_module.argparse.ArgumentParser()
+    server_args_module.ServerArgs.add_cli_args(parser)
+
+    with caplog.at_level("WARNING"):
+        namespace = parser.parse_args(
+            ["--model-path", "dummy", "--ple-offload-embedding"]
+        )
+
+    assert namespace.ple_storage == "pinned"
+    assert "--ple-offload-embedding" in caplog.text
+    assert "--ple-storage pinned" in caplog.text
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

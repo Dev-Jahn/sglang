@@ -889,6 +889,7 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
         req_pool_indices=torch.tensor([7, 0, 0, 0], dtype=torch.long, device=device),
         out_cache_loc=torch.tensor([20, 0, 0, 0], dtype=torch.long, device=device),
         forward_mode=ForwardMode.DECODE,
+        batch_size=lookup_tokens,
         runtime_forward_batch=runtime,
     )
     model = Qwen4ExpModel.__new__(Qwen4ExpModel)

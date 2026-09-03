@@ -312,6 +312,9 @@ def load_model_with_memory_saver(
             model_config.hf_text_config.ple_disk_stats_log_interval = (
                 server_args.ple_disk_stats_log_interval
             )
+            model_config.hf_text_config.ple_disk_max_prefill_chunk_tokens = max(
+                0, int(server_args.chunked_prefill_size or 0)
+            )
 
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup

@@ -105,9 +105,16 @@ _PLE_EMBEDDING_ATTRIBUTES = (
 
 
 def _ple_transfer_buffer_retain_rows(
-    prefill_buffer_tokens: int, ngram_heads: int
+    prefill_buffer_tokens: int,
+    ngram_heads: int,
+    *,
+    max_prefill_chunk_tokens: int = 0,
 ) -> int:
-    return max(65536, int(prefill_buffer_tokens) * int(ngram_heads))
+    return max(
+        65536,
+        int(prefill_buffer_tokens) * int(ngram_heads),
+        int(max_prefill_chunk_tokens) * int(ngram_heads),
+    )
 
 
 def _should_interleave_ple_table() -> bool:
@@ -278,6 +285,11 @@ def _prepare_ple_batch(
         token_offsets = positions - query_start_loc.index_select(0, req_indices)
 
     sequence_count = lengths.shape[0]
+    if replay is not None and sequence_count != replay.batch_size:
+        raise RuntimeError(
+            "PLE sequence count does not match CUDA graph replay batch size: "
+            f"{sequence_count=} replay_batch_size={replay.batch_size}"
+        )
     out_cache_loc = (
         replay.out_cache_loc if replay is not None else forward_batch.out_cache_loc
     )
@@ -293,7 +305,9 @@ def _prepare_ple_batch(
             valid_tokens = valid_tokens & out_cache_loc[:processed_tokens].ne(0)
     else:
         valid_tokens = token_offsets < lengths.index_select(0, req_indices)
-        if (
+        if mask_invalid_tokens and mode.is_decode() and out_cache_loc is not None:
+            valid_tokens = valid_tokens & out_cache_loc[:processed_tokens].ne(0)
+        elif (
             mask_invalid_tokens
             and mode.is_target_verify()
             and out_cache_loc is not None
@@ -1042,33 +1056,24 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             ple_layer_count,
             use_attn_tp_group=self.use_attn_tp_group,
         )
-        self._hot_cache_gb = (
-            float(getattr(config, "ple_disk_hot_cache_gb", 8.0)) / cache_budget_divisor
-        )
+        self._hot_cache_gb = float(config.ple_disk_hot_cache_gb) / cache_budget_divisor
         self._hot_frequency_file = resolve_hot_frequency_file(
-            getattr(config, "ple_disk_hot_frequency_file", None),
+            config.ple_disk_hot_frequency_file,
             ple_layer_index,
             ple_layer_count,
             require_exists=True,
         )
         self._dynamic_cache_gb = (
-            float(getattr(config, "ple_disk_dynamic_cache_gb", 0.0))
-            / cache_budget_divisor
+            float(config.ple_disk_dynamic_cache_gb) / cache_budget_divisor
         )
-        self._prefill_buffer_tokens = int(
-            getattr(config, "ple_disk_prefill_buffer_tokens", 0)
-        )
-        self._prefill_read_pages = int(
-            getattr(config, "ple_disk_prefill_read_pages", 128)
-        )
+        self._prefill_buffer_tokens = int(config.ple_disk_prefill_buffer_tokens)
+        self._prefill_read_pages = int(config.ple_disk_prefill_read_pages)
         self._ngram_heads = (int(getattr(config, "ngram_size", 3)) - 1) * int(
             getattr(config, "heads_per_ngram", 8)
         )
         from sglang.srt.models.qwen4_ple_disk import resolve_max_read_pages
 
-        self._max_read_pages = resolve_max_read_pages(
-            getattr(config, "ple_disk_max_read_pages", None)
-        )
+        self._max_read_pages = resolve_max_read_pages(config.ple_disk_max_read_pages)
         if self._prefill_read_pages > self._max_read_pages:
             logger.warning(
                 "Qwen4 PLE disk prefill read pages %d exceed max read pages %d; "
@@ -1095,15 +1100,17 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         self._completion_event = None
         self._transfer_buffers = {}
         self._transfer_buffer_retain_rows = _ple_transfer_buffer_retain_rows(
-            self._prefill_buffer_tokens, self._ngram_heads
+            self._prefill_buffer_tokens,
+            self._ngram_heads,
+            max_prefill_chunk_tokens=int(
+                getattr(config, "ple_disk_max_prefill_chunk_tokens", 0)
+            ),
         )
         self._active_transfer_device = None
         self._prefill_host_ids = None
         self._graph_generation = 0
         self._active_graph_generation = None
-        self._stats_log_interval = int(
-            getattr(config, "ple_disk_stats_log_interval", 0)
-        )
+        self._stats_log_interval = int(config.ple_disk_stats_log_interval)
         self._stats = {
             "steps": 0,
             "rows_requested": 0,
@@ -1146,12 +1153,15 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             initargs=(self._cuda_device,),
         )
 
-    def _open_fetcher(self) -> None:
+    def _build_fetcher(self, image):
         from sglang.srt.models.qwen4_ple_disk import DiskRowFetcher
 
+        return DiskRowFetcher(image, **self._fetcher_kwargs)
+
+    def _open_fetcher(self) -> None:
         if self._image is None:
             raise RuntimeError("PLE disk image is unavailable")
-        self._fetcher = DiskRowFetcher(self._image, **self._fetcher_kwargs)
+        self._fetcher = self._build_fetcher(self._image)
 
     def add_checkpoint_shard(
         self, name: str, loaded_weight: torch.Tensor, row_start: int, row_end: int
@@ -1165,11 +1175,25 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             return
         if self._image_builder is None:
             return
-        image, reused, stats = self._image_builder.finalize(
-            float(self.weight_scale.item())
-        )
-        self._image_builder = None
+        builder = self._image_builder
+        replacing_live_image = self._image is not None and self._fetcher is not None
+        try:
+            image, reused, stats = builder.finalize(float(self.weight_scale.item()))
+        except ValueError as exc:
+            if replacing_live_image and "do not exactly cover TP rank" in str(exc):
+                raise ValueError(
+                    "PLE weight reload received filtered updates; every PLE "
+                    "checkpoint shard must be included"
+                ) from exc
+            raise
+        finally:
+            self._image_builder = None
+        new_fetcher = self._build_fetcher(image)
+        old_fetcher = self._fetcher
         self._image = image
+        self._fetcher = new_fetcher
+        if old_fetcher is not None:
+            old_fetcher.close()
         logger.info(
             "Qwen4 PLE disk image rank=%d path=%s reused=%s "
             "conversion=%.3fs throughput=%.3f GiB/s",
@@ -1185,11 +1209,6 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
                 "file was supplied; starting with an empty exact hot set",
                 self._hot_cache_gb,
             )
-        try:
-            self._open_fetcher()
-        except BaseException:
-            self.close()
-            raise
         hot_bytes = self._fetcher.hot.rows.numel()
         metadata_bytes = (
             self._fetcher.hot.bitmap.nbytes + self._fetcher.hot.rank_prefix.nbytes
@@ -1552,10 +1571,9 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             return
         from sglang.srt.models.qwen4_ple_disk import PLEImageBuilder
 
-        self.close()
-        self._image = None
+        if self._image_builder is not None:
+            self._image_builder.close()
         self._image_builder = PLEImageBuilder(**self._builder_args)
-        self._executor = self._new_executor()
         self._weight_reload_pending = False
 
     @property
@@ -3023,14 +3041,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             capture_decode_cuda_graph
             and graph_config.decode.backend != Backend.DISABLED
         ):
-            decode_width = model_runner.decode_num_tokens_per_req(
-                num_draft_tokens=model_runner.server_args.speculative_num_draft_tokens
-            )
-            max_tokens = max(
-                max_tokens,
-                max(graph_config.decode.bs or (graph_config.decode.max_bs or 0,))
-                * decode_width,
-            )
+            max_tokens = max(max_tokens, model_runner.max_decode_logits_rows())
 
         for module in ple_layers:
             lookup_tokens = max_tokens

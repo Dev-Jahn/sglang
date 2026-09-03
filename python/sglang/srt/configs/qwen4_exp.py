@@ -5,6 +5,18 @@ from transformers import PretrainedConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 
+PLE_DISK_MAX_PREFILL_BUFFER_TOKENS = 65536
+PLE_DISK_DEFAULTS = {
+    "ple_disk_dir": None,
+    "ple_disk_hot_cache_gb": 8.0,
+    "ple_disk_hot_frequency_file": None,
+    "ple_disk_dynamic_cache_gb": 2.0,
+    "ple_disk_prefill_buffer_tokens": 8192,
+    "ple_disk_prefill_read_pages": 128,
+    "ple_disk_max_read_pages": None,
+    "ple_disk_stats_log_interval": 0,
+}
+
 
 def resolve_ple_storage(config, default=None):
     storage = getattr(config, "ple_storage", None)
@@ -38,6 +50,16 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         ple_storage=None,
         ple_offload_embedding=None,
         ple_embedding_dtype=None,
+        ple_disk_dir=PLE_DISK_DEFAULTS["ple_disk_dir"],
+        ple_disk_hot_cache_gb=PLE_DISK_DEFAULTS["ple_disk_hot_cache_gb"],
+        ple_disk_hot_frequency_file=PLE_DISK_DEFAULTS["ple_disk_hot_frequency_file"],
+        ple_disk_dynamic_cache_gb=PLE_DISK_DEFAULTS["ple_disk_dynamic_cache_gb"],
+        ple_disk_prefill_buffer_tokens=PLE_DISK_DEFAULTS[
+            "ple_disk_prefill_buffer_tokens"
+        ],
+        ple_disk_prefill_read_pages=PLE_DISK_DEFAULTS["ple_disk_prefill_read_pages"],
+        ple_disk_max_read_pages=PLE_DISK_DEFAULTS["ple_disk_max_read_pages"],
+        ple_disk_stats_log_interval=PLE_DISK_DEFAULTS["ple_disk_stats_log_interval"],
         index_share_for_mtp_iteration=True,
         rope_parameters=None,
         layer_types=None,
@@ -87,6 +109,14 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ngram_vocab_size_base = ngram_vocab_size_base
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
         self.ple_storage = ple_storage
+        self.ple_disk_dir = ple_disk_dir
+        self.ple_disk_hot_cache_gb = ple_disk_hot_cache_gb
+        self.ple_disk_hot_frequency_file = ple_disk_hot_frequency_file
+        self.ple_disk_dynamic_cache_gb = ple_disk_dynamic_cache_gb
+        self.ple_disk_prefill_buffer_tokens = ple_disk_prefill_buffer_tokens
+        self.ple_disk_prefill_read_pages = ple_disk_prefill_read_pages
+        self.ple_disk_max_read_pages = ple_disk_max_read_pages
+        self.ple_disk_stats_log_interval = ple_disk_stats_log_interval
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
         # MTP draft decode steps reuse the draft-extend indexer selection

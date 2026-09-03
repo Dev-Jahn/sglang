@@ -168,6 +168,7 @@ def test_model_prewarm_allocates_on_non_sm120(monkeypatch):
             ),
         ),
         decode_num_tokens_per_req=lambda **_: 4,
+        max_decode_logits_rows=lambda: 32,
     )
     monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: False)
 
@@ -199,6 +200,7 @@ def test_model_prewarm_allocates_on_sm121(monkeypatch):
             ),
         ),
         decode_num_tokens_per_req=lambda **_: 4,
+        max_decode_logits_rows=lambda: 32,
     )
     monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: True)
     monkeypatch.setattr(
@@ -233,6 +235,7 @@ def test_model_prewarm_allocates_the_largest_sm120_capture_shape(monkeypatch):
             ),
         ),
         decode_num_tokens_per_req=lambda **_: 4,
+        max_decode_logits_rows=lambda: 32,
     )
     monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: True)
 
@@ -240,6 +243,37 @@ def test_model_prewarm_allocates_the_largest_sm120_capture_shape(monkeypatch):
 
     layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
         32, torch.device("cuda")
+    )
+
+
+def test_model_prewarm_uses_the_runner_decode_capture_extent(monkeypatch):
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
+    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    model = torch.nn.Module()
+    model.add_module("ple", layer)
+    model._prewarm_cuda_graph_jit_kernels = MagicMock()
+    runner = SimpleNamespace(
+        device="cuda",
+        model_config=SimpleNamespace(quantization=None),
+        server_args=SimpleNamespace(
+            speculative_num_draft_tokens=4,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled", bs=None, max_bs=0),
+                decode=SimpleNamespace(backend="full", bs=[1, 8], max_bs=8),
+            ),
+        ),
+        decode_num_tokens_per_req=lambda **_: 4,
+        max_decode_logits_rows=lambda: 48,
+    )
+    monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: False)
+
+    Qwen4ExpModel.prewarm_cuda_graphs(model, runner, capture_decode_cuda_graph=True)
+
+    layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
+        48, torch.device("cuda")
     )
 
 

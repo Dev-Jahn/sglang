@@ -111,7 +111,8 @@ RUN_TESTS_FLAG="${SGL_KERNEL_RUN_TESTS:-0}"
 REQUIRE_IO_URING_FLAG="${SGL_KERNEL_PLE_REQUIRE_IO_URING:-0}"
 DOCKER_TEST_FLAGS=()
 if [ "${RUN_TESTS_FLAG}" = "1" ]; then
-  # The container already runs as root with a host bind mount and host network, so the profile added no isolation.
+  # This opt-in test container runs as root with host networking and a host
+  # source bind. Run it unconfined so the three io_uring calls can execute.
   DOCKER_TEST_FLAGS+=(--security-opt seccomp=unconfined)
 fi
 

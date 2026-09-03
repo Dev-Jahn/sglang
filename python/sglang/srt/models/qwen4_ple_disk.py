@@ -63,6 +63,7 @@ CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 FETCHER_FAILURE_SETUP = 1
 FETCHER_FAILURE_REGISTER_BUFFER = 2
 FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
+DIRECT_READER_LOCK_TIMEOUT_SECONDS = 5.0
 _METADATA_HEADER = struct.Struct("<8sI")
 _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 # Intentionally unbounded: releasing any entry could let the kernel write into
@@ -108,6 +109,10 @@ def resolve_hot_frequency_file(
 
 def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
     return torch.empty(*size, device="cpu", pin_memory=pin_memory, **kwargs)
+
+
+def _open_direct_file(path: Path) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECT)
 
 
 def _current_cuda_device() -> int:
@@ -639,6 +644,13 @@ class PLEImageBuilder:
     def add_shard(
         self, name: str, loaded_weight: torch.Tensor, row_start: int, row_end: int
     ) -> None:
+        """Append one checkpoint shard to the image build.
+
+        Every tensor-parallel rank must call this method for every checkpoint
+        shard before rank-overlap filtering. The sampled digest must cover the
+        complete unsharded tensor. These rules keep the shared manifest payload
+        equal across ranks.
+        """
         try:
             self._add_shard(name, loaded_weight, row_start, row_end)
         except BaseException:
@@ -889,6 +901,11 @@ class PLEImageBuilder:
 
             os.replace(tmp_crc, crc_path)
             os.replace(manifest_tmp, manifest_path)
+            if manifest_path.read_bytes() != manifest_payload:
+                raise RuntimeError(
+                    "PLE manifest changed after install; another rank produced "
+                    "a different checkpoint manifest"
+                )
             if ple_metadata_tmp is not None:
                 os.replace(ple_metadata_tmp, ple_metadata_path)
             directory_fd = os.open(final_dir, os.O_RDONLY | os.O_DIRECTORY)
@@ -1267,6 +1284,7 @@ class WTinyLFURowCache:
         *,
         capacity_rows: Optional[int] = None,
         queue_batches: int = 64,
+        start_worker: bool = True,
     ) -> None:
         if capacity_rows is not None:
             self.num_sets = max(0, int(capacity_rows)) // self._WAYS
@@ -1293,7 +1311,7 @@ class WTinyLFURowCache:
         self._dropped_batches = 0
         self._worker_error: Optional[BaseException] = None
         self._worker = None
-        if self.capacity:
+        if self.capacity and start_worker:
             self._worker = threading.Thread(
                 target=self._admission_loop,
                 name="ple-wtinylfu",
@@ -1355,8 +1373,9 @@ class WTinyLFURowCache:
                 ways = matches[selected].argmax(axis=1)
                 slots = sets[selected] * self._WAYS + ways
                 output[selected] = cached_rows[slots]
-        if record_hits and np.any(hit):
-            self.record(ids[hit], None)
+                if record_hits:
+                    for row_id in ids[selected]:
+                        self._increment(int(row_id))
         return hit
 
     def record(self, local_ids: np.ndarray, exact_rows: Optional[np.ndarray]) -> None:
@@ -1486,6 +1505,18 @@ class WTinyLFURowCache:
 
     def close(self) -> None:
         if not self.capacity:
+            return
+        if self._worker is None:
+            with self._pending_condition:
+                self._closed = True
+                self._pending_batches = 0
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self._queue.task_done()
             return
         error = None
         with self._pending_condition:
@@ -1640,7 +1671,7 @@ class DirectPageReader:
         self.lib.ple_fetcher_destroy.restype = ctypes.c_int
         self.fd = None
         self.handle = None
-        self.fd = os.open(image.path, os.O_RDONLY | os.O_DIRECT)
+        self.fd = _open_direct_file(image.path)
         failure_stage = ctypes.c_int()
         self.handle = self.lib.ple_fetcher_create(
             self.fd,
@@ -1672,30 +1703,60 @@ class DirectPageReader:
                     "container seccomp policy and kernel.io_uring_disabled. "
                     "Allow io_uring or use --ple-storage pinned",
                 )
+            if error == errno.EOPNOTSUPP and (
+                failure_stage.value == FETCHER_FAILURE_SETUP
+            ):
+                raise OSError(
+                    error,
+                    "PLE io_uring requires Linux kernel 5.11 or later; "
+                    "upgrade the kernel or use --ple-storage pinned",
+                )
             raise OSError(error, os.strerror(error))
 
     def read(self, page_ids: np.ndarray) -> np.ndarray:
-        with self.locked_pages(page_ids) as pages:
-            return pages.copy()
-
-    @contextmanager
-    def locked_pages(self, page_ids: np.ndarray):
-        if not self._read_lock.acquire(blocking=False):
-            raise RuntimeError("PLE direct page reader supports one caller at a time")
+        page_ids = np.asarray(page_ids, dtype=np.int64)
+        if page_ids.size <= self.max_pages:
+            with self.locked_pages(page_ids) as pages:
+                return pages.copy()
+        self._acquire_read_lock()
         try:
-            yield self._read_locked(page_ids)
+            return self._read_locked(page_ids, return_staging=False)
         finally:
             self._read_lock.release()
 
-    def _read_locked(self, page_ids: np.ndarray) -> np.ndarray:
+    def _acquire_read_lock(self) -> None:
+        if not self._read_lock.acquire(timeout=DIRECT_READER_LOCK_TIMEOUT_SECONDS):
+            raise TimeoutError(
+                "PLE direct page reader timed out waiting 5.0s for another caller"
+            )
+
+    @contextmanager
+    def locked_pages(self, page_ids: np.ndarray):
+        page_ids = np.asarray(page_ids, dtype=np.int64)
+        if page_ids.size > self.max_pages:
+            raise ValueError(
+                "PLE locked page view cannot exceed --ple-disk-max-read-pages"
+            )
+        self._acquire_read_lock()
+        try:
+            yield self._read_locked(page_ids, return_staging=True)
+        finally:
+            self._read_lock.release()
+
+    def _read_locked(
+        self, page_ids: np.ndarray, *, return_staging: bool = False
+    ) -> np.ndarray:
         page_ids = np.asarray(page_ids, dtype=np.int64)
         if np.any((page_ids < 0) | (page_ids >= self.image.num_pages)):
             raise IndexError("PLE page id outside image")
-        result = (
-            self.result[: page_ids.size]
-            if page_ids.size <= self.max_pages
-            else np.empty((page_ids.size, PAGE_BYTES), dtype=np.uint8)
-        )
+        result = None
+        if not return_staging:
+            result = (
+                self.result[: page_ids.size]
+                if page_ids.size <= self.max_pages
+                else np.empty((page_ids.size, PAGE_BYTES), dtype=np.uint8)
+            )
+        pages = self.staging[:0].numpy().reshape(0, PAGE_BYTES)
         for begin in range(0, page_ids.size, self.max_pages):
             chunk = page_ids[begin : begin + self.max_pages]
             offsets = self.offsets[: chunk.size]
@@ -1759,8 +1820,9 @@ class DirectPageReader:
                 raise IOError(
                     f"PLE checksum mismatch on page {int(chunk[mismatch[0]])}"
                 )
-            result[begin : begin + offsets.size] = pages
-        return result
+            if result is not None:
+                result[begin : begin + offsets.size] = pages
+        return pages if return_staging else result
 
     def close(self) -> None:
         with self._read_lock:

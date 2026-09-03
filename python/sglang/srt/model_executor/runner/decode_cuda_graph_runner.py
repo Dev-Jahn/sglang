@@ -1417,11 +1417,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         CudaGraphReplayInput(
                             padded_num_tokens=padded_num_tokens,
                             input_ids=self.buffers.input_ids[:padded_num_tokens],
-                            req_pool_indices=self.buffers.req_pool_indices[: self.bs],
+                            req_pool_indices=self.buffers.req_pool_indices,
                             out_cache_loc=self.buffers.out_cache_loc[
                                 :padded_num_tokens
                             ],
                             forward_mode=self.capture_forward_mode,
+                            batch_size=self.bs,
                             runtime_forward_batch=forward_batch,
                         )
                     )

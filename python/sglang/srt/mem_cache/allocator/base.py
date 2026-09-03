@@ -24,9 +24,37 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+def allocator_reserves_token_slot(allocator, slot: int) -> bool:
+    """Return whether every allocator free list excludes ``slot``."""
+
+    pending = [allocator]
+    seen = set()
+    found_free_list = False
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        for name in ("free_pages", "release_pages", "free_slots"):
+            values = getattr(current, name, None)
+            if isinstance(values, torch.Tensor):
+                found_free_list = True
+                if bool(values.eq(slot).any().item()):
+                    return False
+        for name in (
+            "full_attn_allocator",
+            "swa_attn_allocator",
+            "logical_attn_allocator",
+            "hisparse_attn_allocator",
+        ):
+            child = getattr(current, name, None)
+            if child is not None:
+                pending.append(child)
+    return found_free_list
+
+
 class BaseTokenToKVPoolAllocator(abc.ABC):
     _kvcache = None
-    padding_slot = 0
 
     @abc.abstractmethod
     def __init__(

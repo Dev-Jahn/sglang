@@ -184,7 +184,7 @@ def test_hit_sim_selects_accessed_rows_and_splits_tp_ranks(tmp_path, monkeypatch
         )
 
 
-def test_hit_sim_counting_uses_bincount_per_head(tmp_path, monkeypatch):
+def test_hit_sim_counting_records_each_head(tmp_path):
     script = Path(__file__).resolve().parents[4] / "scripts/ple_disk/hit_sim.py"
     spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_count", script)
     hit_sim = importlib.util.module_from_spec(spec)
@@ -199,20 +199,12 @@ def test_hit_sim_counting_uses_bincount_per_head(tmp_path, monkeypatch):
     token_path = tmp_path / "tokens.i32"
     np.array([1, 2, 3, 1], dtype="<i4").tofile(token_path)
     counts = hit_sim.open_counts(tmp_path / "counts", metadata)
-    calls = []
-    real_bincount = np.bincount
-
-    def counted_bincount(*args, **kwargs):
-        calls.append(1)
-        return real_bincount(*args, **kwargs)
-
-    monkeypatch.setattr(hit_sim.np, "bincount", counted_bincount)
     hit_sim.count_rows(token_path, metadata, counts, chunk_tokens=2)
-    assert len(calls) == len(counts) * 2
-    assert sum(int(array.sum()) for array in counts) == 8
+    assert counts[0].tolist() == [1, 1, 0, 2]
+    assert counts[1].tolist() == [0, 3, 1]
 
 
-def test_hit_sim_selection_is_independent_of_peak_frequency(monkeypatch):
+def test_hit_sim_selection_handles_a_large_peak_frequency():
     script = Path(__file__).resolve().parents[4] / "scripts/ple_disk/hit_sim.py"
     spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_peak", script)
     hit_sim = importlib.util.module_from_spec(spec)
@@ -228,13 +220,6 @@ def test_hit_sim_selection_is_independent_of_peak_frequency(monkeypatch):
         np.array([10**12, 7, 7, 1], dtype=np.uint64),
         np.array([8, 7, 0], dtype=np.uint64),
     ]
-    monkeypatch.setattr(
-        hit_sim.np,
-        "zeros",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("selection allocated by peak frequency")
-        ),
-    )
     ids, frequencies = hit_sim.select_rows(counts, metadata, capacity=4)
     assert ids.tolist() == [0, 4, 1, 2]
     assert frequencies.tolist() == [10**12, 8, 7, 7]

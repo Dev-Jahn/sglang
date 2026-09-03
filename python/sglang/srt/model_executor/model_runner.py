@@ -86,6 +86,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import allocator_reserves_token_slot
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
@@ -833,10 +834,19 @@ class ModelRunner:
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
-        if getattr(self.server_args, "ple_storage", "gpu") == "disk":
-            assert (
-                self.token_to_kv_pool_allocator.padding_slot == 0
-            ), "Qwen4 PLE disk masking requires KV cache padding slot 0"
+        from sglang.srt.configs.qwen4_exp import resolve_ple_storage
+
+        if resolve_ple_storage(self.server_args, "gpu") == "disk":
+            if self.token_to_kv_pool_allocator is None:
+                raise ValueError(
+                    "Qwen4 PLE disk masking requires a token allocator that "
+                    "reserves KV cache slot 0"
+                )
+            if not allocator_reserves_token_slot(self.token_to_kv_pool_allocator, 0):
+                raise ValueError(
+                    "Qwen4 PLE disk masking requires KV cache slot 0 to be "
+                    "reserved and absent from allocator free lists"
+                )
         self.memory_pool_config = result.memory_pool_config
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
