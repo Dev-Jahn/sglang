@@ -30,7 +30,7 @@ On the measured dual RTX PRO 6000 TP2 host, first-build conversion of the two ap
 
 ## When to use disk storage
 
-Disk mode targets RAM-constrained, low-concurrency serving. In equal-commit NVFP4 TP2 tests with 512-token inputs and outputs, median TPOT was 1.9% higher at concurrency 1. With 32 prompts at concurrency 16, median output throughput was 9.0% lower and median TPOT was 7.5% higher. These tests used decode CUDA graphs, FlashInfer attention, Triton linear attention, and the FlashInfer CUTLASS FP4 and MoE backends on two RTX PRO 6000 GPUs. The image files were on an ext4 MegaRAID virtual SCSI volume, rather than a native NVMe namespace. Use pinned storage when host RAM is available and high-concurrency throughput is the priority.
+Disk mode targets RAM-constrained, low-concurrency serving. In equal-commit NVFP4 TP2 tests with 512-token inputs and outputs on the branch tip, median TPOT was 9.7% higher at concurrency 1 (7.79 ms pinned against 8.55 ms disk). With 32 prompts at concurrency 16, median output throughput was 10.9% lower and median TPOT was 11.7% higher. With NEXTN speculative decoding the median TPOT cost was 4.3% at concurrency 1 and 3.8% at concurrency 4. These tests used decode CUDA graphs, FlashInfer attention, Triton linear attention, and the FlashInfer CUTLASS FP4 and MoE backends on two RTX PRO 6000 GPUs. The image files were on an ext4 MegaRAID virtual SCSI volume, rather than a native NVMe namespace. Use pinned storage when host RAM is available and high-concurrency throughput is the priority.
 
 ## Launch a server
 
