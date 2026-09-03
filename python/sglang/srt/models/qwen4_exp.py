@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import msgspec
+import numpy as np
 import sympy
 import torch
 import torch.nn.functional as F
@@ -1106,6 +1107,8 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         }
         self._image = None
         self._fetcher = None
+        self._row_diagnostics = None
+        self._row_step_index = 0
         self._weight_reload_pending = False
         self._executor = self._new_executor()
         self._future: Optional[Future] = None
@@ -1169,10 +1172,27 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
 
         return DiskRowFetcher(image, **self._fetcher_kwargs)
 
+    def _build_row_diagnostics(self, image):
+        from sglang.srt.models.qwen4_ple_disk import PLEFetchDiagnostics
+
+        return PLEFetchDiagnostics.from_env(
+            image,
+            rank=getattr(self, "_rank", 0),
+            module_prefix=getattr(self, "_module_prefix", "ple"),
+            max_pages=getattr(self, "_max_read_pages", 1),
+        )
+
     def _open_fetcher(self) -> None:
         if self._image is None:
             raise RuntimeError("PLE disk image is unavailable")
-        self._fetcher = self._build_fetcher(self._image)
+        fetcher = self._build_fetcher(self._image)
+        try:
+            diagnostics = self._build_row_diagnostics(self._image)
+        except BaseException:
+            fetcher.close()
+            raise
+        self._fetcher = fetcher
+        self._row_diagnostics = diagnostics
 
     def add_checkpoint_shard(
         self, name: str, loaded_weight: torch.Tensor, row_start: int, row_end: int
@@ -1200,11 +1220,26 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         finally:
             self._image_builder = None
         new_fetcher = self._build_fetcher(image)
+        try:
+            new_diagnostics = self._build_row_diagnostics(image)
+        except BaseException:
+            new_fetcher.close()
+            raise
         old_fetcher = self._fetcher
+        old_diagnostics = getattr(self, "_row_diagnostics", None)
         self._image = image
         self._fetcher = new_fetcher
-        if old_fetcher is not None:
-            old_fetcher.close()
+        self._row_diagnostics = new_diagnostics
+        close_error = None
+        for resource in (old_diagnostics, old_fetcher):
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except BaseException as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise close_error
         logger.info(
             "Qwen4 PLE disk image rank=%d path=%s reused=%s "
             "conversion=%.3fs throughput=%.3f GiB/s",
@@ -1261,12 +1296,24 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         output: torch.Tensor,
         stream: torch.cuda.Stream,
         admit_dynamic: bool,
+        step_index: Optional[int] = None,
     ) -> tuple[torch.cuda.Event, Any, float, float]:
         ids_wait_started = time.perf_counter_ns()
         ids_ready.synchronize()
         ids_ready_wait_us = (time.perf_counter_ns() - ids_wait_started) / 1000.0
+        diagnostics = (
+            getattr(self, "_row_diagnostics", None) if step_index is not None else None
+        )
+        tiers = (
+            np.empty(tuple(host_ids.shape), dtype=np.uint8)
+            if diagnostics is not None
+            else None
+        )
         fetch_started = time.perf_counter_ns()
-        self._fetcher.fetch(host_ids.numpy(), out=raw_host, admit_dynamic=admit_dynamic)
+        fetch_kwargs = {"out": raw_host, "admit_dynamic": admit_dynamic}
+        if tiers is not None:
+            fetch_kwargs["tier_out"] = tiers
+        self._fetcher.fetch(host_ids.numpy(), **fetch_kwargs)
         storage_fetch_us = (time.perf_counter_ns() - fetch_started) / 1000.0
         fetch_stats = self._fetcher.last_fetch_stats
         with torch.cuda.stream(stream):
@@ -1275,6 +1322,8 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             output.copy_(raw_device.view(torch.float8_e4m3fn).to(torch.bfloat16))
             complete = torch.cuda.Event()
             complete.record(stream)
+        if diagnostics is not None:
+            diagnostics.submit(step_index, host_ids.numpy(), raw_host, tiers)
         return complete, fetch_stats, ids_ready_wait_us, storage_fetch_us
 
     def _get_transfer_buffers(
@@ -1323,6 +1372,11 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         # reject another launch until wait_for_prefetch has joined the worker,
         # so the worker finishes reading host_ids before this storage is reused.
         ids_ready.record(stream)
+        step_index = None
+        diagnostics = getattr(self, "_row_diagnostics", None)
+        if admit_dynamic and diagnostics is not None:
+            self._row_step_index = getattr(self, "_row_step_index", 0) + 1
+            step_index = self._row_step_index
         self._future = self._executor.submit(
             self._fetch_to_device,
             host_ids,
@@ -1332,6 +1386,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             output,
             stream,
             admit_dynamic,
+            step_index,
         )
         self._active_transfer_device = input_ids.device
 
@@ -1451,6 +1506,28 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             with dynamic._lock:
                 snapshot["dynamic_admission_dropped"] = dynamic._dropped_batches
             snapshot["dynamic_admission_queue_depth"] = dynamic._queue.qsize()
+        diagnostics = getattr(self, "_row_diagnostics", None)
+        if diagnostics is None:
+            snapshot.update(
+                {
+                    "row_content_validation_enabled": False,
+                    "row_trace_enabled": False,
+                    "row_content_batches_submitted": 0,
+                    "row_content_batches_completed": 0,
+                    "row_content_batches_dropped": 0,
+                    "row_content_rows_checked": 0,
+                    "row_content_mismatches": 0,
+                    "row_content_validation_errors": 0,
+                    "row_content_validation_queue_depth": 0,
+                    "row_trace_records_submitted": 0,
+                    "row_trace_records_written": 0,
+                    "row_trace_records_dropped": 0,
+                    "row_trace_write_errors": 0,
+                    "row_trace_queue_depth": 0,
+                }
+            )
+        else:
+            snapshot.update(diagnostics.stats_snapshot())
         return snapshot
 
     def wait_for_prefetch(self) -> None:
@@ -1530,6 +1607,13 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
                 first_error = first_error or exc
                 logger.warning("PLE disk fetch failed during shutdown", exc_info=True)
         fetcher = getattr(self, "_fetcher", None)
+        diagnostics = getattr(self, "_row_diagnostics", None)
+        if diagnostics is not None:
+            self._row_diagnostics = None
+            try:
+                diagnostics.close()
+            except BaseException as exc:
+                first_error = first_error or exc
         if fetcher is not None:
             self._fetcher = None
             try:

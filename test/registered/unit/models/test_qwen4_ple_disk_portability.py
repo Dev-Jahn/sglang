@@ -12,6 +12,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
@@ -2962,6 +2963,288 @@ def test_disk_fetch_reuses_caller_owned_output(tmp_path, monkeypatch):
         assert fetcher.fetch(ids, out=output) is output
     finally:
         fetcher.close()
+
+
+def test_row_content_validator_reports_corrupt_dynamic_hit(
+    tmp_path, monkeypatch, caplog
+):
+    rows = _fp8_rows(25)
+    raw = rows.view(torch.uint8)
+    image = build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    fetcher = disk.DiskRowFetcher(
+        image, hot_cache_gb=0, dynamic_capacity_rows=8, max_pages=1
+    )
+    diagnostics = disk.PLEFetchDiagnostics(
+        image,
+        rank=3,
+        module_prefix="model.layers.1.ple",
+        max_pages=1,
+        validate_row_content=True,
+    )
+    assert diagnostics._validator.reader is not fetcher.reader
+    corrupt = raw[7].numpy().copy()
+    corrupt[19] ^= np.uint8(1)
+    fetcher.dynamic._insert(7, corrupt)
+    tiers = np.empty(1, dtype=np.uint8)
+    try:
+        actual = fetcher.fetch(np.array([7], dtype=np.int64), tier_out=tiers)
+        assert tiers.tolist() == [disk.PLE_ROW_TIER_DYNAMIC]
+        with caplog.at_level("ERROR", logger=disk.__name__):
+            diagnostics.submit(41, np.array([7], dtype=np.int64), actual, tiers)
+            assert diagnostics.wait_validation(1.0)
+
+        snapshot = diagnostics.stats_snapshot()
+        assert snapshot["row_content_mismatches"] == 1
+        assert "rank=3" in caplog.text
+        assert "module=model.layers.1.ple" in caplog.text
+        assert "step=41" in caplog.text
+        assert "id=7" in caplog.text
+        assert "tier=dynamic" in caplog.text
+        assert "first_differing_byte=19" in caplog.text
+    finally:
+        diagnostics.close()
+        fetcher.close()
+
+
+def test_row_content_validator_accepts_exact_rows(tmp_path, monkeypatch):
+    rows = _fp8_rows(25)
+    image = build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    hot_path = tmp_path / "hot.bin"
+    disk.write_hot_frequency_file(
+        hot_path,
+        {0: np.array([1], dtype=np.uint32)},
+        fingerprint=image.header["fingerprint"],
+        total_rows=25,
+        tp_size=1,
+        padding_divisor=1,
+    )
+    fetcher = disk.DiskRowFetcher(
+        image,
+        hot_frequency_file=str(hot_path),
+        hot_cache_gb=(disk.ROW_BYTES + 1) / (1 << 30),
+        dynamic_capacity_rows=8,
+        prefill_buffer_tokens=1,
+        prefill_read_pages=1,
+        max_pages=1,
+    )
+    diagnostics = disk.PLEFetchDiagnostics(
+        image,
+        rank=0,
+        module_prefix="model.layers.1.ple",
+        max_pages=1,
+        validate_row_content=True,
+    )
+    fetcher.dynamic._insert(2, rows.view(torch.uint8)[2].numpy())
+    assert fetcher.submit_prefill(np.array([3], dtype=np.int64))
+    fetcher.wait_prefill()
+    ids = np.array([1, 2, 3, 4], dtype=np.int64)
+    tiers = np.empty(ids.shape, dtype=np.uint8)
+    try:
+        actual = fetcher.fetch(ids, tier_out=tiers)
+        assert tiers.tolist() == [
+            disk.PLE_ROW_TIER_STATIC,
+            disk.PLE_ROW_TIER_DYNAMIC,
+            disk.PLE_ROW_TIER_PREFILL,
+            disk.PLE_ROW_TIER_COLD,
+        ]
+        diagnostics.submit(1, ids, actual, tiers)
+        assert diagnostics.wait_validation(1.0)
+        snapshot = diagnostics.stats_snapshot()
+        assert snapshot["row_content_rows_checked"] == 4
+        assert snapshot["row_content_mismatches"] == 0
+    finally:
+        diagnostics.close()
+        fetcher.close()
+
+
+def test_row_content_validator_never_blocks_the_serving_fetch(tmp_path, monkeypatch):
+    rows = _fp8_rows(25)
+    image = build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    fetcher = disk.DiskRowFetcher(image, hot_cache_gb=0, max_pages=1)
+    diagnostics = disk.PLEFetchDiagnostics(
+        image,
+        rank=0,
+        module_prefix="model.layers.1.ple",
+        max_pages=1,
+        validate_row_content=True,
+        validation_max_inflight=1,
+    )
+    validator_entered = threading.Event()
+    release_validator = threading.Event()
+    fetch_finished = threading.Event()
+    result = {}
+    original_validate = diagnostics._validator._validate
+
+    def stalled_validate(batch):
+        validator_entered.set()
+        release_validator.wait()
+        original_validate(batch)
+
+    monkeypatch.setattr(diagnostics._validator, "_validate", stalled_validate)
+
+    def fetch_and_submit():
+        ids = np.array([4], dtype=np.int64)
+        tiers = np.empty(ids.shape, dtype=np.uint8)
+        actual = fetcher.fetch(ids, tier_out=tiers)
+        result.update(ids=ids, tiers=tiers, actual=actual)
+        diagnostics.submit(9, ids, actual, tiers)
+        fetch_finished.set()
+
+    worker = threading.Thread(target=fetch_and_submit)
+    try:
+        worker.start()
+        assert validator_entered.wait(1.0)
+        assert fetch_finished.wait(1.0)
+        assert not diagnostics.wait_validation(0.01)
+        diagnostics.submit(10, result["ids"], result["actual"], result["tiers"])
+        assert diagnostics.stats_snapshot()["row_content_batches_dropped"] == 1
+    finally:
+        release_validator.set()
+        worker.join(1.0)
+        diagnostics.close()
+        fetcher.close()
+
+
+def test_row_trace_writes_step_hashes_and_tier_counts(tmp_path):
+    path = tmp_path / "row-trace.jsonl"
+    image = SimpleNamespace()
+    diagnostics = disk.PLEFetchDiagnostics(
+        image,
+        rank=2,
+        module_prefix="model.layers.1.ple",
+        max_pages=1,
+        row_trace_path=path,
+    )
+    ids = np.array([11, -1], dtype=np.int64)
+    rows = np.arange(2 * disk.ROW_BYTES, dtype=np.uint8).reshape(2, disk.ROW_BYTES)
+    tiers = np.array(
+        [disk.PLE_ROW_TIER_COLD, disk.PLE_ROW_TIER_UNOWNED], dtype=np.uint8
+    )
+    diagnostics.submit(17, ids, rows, tiers)
+    diagnostics.close()
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["rank"] == 2
+    assert records[0]["module"] == "model.layers.1.ple"
+    assert records[0]["step"] == 17
+    assert len(records[0]["ids_hash"]) == 32
+    assert len(records[0]["payload_hash"]) == 32
+    assert records[0]["tier_counts"] == {
+        "unowned": 1,
+        "static": 0,
+        "prefill": 0,
+        "dynamic": 0,
+        "cold": 1,
+    }
+
+
+def test_row_diagnostics_environment_is_opt_in(tmp_path, monkeypatch):
+    image = build_test_image(tmp_path, _fp8_rows(25))
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    monkeypatch.delenv("SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT", raising=False)
+    monkeypatch.delenv("SGLANG_PLE_DISK_ROW_TRACE", raising=False)
+    assert (
+        disk.PLEFetchDiagnostics.from_env(
+            image, rank=0, module_prefix="ple", max_pages=1
+        )
+        is None
+    )
+
+    monkeypatch.setenv("SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT", "1")
+    monkeypatch.setenv("SGLANG_PLE_DISK_ROW_TRACE", str(tmp_path / "trace.jsonl"))
+    diagnostics = disk.PLEFetchDiagnostics.from_env(
+        image, rank=0, module_prefix="ple", max_pages=1
+    )
+    try:
+        snapshot = diagnostics.stats_snapshot()
+        assert snapshot["row_content_validation_enabled"]
+        assert snapshot["row_trace_enabled"]
+    finally:
+        diagnostics.close()
+
+
+def test_disk_transfer_submits_the_staged_payload_to_diagnostics(monkeypatch):
+    events = []
+    ids = np.array([12], dtype=np.int64)
+    raw_host = torch.empty((1, disk.ROW_BYTES), dtype=torch.uint8)
+
+    class Fetcher:
+        last_fetch_stats = object()
+
+        def fetch(self, fetched_ids, *, out, admit_dynamic, tier_out):
+            assert np.array_equal(fetched_ids, ids)
+            out.fill_(7)
+            tier_out.fill(disk.PLE_ROW_TIER_COLD)
+
+    class DeviceBuffer:
+        def record_stream(self, stream):
+            pass
+
+        def copy_(self, source, non_blocking=False):
+            assert source is raw_host
+            assert non_blocking
+
+        def view(self, dtype):
+            return torch.zeros_like(raw_host).view(dtype)
+
+    class Completion:
+        def record(self, stream):
+            events.append("completion")
+
+    class Diagnostics:
+        def submit(self, step_index, fetched_ids, rows, tiers):
+            events.append(
+                (
+                    "diagnostics",
+                    step_index,
+                    fetched_ids.copy(),
+                    rows.numpy().copy(),
+                    tiers.copy(),
+                )
+            )
+
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._fetcher = Fetcher()
+    embedding._row_diagnostics = Diagnostics()
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda, "stream", lambda value: nullcontext()
+    )
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", Completion)
+
+    embedding._fetch_to_device(
+        SimpleNamespace(shape=(1,), numpy=lambda: ids),
+        SimpleNamespace(synchronize=lambda: None),
+        raw_host,
+        DeviceBuffer(),
+        torch.empty((1, disk.ROW_BYTES), dtype=torch.bfloat16),
+        object(),
+        True,
+        23,
+    )
+
+    assert events[0] == "completion"
+    _, step_index, submitted_ids, submitted_rows, submitted_tiers = events[1]
+    assert step_index == 23
+    assert submitted_ids.tolist() == [12]
+    assert np.all(submitted_rows == 7)
+    assert submitted_tiers.tolist() == [disk.PLE_ROW_TIER_COLD]
 
 
 def test_dynamic_wtinylfu_admission_eviction_and_exactness(tmp_path, monkeypatch):

@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import zlib
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -54,6 +55,14 @@ logger = logging.getLogger(__name__)
 PAGE_BYTES = 4096
 ROW_BYTES = 160
 ROWS_PER_PAGE = 25
+PLE_ROW_TIER_UNOWNED = 0
+PLE_ROW_TIER_STATIC = 1
+PLE_ROW_TIER_PREFILL = 2
+PLE_ROW_TIER_DYNAMIC = 3
+PLE_ROW_TIER_COLD = 4
+PLE_ROW_TIER_NAMES = ("unowned", "static", "prefill", "dynamic", "cold")
+PLE_ROW_VALIDATION_MAX_INFLIGHT = 4
+PLE_ROW_TRACE_RING_SIZE = 65536
 IMAGE_MAGIC = b"PLEDISK4"
 CRC_MAGIC = b"PLCRC001"
 HOT_MAGIC = b"PLHOT001"
@@ -2186,6 +2195,469 @@ class DirectPageReader:
             pass
 
 
+@dataclass(frozen=True)
+class _PLEValidationBatch:
+    step_index: int
+    ids: np.ndarray
+    rows: np.ndarray
+    tiers: np.ndarray
+
+
+class _PLERowContentValidator:
+    def __init__(
+        self,
+        image: PLEImage,
+        *,
+        rank: int,
+        module_prefix: str,
+        max_pages: int,
+        max_inflight: int,
+    ) -> None:
+        if max_inflight <= 0:
+            raise ValueError("PLE row validation max_inflight must be positive")
+        self.image = image
+        self.rank = int(rank)
+        self.module_prefix = str(module_prefix)
+        self.max_inflight = int(max_inflight)
+        self.reader = DirectPageReader(image, max_pages=max_pages)
+        self._queue: queue.Queue = queue.Queue(maxsize=self.max_inflight)
+        self._slots = threading.BoundedSemaphore(self.max_inflight)
+        self._stats_lock = threading.Lock()
+        self._pending_condition = threading.Condition()
+        self._pending_batches = 0
+        self._closed = False
+        self._stats = {
+            "row_content_batches_submitted": 0,
+            "row_content_batches_completed": 0,
+            "row_content_batches_dropped": 0,
+            "row_content_rows_checked": 0,
+            "row_content_mismatches": 0,
+            "row_content_validation_errors": 0,
+        }
+        self._worker = threading.Thread(
+            target=self._run,
+            name=f"ple-row-validator-rank{self.rank}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def submit(
+        self,
+        step_index: int,
+        ids: np.ndarray,
+        rows: np.ndarray,
+        tiers: np.ndarray,
+    ) -> bool:
+        if self._closed:
+            return False
+        if not self._slots.acquire(blocking=False):
+            with self._stats_lock:
+                self._stats["row_content_batches_dropped"] += 1
+                dropped = self._stats["row_content_batches_dropped"]
+            if dropped == 1 or dropped & (dropped - 1) == 0:
+                logger.warning(
+                    "PLE disk row validation dropped %d batches because its "
+                    "in-flight limit was reached (rank=%d module=%s)",
+                    dropped,
+                    self.rank,
+                    self.module_prefix,
+                )
+            return False
+        pending_added = False
+        try:
+            batch = _PLEValidationBatch(
+                step_index=int(step_index),
+                ids=np.asarray(ids, dtype=np.int64).reshape(-1).copy(),
+                rows=np.asarray(rows, dtype=np.uint8).reshape(-1, ROW_BYTES).copy(),
+                tiers=np.asarray(tiers, dtype=np.uint8).reshape(-1).copy(),
+            )
+            if (
+                batch.ids.size != batch.rows.shape[0]
+                or batch.ids.size != batch.tiers.size
+            ):
+                raise ValueError("PLE row validation input lengths differ")
+            with self._pending_condition:
+                if self._closed:
+                    self._slots.release()
+                    return False
+                self._pending_batches += 1
+                pending_added = True
+            self._queue.put_nowait(batch)
+        except BaseException:
+            with self._pending_condition:
+                if pending_added:
+                    self._pending_batches -= 1
+                    if not self._pending_batches:
+                        self._pending_condition.notify_all()
+            self._slots.release()
+            raise
+        with self._stats_lock:
+            self._stats["row_content_batches_submitted"] += 1
+        return True
+
+    def _run(self) -> None:
+        while True:
+            batch = self._queue.get()
+            try:
+                if batch is None:
+                    return
+                try:
+                    self._validate(batch)
+                except BaseException:
+                    with self._stats_lock:
+                        self._stats["row_content_validation_errors"] += 1
+                    logger.exception(
+                        "PLE disk row validation failed rank=%d module=%s step=%d",
+                        self.rank,
+                        self.module_prefix,
+                        batch.step_index,
+                    )
+            finally:
+                self._queue.task_done()
+                if batch is not None:
+                    with self._stats_lock:
+                        self._stats["row_content_batches_completed"] += 1
+                    with self._pending_condition:
+                        self._pending_batches -= 1
+                        if not self._pending_batches:
+                            self._pending_condition.notify_all()
+                    self._slots.release()
+
+    def _validate(self, batch: _PLEValidationBatch) -> None:
+        owned_positions = np.flatnonzero(
+            (batch.ids >= self.image.vocab_start) & (batch.ids < self.image.vocab_end)
+        )
+        if not owned_positions.size:
+            return
+        local_ids = batch.ids[owned_positions] - self.image.vocab_start
+        page_ids, within = np.divmod(local_ids, ROWS_PER_PAGE)
+        unique_pages, inverse = np.unique(page_ids, return_inverse=True)
+        pages = self.reader.read(unique_pages)
+        byte_indices = (
+            within[:, None] * ROW_BYTES + np.arange(ROW_BYTES, dtype=np.int64)[None, :]
+        )
+        expected = pages[inverse[:, None], byte_indices]
+        actual = batch.rows[owned_positions]
+        mismatched = np.flatnonzero(np.any(actual != expected, axis=1))
+        for mismatch_index in mismatched:
+            source_index = int(owned_positions[mismatch_index])
+            differing = np.flatnonzero(
+                actual[mismatch_index] != expected[mismatch_index]
+            )
+            first_byte = int(differing[0])
+            tier_code = int(batch.tiers[source_index])
+            tier = (
+                PLE_ROW_TIER_NAMES[tier_code]
+                if 0 <= tier_code < len(PLE_ROW_TIER_NAMES)
+                else f"unknown-{tier_code}"
+            )
+            logger.error(
+                "PLE disk row content mismatch rank=%d module=%s step=%d "
+                "id=%d tier=%s first_differing_byte=%d actual=0x%02x "
+                "expected=0x%02x",
+                self.rank,
+                self.module_prefix,
+                batch.step_index,
+                int(batch.ids[source_index]),
+                tier,
+                first_byte,
+                int(actual[mismatch_index, first_byte]),
+                int(expected[mismatch_index, first_byte]),
+            )
+        with self._stats_lock:
+            self._stats["row_content_rows_checked"] += int(owned_positions.size)
+            self._stats["row_content_mismatches"] += int(mismatched.size)
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._pending_condition:
+            while self._pending_batches:
+                if deadline is None:
+                    self._pending_condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pending_condition.wait(remaining)
+        return True
+
+    def stats_snapshot(self) -> dict:
+        with self._stats_lock:
+            snapshot = dict(self._stats)
+        snapshot["row_content_validation_queue_depth"] = self._queue.qsize()
+        snapshot["row_content_validation_max_inflight"] = self.max_inflight
+        return snapshot
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.wait()
+        self._queue.put(None)
+        self._worker.join()
+        self.reader.close()
+
+
+class _PLERowTraceWriter:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        rank: int,
+        module_prefix: str,
+        ring_size: int = PLE_ROW_TRACE_RING_SIZE,
+    ) -> None:
+        if ring_size <= 0:
+            raise ValueError("PLE row trace ring size must be positive")
+        self.path = Path(path)
+        self.rank = int(rank)
+        self.module_prefix = str(module_prefix)
+        self.ring_size = int(ring_size)
+        self._fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        self._condition = threading.Condition()
+        self._ring = deque()
+        self._closed = False
+        self._submitted = 0
+        self._written = 0
+        self._dropped = 0
+        self._errors = 0
+        self._worker = threading.Thread(
+            target=self._run,
+            name=f"ple-row-trace-rank{self.rank}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @staticmethod
+    def _fingerprint(values: np.ndarray) -> str:
+        contiguous = np.ascontiguousarray(values)
+        return hashlib.blake2b(contiguous.view(np.uint8), digest_size=16).hexdigest()
+
+    def submit(
+        self,
+        step_index: int,
+        ids: np.ndarray,
+        rows: np.ndarray,
+        tiers: np.ndarray,
+    ) -> bool:
+        ids = np.ascontiguousarray(ids, dtype="<i8").reshape(-1)
+        rows = np.ascontiguousarray(rows, dtype=np.uint8).reshape(-1, ROW_BYTES)
+        tiers = np.ascontiguousarray(tiers, dtype=np.uint8).reshape(-1)
+        counts = np.bincount(tiers, minlength=len(PLE_ROW_TIER_NAMES))
+        record = {
+            "rank": self.rank,
+            "module": self.module_prefix,
+            "step": int(step_index),
+            "ids_hash": self._fingerprint(ids),
+            "payload_hash": self._fingerprint(rows),
+            "tier_counts": {
+                name: int(counts[index])
+                for index, name in enumerate(PLE_ROW_TIER_NAMES)
+            },
+        }
+        line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        with self._condition:
+            if self._closed:
+                return False
+            if len(self._ring) >= self.ring_size:
+                self._dropped += 1
+                dropped = self._dropped
+            else:
+                self._ring.append(line)
+                self._submitted += 1
+                self._condition.notify()
+                return True
+        if dropped == 1 or dropped & (dropped - 1) == 0:
+            logger.error(
+                "PLE disk row trace dropped %d records because its ring was full "
+                "(rank=%d module=%s path=%s)",
+                dropped,
+                self.rank,
+                self.module_prefix,
+                self.path,
+            )
+        return False
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._ring and not self._closed:
+                    self._condition.wait()
+                if not self._ring:
+                    return
+                line = self._ring.popleft()
+            try:
+                written = os.write(self._fd, line)
+                if written != len(line):
+                    raise OSError(errno.EIO, "short PLE row trace write")
+            except BaseException:
+                with self._condition:
+                    self._errors += 1
+                logger.exception(
+                    "PLE disk row trace write failed rank=%d module=%s path=%s",
+                    self.rank,
+                    self.module_prefix,
+                    self.path,
+                )
+            else:
+                with self._condition:
+                    self._written += 1
+
+    def stats_snapshot(self) -> dict:
+        with self._condition:
+            return {
+                "row_trace_records_submitted": self._submitted,
+                "row_trace_records_written": self._written,
+                "row_trace_records_dropped": self._dropped,
+                "row_trace_write_errors": self._errors,
+                "row_trace_queue_depth": len(self._ring),
+                "row_trace_ring_size": self.ring_size,
+            }
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+        self._worker.join()
+        os.close(self._fd)
+
+
+def _read_env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.lower()
+    if normalized in ("true", "1", "yes", "y"):
+        return True
+    if normalized in ("false", "0", "no", "n"):
+        return False
+    raise ValueError(f'"{value}" is not a valid boolean value for {name}')
+
+
+class PLEFetchDiagnostics:
+    def __init__(
+        self,
+        image: PLEImage,
+        *,
+        rank: int,
+        module_prefix: str,
+        max_pages: int,
+        validate_row_content: bool = False,
+        row_trace_path: Optional[str | Path] = None,
+        validation_max_inflight: int = PLE_ROW_VALIDATION_MAX_INFLIGHT,
+        trace_ring_size: int = PLE_ROW_TRACE_RING_SIZE,
+    ) -> None:
+        self._validator = None
+        self._trace = None
+        try:
+            if validate_row_content:
+                self._validator = _PLERowContentValidator(
+                    image,
+                    rank=rank,
+                    module_prefix=module_prefix,
+                    max_pages=max_pages,
+                    max_inflight=validation_max_inflight,
+                )
+            if row_trace_path:
+                self._trace = _PLERowTraceWriter(
+                    row_trace_path,
+                    rank=rank,
+                    module_prefix=module_prefix,
+                    ring_size=trace_ring_size,
+                )
+        except BaseException:
+            self.close()
+            raise
+
+    @classmethod
+    def from_env(
+        cls,
+        image: PLEImage,
+        *,
+        rank: int,
+        module_prefix: str,
+        max_pages: int,
+    ) -> Optional[PLEFetchDiagnostics]:
+        validate = _read_env_bool("SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT")
+        trace_path = os.environ.get("SGLANG_PLE_DISK_ROW_TRACE") or None
+        if not validate and trace_path is None:
+            return None
+        return cls(
+            image,
+            rank=rank,
+            module_prefix=module_prefix,
+            max_pages=max_pages,
+            validate_row_content=validate,
+            row_trace_path=trace_path,
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._validator is not None or self._trace is not None
+
+    def submit(
+        self,
+        step_index: int,
+        ids: np.ndarray,
+        rows: torch.Tensor | np.ndarray,
+        tiers: np.ndarray,
+    ) -> None:
+        row_values = rows.numpy() if isinstance(rows, torch.Tensor) else rows
+        if self._validator is not None:
+            self._validator.submit(step_index, ids, row_values, tiers)
+        if self._trace is not None:
+            self._trace.submit(step_index, ids, row_values, tiers)
+
+    def wait_validation(self, timeout: Optional[float] = None) -> bool:
+        if self._validator is None:
+            return True
+        return self._validator.wait(timeout)
+
+    def stats_snapshot(self) -> dict:
+        snapshot = {
+            "row_content_validation_enabled": self._validator is not None,
+            "row_trace_enabled": self._trace is not None,
+            "row_content_batches_submitted": 0,
+            "row_content_batches_completed": 0,
+            "row_content_batches_dropped": 0,
+            "row_content_rows_checked": 0,
+            "row_content_mismatches": 0,
+            "row_content_validation_errors": 0,
+            "row_content_validation_queue_depth": 0,
+            "row_trace_records_submitted": 0,
+            "row_trace_records_written": 0,
+            "row_trace_records_dropped": 0,
+            "row_trace_write_errors": 0,
+            "row_trace_queue_depth": 0,
+        }
+        if self._validator is not None:
+            snapshot.update(self._validator.stats_snapshot())
+        if self._trace is not None:
+            snapshot.update(self._trace.stats_snapshot())
+        return snapshot
+
+    def close(self) -> None:
+        first_error = None
+        validator = self._validator
+        self._validator = None
+        if validator is not None:
+            try:
+                validator.close()
+            except BaseException as exc:
+                first_error = exc
+        trace = self._trace
+        self._trace = None
+        if trace is not None:
+            try:
+                trace.close()
+            except BaseException as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+
 class DiskRowFetcher:
     def __init__(
         self,
@@ -2456,6 +2928,7 @@ class DiskRowFetcher:
         priority: str = "decode",
         use_prefill: bool = True,
         admit_dynamic: bool = True,
+        tier_out: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         if getattr(self, "_closed", False):
             raise RuntimeError("PLE disk fetcher is closed")
@@ -2489,6 +2962,21 @@ class DiskRowFetcher:
         owned = (flat_ids >= self.image.vocab_start) & (flat_ids < self.image.vocab_end)
         out_np = output.numpy().reshape(-1, ROW_BYTES)
         out_np[~owned] = 0
+        flat_tiers = None
+        if tier_out is not None:
+            tiers = np.asarray(tier_out)
+            if (
+                tiers.shape != ids.shape
+                or tiers.dtype != np.uint8
+                or not tiers.flags.c_contiguous
+                or not tiers.flags.writeable
+            ):
+                raise ValueError(
+                    "PLE fetch tier output must be writable contiguous uint8 with "
+                    f"shape {ids.shape}"
+                )
+            flat_tiers = tiers.reshape(-1)
+            flat_tiers.fill(PLE_ROW_TIER_UNOWNED)
         positions = np.flatnonzero(owned)
         if not positions.size:
             self.last_fetch_stats = PLEFetchStats()
@@ -2497,6 +2985,8 @@ class DiskRowFetcher:
         hit, slots = self.hot.lookup(local)
         if np.any(hit):
             out_np[positions[hit]] = self.hot.rows.numpy()[slots[hit]]
+            if flat_tiers is not None:
+                flat_tiers[positions[hit]] = PLE_ROW_TIER_STATIC
         pending_positions = positions[~hit]
         pending_local = local[~hit]
         prefill_hits = np.zeros(pending_positions.size, dtype=np.bool_)
@@ -2509,6 +2999,8 @@ class DiskRowFetcher:
             )
             if np.any(prefill_hits):
                 out_np[pending_positions[prefill_hits]] = prefill_output[prefill_hits]
+                if flat_tiers is not None:
+                    flat_tiers[pending_positions[prefill_hits]] = PLE_ROW_TIER_PREFILL
         dynamic_positions = pending_positions[~prefill_hits]
         dynamic_local = pending_local[~prefill_hits]
         dynamic_hits = np.zeros(dynamic_positions.size, dtype=np.bool_)
@@ -2521,11 +3013,15 @@ class DiskRowFetcher:
             )
             if np.any(dynamic_hits):
                 out_np[dynamic_positions[dynamic_hits]] = dynamic_output[dynamic_hits]
+                if flat_tiers is not None:
+                    flat_tiers[dynamic_positions[dynamic_hits]] = PLE_ROW_TIER_DYNAMIC
         cold_positions = dynamic_positions[~dynamic_hits]
         cold_local = dynamic_local[~dynamic_hits]
         cold_pages = 0
         coalesced_rows = 0
         if cold_positions.size:
+            if flat_tiers is not None:
+                flat_tiers[cold_positions] = PLE_ROW_TIER_COLD
             page_ids = cold_local // ROWS_PER_PAGE
             within = cold_local % ROWS_PER_PAGE
             unique, inverse = np.unique(page_ids, return_inverse=True)
