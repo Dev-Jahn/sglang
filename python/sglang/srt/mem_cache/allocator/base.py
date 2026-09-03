@@ -35,7 +35,7 @@ def allocator_reserves_token_slot(allocator, slot: int) -> bool:
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
-        for name in ("free_pages", "release_pages", "free_slots"):
+        for name in ("free_pages", "release_pages", "free_slots", "free_virtual_ids"):
             values = getattr(current, name, None)
             if isinstance(values, torch.Tensor):
                 found_free_list = True

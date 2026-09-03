@@ -236,6 +236,14 @@ def test_disk_padding_slot_must_be_absent_from_allocator_free_lists():
     )
 
     assert allocator_reserves_token_slot(valid, 0)
+    unified_valid = SimpleNamespace(
+        full_attn_allocator=SimpleNamespace(free_virtual_ids=torch.tensor([1, 2])),
+    )
+    unified_invalid = SimpleNamespace(
+        full_attn_allocator=SimpleNamespace(free_virtual_ids=torch.tensor([0, 1])),
+    )
+    assert allocator_reserves_token_slot(unified_valid, 0)
+    assert not allocator_reserves_token_slot(unified_invalid, 0)
     assert not allocator_reserves_token_slot(invalid, 0)
 
 
