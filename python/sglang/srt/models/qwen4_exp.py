@@ -67,6 +67,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner import (
     get_capture_dsa_variant,
     get_capture_lora_variant,
+    get_capture_runner_graph_key,
     get_is_capture_mode,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
@@ -1728,6 +1729,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self._pending_graph_embedding_validation = None
         self._completed_graph_embedding_validation = deque()
         self._graph_lookup_id_buffers = {}
+        self._graph_lookup_id_buffer_owners = {}
         self._graph_lookup_validation_due = set()
         self._pending_graph_lookup_validation = None
         self._completed_graph_lookup_validation = deque()
@@ -1897,6 +1899,7 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def reset_cuda_graph_capture_buffers(self) -> None:
         self._graph_lookup_id_buffers.clear()
+        self._graph_lookup_id_buffer_owners.clear()
         self._graph_embedding_snapshot_buffers.clear()
         self._graph_lookup_validation_due.clear()
         self._pending_graph_lookup_validation = None
@@ -2015,7 +2018,13 @@ class Qwen4ExpPLELayer(nn.Module):
             and future_contexts.numel()
         ):
             future_lookup_ids = self.ple_embedding._hash_contexts(future_contexts)
-        graph_key = _ple_graph_key(batch, forward_batch, lookup_tokens)
+        runner_graph_key = get_capture_runner_graph_key() if capturing_disk else None
+        graph_key = _ple_graph_key(
+            batch,
+            forward_batch,
+            lookup_tokens,
+            runner_graph_key=runner_graph_key,
+        )
         prefetched = self._get_prefetch_buffer(
             lookup_tokens,
             lookup_ids,
@@ -2024,12 +2033,17 @@ class Qwen4ExpPLELayer(nn.Module):
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
 
         if capturing_disk:
-            if graph_key in self._graph_lookup_id_buffers:
+            owner = self._graph_lookup_id_buffer_owners.get(graph_key)
+            if (
+                graph_key in self._graph_lookup_id_buffer_owners
+                and owner != runner_graph_key
+            ):
                 raise RuntimeError(
                     "PLE graph capture key is already owned by another graph: "
                     f"{graph_key}"
                 )
             self._graph_lookup_id_buffers[graph_key] = lookup_ids
+            self._graph_lookup_id_buffer_owners[graph_key] = runner_graph_key
             self._graph_lookup_validation_due.add(graph_key)
             offloaded_embedding.gather(lookup_ids, out=output_view)
             self._prefetch_state = (

@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_utils.capture_mode import capture_runner_graph
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpDiskEmbedding,
@@ -132,6 +134,7 @@ def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
     layer._prefetch_state = None
     layer._future_lookup_contexts = torch.ones((3, 3), dtype=torch.long)
     layer._graph_lookup_id_buffers = {}
+    layer._graph_lookup_id_buffer_owners = {}
     layer._graph_lookup_validation_due = set()
     layer._is_capturing = lambda: True
     layer._get_prefetch_buffer = lambda tokens, ids, graph_key: torch.empty(
@@ -180,6 +183,7 @@ def test_disk_capture_keys_equal_token_counts_by_forward_mode(monkeypatch):
     layer._prefetch_state = None
     layer._future_lookup_contexts = None
     layer._graph_lookup_id_buffers = {}
+    layer._graph_lookup_id_buffer_owners = {}
     layer._graph_lookup_validation_due = set()
     layer._is_capturing = lambda: True
     layer._get_prefetch_buffer = lambda tokens, ids, graph_key: torch.empty(
@@ -203,7 +207,7 @@ def test_disk_capture_keys_equal_token_counts_by_forward_mode(monkeypatch):
     }
 
 
-def test_disk_capture_key_keeps_runner_variants_separate(monkeypatch):
+def test_disk_capture_key_keeps_runner_variants_separate():
     offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
     torch.nn.Module.__init__(offloaded)
     offloaded.gather = lambda input_ids, out: out
@@ -224,23 +228,11 @@ def test_disk_capture_key_keeps_runner_variants_separate(monkeypatch):
     layer._prefetch_state = None
     layer._future_lookup_contexts = None
     layer._graph_lookup_id_buffers = {}
+    layer._graph_lookup_id_buffer_owners = {}
     layer._graph_lookup_validation_due = set()
     layer._is_capturing = lambda: True
     layer._get_prefetch_buffer = lambda tokens, ids, graph_key: torch.empty(
         (tokens, 1, 4), dtype=torch.bfloat16
-    )
-    variants = iter(["lora", "nolora", "lora"])
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_capture_lora_variant",
-        lambda: next(variants),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_capture_dsa_variant",
-        lambda: None,
-        raising=False,
     )
     batch = SimpleNamespace(
         mode=ForwardMode.DECODE, physical_tokens=4, processed_tokens=4
@@ -252,14 +244,119 @@ def test_disk_capture_key_keeps_runner_variants_separate(monkeypatch):
         _original_forward_mode=None,
     )
 
-    layer.start_prefetch(batch, forward_batch)
-    layer._prefetch_state = None
-    layer.start_prefetch(batch, forward_batch)
-
-    assert len(layer._graph_lookup_id_buffers) == 2
-    layer._prefetch_state = None
-    with pytest.raises(RuntimeError, match="already owned by another graph"):
+    first_runner_key = ShapeKey(
+        size=4, stream_idx=0, variant_label="lora", dsa_variant="dense"
+    )
+    second_runner_key = ShapeKey(
+        size=4, stream_idx=0, variant_label="nolora", dsa_variant="dense"
+    )
+    colliding_runner_key = ShapeKey(
+        size=4, stream_idx=1, variant_label="lora", dsa_variant="dense"
+    )
+    with capture_runner_graph(first_runner_key):
         layer.start_prefetch(batch, forward_batch)
+    layer._prefetch_state = None
+    with capture_runner_graph(second_runner_key):
+        layer.start_prefetch(batch, forward_batch)
+    layer._prefetch_state = None
+    with capture_runner_graph(colliding_runner_key):
+        with pytest.raises(RuntimeError, match="already owned by another graph"):
+            layer.start_prefetch(batch, forward_batch)
+
+    lora_key = (ForwardMode.DECODE, 4, "lora", "dense")
+    nolora_key = (ForwardMode.DECODE, 4, "nolora", "dense")
+    assert layer._graph_lookup_id_buffer_owners == {
+        lora_key: first_runner_key,
+        nolora_key: second_runner_key,
+    }
+
+
+def test_disk_capture_reregisters_one_runner_key_before_replay(monkeypatch):
+    offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(offloaded)
+    offloaded.gather = lambda input_ids, out: out.fill_(input_ids[0, 0])
+    offloaded.reduce = lambda embeddings: embeddings
+    offloaded.weight_scale = 1
+    offloaded.stage_graph_step = lambda input_ids, out: 1
+    offloaded.wait_for_graph_step = lambda generation: None
+    lookup_ids = [torch.full((4, 1), value, dtype=torch.long) for value in (1, 2, 3)]
+    ngram_embedding = SimpleNamespace(
+        ngram_embedding=offloaded,
+        ngram_heads=1,
+        gather_dp_tokens=False,
+        compute_ngram_ids=lambda batch: lookup_ids.pop(0),
+        _prepare_embedding_lookup=lambda ids, forward_batch, physical_tokens: (
+            ids,
+            physical_tokens,
+        ),
+        _finish_embedding_lookup=lambda embeddings, *args: embeddings,
+    )
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = ngram_embedding
+    layer._prefetch_stream = SimpleNamespace(wait_stream=lambda stream: None)
+    layer._graph_prefetch_buffer = torch.empty((4, 1, 4), dtype=torch.bfloat16)
+    layer._prefetch_state = None
+    layer._future_lookup_contexts = None
+    layer._graph_lookup_id_buffers = {}
+    layer._graph_lookup_id_buffer_owners = {}
+    layer._graph_embedding_snapshot_buffers = {}
+    layer._graph_lookup_validation_due = set()
+    layer._graph_lookup_validation_interval = 0
+    layer._graph_replay_generation = None
+    layer._graph_replay_stage_expected = False
+    layer._graph_replay_capture_expected_key = None
+    layer._pending_graph_embedding_validation = None
+    layer._completed_graph_embedding_validation = deque()
+    layer._pending_graph_lookup_validation = None
+    layer._completed_graph_lookup_validation = deque()
+    layer._graph_replay_steps = 0
+    layer._validate_graph_staging = True
+    capturing = True
+    layer._is_capturing = lambda: capturing
+    runner_key = ShapeKey(
+        size=4,
+        stream_idx=1,
+        variant_label="lora",
+        dsa_variant="dense",
+    )
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(wait_stream=lambda stream: None),
+    )
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda, "stream", lambda stream: nullcontext()
+    )
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+    batch = SimpleNamespace(
+        mode=ForwardMode.DECODE, physical_tokens=4, processed_tokens=4
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.arange(4),
+        global_dp_buffer_len=None,
+        forward_mode=ForwardMode.DECODE,
+        _original_forward_mode=None,
+    )
+
+    with capture_runner_graph(runner_key):
+        layer.start_prefetch(batch, forward_batch)
+        layer._consume_prefetched_embeddings(forward_batch)
+        layer.start_prefetch(batch, forward_batch)
+        layer._consume_prefetched_embeddings(forward_batch)
+
+    capturing = False
+    graph_key = (ForwardMode.DECODE, 4, "lora", "dense")
+    assert layer._graph_lookup_id_buffers[graph_key][0, 0].item() == 2
+    assert torch.all(layer._graph_embedding_snapshot_buffers[graph_key] == 2)
+    layer._validate_graph_staging = False
+    layer._graph_lookup_validation_due.clear()
+    layer.prepare_cuda_graph_replay(batch, lookup_ids.pop(0), graph_key)
+    layer.wait_cuda_graph_replay()
+    layer.finish_cuda_graph_replay()
+
+    assert layer._graph_replay_generation is None
+    assert layer._graph_replay_capture_expected_key is None
 
 
 def test_disk_ple_forward_rejects_a_missing_prefetch():
@@ -347,6 +444,7 @@ def test_disk_capture_uses_one_key_when_batch_and_runtime_modes_differ(monkeypat
     layer._prefetch_state = None
     layer._future_lookup_contexts = None
     layer._graph_lookup_id_buffers = {}
+    layer._graph_lookup_id_buffer_owners = {}
     layer._graph_embedding_snapshot_buffers = {}
     layer._graph_lookup_validation_due = set()
     layer._validate_graph_staging = True
@@ -690,6 +788,7 @@ def test_capture_start_drops_references_from_the_previous_graph():
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer._graph_lookup_id_buffers = {1: object()}
+    layer._graph_lookup_id_buffer_owners = {1: object()}
     layer._graph_embedding_snapshot_buffers = {1: object()}
     layer._graph_lookup_validation_due = {1}
     layer._pending_graph_lookup_validation = object()
@@ -698,6 +797,7 @@ def test_capture_start_drops_references_from_the_previous_graph():
     layer.reset_cuda_graph_capture_buffers()
 
     assert layer._graph_lookup_id_buffers == {}
+    assert layer._graph_lookup_id_buffer_owners == {}
     assert layer._graph_embedding_snapshot_buffers == {}
     assert layer._graph_lookup_validation_due == set()
     assert layer._pending_graph_lookup_validation is None

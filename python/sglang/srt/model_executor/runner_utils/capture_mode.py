@@ -20,7 +20,7 @@ which variant to use).
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -41,6 +41,9 @@ _capture_lora_variant: Optional[str] = None
 # None = not dual-capturing; the indexer then bakes in the full-indexer path,
 # which is correct for any kv_len.
 _capture_dsa_variant: Optional[str] = None
+
+# Runner key for the active shape's warmup and recorded passes.
+_capture_runner_graph_key: Optional[Any] = None
 
 
 def get_is_capture_mode() -> bool:
@@ -79,6 +82,21 @@ def get_capture_dsa_variant() -> Optional[str]:
 def _set_capture_dsa_variant(variant: Optional[str]) -> None:
     global _capture_dsa_variant
     _capture_dsa_variant = variant
+
+
+def get_capture_runner_graph_key() -> Optional[Any]:
+    return _capture_runner_graph_key
+
+
+@contextmanager
+def capture_runner_graph(graph_key: Any):
+    global _capture_runner_graph_key
+    previous = _capture_runner_graph_key
+    _capture_runner_graph_key = graph_key
+    try:
+        yield
+    finally:
+        _capture_runner_graph_key = previous
 
 
 @contextmanager

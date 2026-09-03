@@ -14,9 +14,11 @@ from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: F401
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (  # noqa: F401
     _set_capture_lora_variant,
+    capture_runner_graph,
     compile_in_capture_mode,
     get_capture_dsa_variant,
     get_capture_lora_variant,
+    get_capture_runner_graph_key,
     get_is_capture_mode,
     model_capture_mode,
 )

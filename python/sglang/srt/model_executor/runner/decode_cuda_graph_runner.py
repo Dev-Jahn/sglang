@@ -93,6 +93,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_dsa_variant,
     _set_capture_lora_variant,
+    capture_runner_graph,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -1226,18 +1227,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
-                maybe_flashinfer_autotune_speculative_draft(
-                    self,
-                    run_once,
-                    post_warmup_hook=post_warmup_hook,
-                    run_lm_head=True,
-                )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                with capture_runner_graph(shape_key):
+                    maybe_flashinfer_autotune_speculative_draft(
+                        self,
+                        run_once,
+                        post_warmup_hook=post_warmup_hook,
+                        run_lm_head=True,
+                    )
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
