@@ -988,10 +988,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
 
 def _ple_cache_budget_divisor(
-    tp_size: int, ple_layer_count: int, *, use_attn_tp_group: bool
+    tp_size: int, ple_layer_count: int, replica_count: int
 ) -> int:
-    replication = get_attention_dp_size() if use_attn_tp_group else 1
-    return int(tp_size) * int(ple_layer_count) * int(replication)
+    return int(tp_size) * int(ple_layer_count) * int(replica_count)
 
 
 class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
@@ -1066,7 +1065,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         cache_budget_divisor = _ple_cache_budget_divisor(
             self.tp_size,
             ple_layer_count,
-            use_attn_tp_group=self.use_attn_tp_group,
+            parallel.dp_size,
         )
         self._hot_cache_gb = float(config.ple_disk_hot_cache_gb) / cache_budget_divisor
         self._hot_frequency_file = resolve_hot_frequency_file(
@@ -1114,9 +1113,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         self._transfer_buffer_retain_rows = _ple_transfer_buffer_retain_rows(
             self._prefill_buffer_tokens,
             self._ngram_heads,
-            max_prefill_chunk_tokens=int(
-                getattr(config, "ple_disk_max_prefill_chunk_tokens", 0)
-            ),
+            max_prefill_chunk_tokens=int(config.ple_disk_max_prefill_chunk_tokens),
         )
         self._active_transfer_device = None
         self._prefill_host_ids = None
@@ -3062,7 +3059,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         self, model_runner, *, capture_decode_cuda_graph: bool
     ) -> None:
         ple_layers = [
-            module for module in self.modules() if isinstance(module, Qwen4ExpPLELayer)
+            module
+            for module in self.modules()
+            if isinstance(module, Qwen4ExpPLELayer)
+            and isinstance(
+                module.ple_embedding.ngram_embedding,
+                (Qwen4ExpPinnedHostEmbedding, Qwen4ExpDiskEmbedding),
+            )
         ]
         for module in ple_layers:
             module.reset_cuda_graph_capture_buffers()

@@ -31,10 +31,17 @@ from sglang.srt.models.qwen4_exp import (
 )
 from sglang.srt.utils.ple_disk import IORING_MAX_ENTRIES
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ple_disk_utils import (
+    attach_checkpoint_source,
+    build_test_image,
+    fetcher_header_constants,
+    native_reader_unavailable_reason,
+)
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _REAL_ALLOCATE_HOST_TENSOR = disk._allocate_host_tensor
+_FETCHER_HEADER_CONSTANTS = fetcher_header_constants()
 
 
 @pytest.fixture(autouse=True)
@@ -225,7 +232,7 @@ def test_disk_decode_masks_padding_when_fusion_is_disabled(monkeypatch):
 
 
 def test_disk_padding_slot_uses_each_real_allocator_contract():
-    from sglang.srt.mem_cache.allocator.base import allocator_reserves_token_slot
+    from sglang.srt.mem_cache.allocator.base import allocator_reserves_padding_slot
     from sglang.srt.mem_cache.allocator.hisparse import (
         DeepSeekV4HiSparseTokenToKVPoolAllocator,
         HiSparseTokenToKVPoolAllocator,
@@ -273,10 +280,11 @@ def test_disk_padding_slot_uses_each_real_allocator_contract():
         unified_mamba,
         unified_swa,
     ):
-        assert allocator_reserves_token_slot(allocator, 0)
+        assert allocator_reserves_padding_slot(allocator)
 
     token.free_pages = torch.tensor([0, 1])
-    assert not allocator_reserves_token_slot(token, 0)
+    assert not allocator_reserves_padding_slot(token)
+    assert multi.is_slot_allocated(0)
 
 
 def test_layer_multipliers_follow_the_default_device_context():
@@ -310,9 +318,27 @@ def test_checkpoint_ple_offload_embedding_maps_to_storage_with_warning():
     from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 
     for legacy, expected in ((True, "pinned"), (False, "gpu")):
-        with pytest.warns(FutureWarning, match="ple_offload_embedding"):
+        with pytest.warns(FutureWarning, match="--ple-storage"):
             config = Qwen4ExpTextConfig(ple_offload_embedding=legacy)
         assert config.ple_storage == expected
+
+
+@pytest.mark.parametrize(("legacy", "expected"), [(True, "pinned"), (False, "gpu")])
+def test_engine_legacy_ple_keyword_translates_from_json_dict(legacy, expected):
+    from sglang.srt.entrypoints.engine import _translate_legacy_ple_storage_kwargs
+
+    kwargs = json.loads(json.dumps({"ple_offload_embedding": legacy}))
+    with pytest.warns(FutureWarning, match="ple_storage"):
+        _translate_legacy_ple_storage_kwargs(kwargs)
+    assert kwargs == {"ple_storage": expected}
+
+
+def test_engine_legacy_ple_keyword_rejects_explicit_conflict():
+    from sglang.srt.entrypoints.engine import _translate_legacy_ple_storage_kwargs
+
+    kwargs = {"ple_offload_embedding": True, "ple_storage": "gpu"}
+    with pytest.raises(ValueError, match="ple_offload_embedding.*ple_storage"):
+        _translate_legacy_ple_storage_kwargs(kwargs)
 
 
 def test_checkpoint_config_uses_server_disk_defaults():
@@ -328,6 +354,7 @@ def test_checkpoint_config_uses_server_disk_defaults():
         == ServerArgs.ple_disk_prefill_buffer_tokens
     )
     assert config.ple_disk_prefill_read_pages == ServerArgs.ple_disk_prefill_read_pages
+    assert config.ple_disk_max_prefill_chunk_tokens == 0
 
 
 def _fp8_rows(count: int) -> torch.Tensor:
@@ -335,7 +362,7 @@ def _fp8_rows(count: int) -> torch.Tensor:
         count, disk.ROW_BYTES
     )
     raw[(raw & 0x7F) == 0x7F] = 0
-    return raw.view(torch.float8_e4m3fn)
+    return attach_checkpoint_source(raw.view(torch.float8_e4m3fn))
 
 
 class _FakeFunction:
@@ -352,23 +379,33 @@ class _FakeFetcherLibrary:
         image_bytes: bytes,
         *,
         create_errno=0,
-        failure_stage=0,
+        failure_stage=None,
         read_results=(),
         last_error=None,
-        abi_version=disk.PLE_FETCHER_ABI_VERSION,
+        abi_version=None,
     ):
         self.image_bytes = image_bytes
         self.create_errno = create_errno
-        self.failure_stage = failure_stage
+        self.failure_stage = (
+            _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_FAILURE_NONE"]
+            if failure_stage is None
+            else failure_stage
+        )
         self.read_results = iter(read_results)
         self.last_error = last_error
-        self.abi_version = abi_version
+        self.abi_version = (
+            _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_ABI_VERSION"]
+            if abi_version is None
+            else abi_version
+        )
         self.create_args = None
         self.read_buffer = None
         self.read_buffer_bytes = None
         self.ple_fetcher_create = _FakeFunction(self._create)
         self.ple_fetcher_abi_version = _FakeFunction(lambda: self.abi_version)
-        self.ple_fetcher_lock_budget_ms = _FakeFunction(lambda: 5500)
+        self.ple_fetcher_lock_budget_ms = _FakeFunction(
+            lambda: _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_LOCK_BUDGET_MS"]
+        )
         self.ple_fetcher_read = _FakeFunction(self._read)
         self.ple_fetcher_last_error = _FakeFunction(self._last_error)
         self.ple_fetcher_destroy = _FakeFunction(lambda handle: 0)
@@ -570,7 +607,7 @@ def test_helper_rejects_an_absent_build_marker(tmp_path, monkeypatch):
 
 
 def test_poisoned_fetcher_error_requires_restart(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(
         monkeypatch,
         image,
@@ -593,7 +630,7 @@ def test_poisoned_fetcher_error_requires_restart(tmp_path, monkeypatch):
 def test_poisoned_reader_retains_staging_when_native_drain_expires(
     tmp_path, monkeypatch, caplog
 ):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     library = _patch_fetcher_library(
         monkeypatch,
         image,
@@ -627,7 +664,7 @@ def test_poisoned_reader_retains_staging_when_native_drain_expires(
 
 
 def test_fetcher_error_reports_page_and_short_read_size(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(
         monkeypatch,
         image,
@@ -647,31 +684,17 @@ def test_fetcher_error_reports_page_and_short_read_size(tmp_path, monkeypatch):
 
 def test_native_short_read_keeps_later_reads_quiescent(tmp_path, monkeypatch):
     rows = _fp8_rows(50)
-    image = disk.build_test_image(tmp_path, rows)
+    image = build_test_image(tmp_path, rows)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
     )
     try:
         reader = disk.DirectPageReader(image, max_pages=2)
-    except RuntimeError as exc:
-        message = str(exc)
-        if (
-            "requires sglang-kernel" in message
-            or "qwen4_ple_disk_fetcher" in message
-            or "io_uring support" in message
-            or "required ABI version symbol" in message
-        ):
-            pytest.skip(str(exc))
-        raise
-    except OSError as exc:
-        if exc.errno in {
-            errno.EPERM,
-            errno.EACCES,
-            errno.ENOSYS,
-            errno.EOPNOTSUPP,
-        }:
-            pytest.skip(f"native PLE reader is unavailable: {exc}")
-        raise
+    except (OSError, RuntimeError) as exc:
+        reason = native_reader_unavailable_reason(exc)
+        if reason is None:
+            raise
+        pytest.skip(reason)
 
     try:
         os.truncate(image.path, image.path.stat().st_size - disk.PAGE_BYTES // 2)
@@ -690,13 +713,13 @@ def test_native_short_read_keeps_later_reads_quiescent(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("max_pages", [0, IORING_MAX_ENTRIES + 1])
 def test_direct_reader_rejects_invalid_io_uring_entry_count(tmp_path, max_pages):
-    image = disk.build_test_image(tmp_path, _fp8_rows(1))
+    image = build_test_image(tmp_path, _fp8_rows(1))
     with pytest.raises(ValueError, match="ple-disk-max-read-pages must be between"):
         disk.DirectPageReader(image, max_pages=max_pages)
 
 
 def test_resolved_page_limit_reaches_fetcher_registration(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(50))
+    image = build_test_image(tmp_path, _fp8_rows(50))
     library = _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -711,7 +734,7 @@ def test_resolved_page_limit_reaches_fetcher_registration(tmp_path, monkeypatch)
 
 
 def test_read_abi_passes_the_staging_buffer_length(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(50))
+    image = build_test_image(tmp_path, _fp8_rows(50))
     library = _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -725,7 +748,7 @@ def test_read_abi_passes_the_staging_buffer_length(tmp_path, monkeypatch):
 
 
 def test_locked_pages_returns_the_crc_checked_staging_view(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -753,7 +776,7 @@ def test_direct_reader_waits_for_a_concurrent_caller_with_a_budget(monkeypatch):
 
 
 def test_direct_reader_rejects_a_fetcher_abi_mismatch(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image, abi_version=0)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -795,8 +818,39 @@ def test_installed_fetcher_create_rejects_an_invalid_buffer():
     assert failure_stage.value == 0
 
 
+def test_installed_fetcher_abi_matches_python_constant():
+    installed = disk._installed_sgl_kernel_version()
+    if installed is None or Version(installed) < Version(
+        disk.MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK
+    ):
+        pytest.skip("the pinned sglang-kernel wheel is not installed")
+
+    library = disk._load_helper_library()
+
+    assert library.ple_fetcher_abi_version() == disk.PLE_FETCHER_ABI_VERSION
+
+
+def test_fake_fetcher_constants_come_from_the_native_header():
+    assert (
+        disk.PLE_FETCHER_ABI_VERSION
+        == _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_ABI_VERSION"]
+    )
+    assert (
+        disk.FETCHER_FAILURE_SETUP
+        == _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_FAILURE_SETUP"]
+    )
+    assert (
+        disk.FETCHER_FAILURE_REGISTER_BUFFER
+        == _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_FAILURE_REGISTER_BUFFER"]
+    )
+    assert (
+        disk.FETCHER_FAILURE_REGISTER_FILE
+        == _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_FAILURE_REGISTER_FILE"]
+    )
+
+
 def test_memlock_error_names_limit_bytes_and_flag(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(
         monkeypatch,
         image,
@@ -824,7 +878,7 @@ def test_memlock_error_names_limit_bytes_and_flag(tmp_path, monkeypatch):
 def test_blocked_io_uring_error_has_operator_actions(
     tmp_path, monkeypatch, blocked_errno
 ):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(
         monkeypatch,
         image,
@@ -844,7 +898,7 @@ def test_blocked_io_uring_error_has_operator_actions(
 
 
 def test_old_kernel_io_uring_error_names_the_minimum_version(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(
         monkeypatch,
         image,
@@ -862,7 +916,7 @@ def test_old_kernel_io_uring_error_names_the_minimum_version(tmp_path, monkeypat
 def test_registration_permission_error_is_not_reported_as_blocked_setup(
     tmp_path, monkeypatch
 ):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(
         monkeypatch,
         image,
@@ -877,11 +931,30 @@ def test_registration_permission_error_is_not_reported_as_blocked_setup(
     assert "io_uring is blocked" not in str(exc_info.value)
 
 
+def test_file_registration_permission_error_names_seccomp(tmp_path, monkeypatch):
+    image = build_test_image(tmp_path, _fp8_rows(25))
+    _patch_fetcher_library(
+        monkeypatch,
+        image,
+        create_errno=errno.EPERM,
+        failure_stage=disk.FETCHER_FAILURE_REGISTER_FILE,
+    )
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        disk.DirectPageReader(image, max_pages=2)
+
+    assert "file registration" in str(exc_info.value)
+    assert "seccomp" in str(exc_info.value)
+
+
 def test_manifest_records_ranges_and_rejects_missing_ranges(tmp_path):
     rows = _fp8_rows(100)
     builder = disk.PLEImageBuilder(tmp_path, "ranges", 0, 1, 0, 100)
-    builder.add_shard("shard_1", rows[50:], 50, 100)
-    builder.add_shard("shard_0", rows[:50], 0, 50)
+    builder.add_shard("shard_1", attach_checkpoint_source(rows[50:]), 50, 100)
+    builder.add_shard("shard_0", attach_checkpoint_source(rows[:50]), 0, 50)
     image, _, _ = builder.finalize(0.5)
     manifest_path = image.path.parent / "manifest.json"
     document = json.loads(manifest_path.read_text())
@@ -918,7 +991,7 @@ def test_manifest_install_is_read_back_and_compared(tmp_path, monkeypatch):
 
 def test_manifest_from_newer_install_rejects_older_image(tmp_path):
     rows = _fp8_rows(25)
-    image = disk.build_test_image(
+    image = build_test_image(
         tmp_path, rows, config_sha256="torn-install", weight_scale=0.5
     )
     manifest_path = image.path.parent / "manifest.json"
@@ -957,30 +1030,27 @@ def test_manifest_source_identity_controls_reuse(tmp_path, caplog):
     stat = source.stat()
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
     touched = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
-    with caplog.at_level("WARNING"):
-        touched.add_shard("shard", set_source_identity(rows), 0, 25)
+    touched._materialize_reuse_rows = lambda: pytest.fail(
+        "mtime-only changes must not materialize the image"
+    )
+    touched.add_shard("shard", set_source_identity(rows), 0, 25)
     touched_image, reused, _ = touched.finalize(0.5)
-    assert not reused
+    assert reused
     assert touched_image.path == first_image.path
-    assert "identity changed" in caplog.text
+    assert "identity changed" not in caplog.text
 
 
-def test_missing_checkpoint_source_identity_warns_once(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(disk, "_missing_checkpoint_source_identity_warned", False)
-    rows = _fp8_rows(25)
-    builders = [
-        disk.PLEImageBuilder(tmp_path, f"missing-source-{index}", 0, 1, 0, 25)
-        for index in range(2)
-    ]
+@pytest.mark.parametrize("source", [None, {}])
+def test_missing_checkpoint_source_identity_is_an_error(tmp_path, source):
+    rows = _fp8_rows(25).clone()
+    if source is not None:
+        rows._sglang_checkpoint_source = source
+    builder = disk.PLEImageBuilder(tmp_path, "missing-source", 0, 1, 0, 25)
     try:
-        with caplog.at_level("WARNING"):
-            for index, builder in enumerate(builders):
-                builder.add_shard(f"shard-{index}", rows, 0, 25)
+        with pytest.raises(ValueError, match="requires checkpoint source identity"):
+            builder.add_shard("shard", rows, 0, 25)
     finally:
-        for builder in builders:
-            builder.close()
-
-    assert caplog.text.count("has no checkpoint source identity") == 1
+        builder.close()
 
 
 @pytest.mark.parametrize("failure_call", [2, 3])
@@ -1035,11 +1105,16 @@ def test_builder_cleans_raw_and_packed_temporaries_after_enospc(tmp_path, monkey
 def test_builder_cleans_raw_temporary_after_later_shard_validation_error(tmp_path):
     rows = _fp8_rows(50)
     builder = disk.PLEImageBuilder(tmp_path, "invalid-shard", 0, 1, 0, 50)
-    builder.add_shard("first", rows[:25], 0, 25)
+    builder.add_shard("first", attach_checkpoint_source(rows[:25]), 0, 25)
     assert list(tmp_path.rglob("*.tmp"))
 
     with pytest.raises(TypeError, match="float8_e4m3fn"):
-        builder.add_shard("second", rows[25:].to(torch.bfloat16), 25, 50)
+        builder.add_shard(
+            "second",
+            attach_checkpoint_source(rows[25:].to(torch.bfloat16)),
+            25,
+            50,
+        )
     assert not list(tmp_path.rglob("*.tmp"))
 
 
@@ -1139,7 +1214,7 @@ def test_prefill_executor_initializes_the_current_cuda_device(tmp_path, monkeypa
         def shutdown(self, wait=True):
             pass
 
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1201,7 +1276,7 @@ def test_image_reuse_is_scoped_to_the_ple_module_prefix(tmp_path):
 
 def test_hot_cache_deduplicates_before_applying_capacity(tmp_path, monkeypatch):
     source_rows = _fp8_rows(25)
-    image = disk.build_test_image(tmp_path, source_rows)
+    image = build_test_image(tmp_path, source_rows)
     real_empty = torch.empty
 
     def cpu_empty(*shape, **kwargs):
@@ -1227,7 +1302,7 @@ def test_hot_cache_deduplicates_before_applying_capacity(tmp_path, monkeypatch):
 def test_hot_file_frequency_order_round_trips_through_rank_select_cache(tmp_path, seed):
     rng = np.random.default_rng(seed)
     source_rows = _fp8_rows(64)
-    image = disk.build_test_image(tmp_path, source_rows, tp_size=2)
+    image = build_test_image(tmp_path, source_rows, tp_size=2)
     rank_zero = rng.permutation(64).astype(np.uint32)
     rank_one = (64 + rng.permutation(64)).astype(np.uint32)
     path = tmp_path / "hot.bin"
@@ -1269,7 +1344,7 @@ def test_hot_frequency_template_selects_two_ple_layer_files(tmp_path):
     second_rows = rows.clone()
     second_rows.view(torch.uint8)[0, 0] = 1
     images = [
-        disk.build_test_image(tmp_path, layer_rows, module_prefix=f"ple.{layer}")
+        build_test_image(tmp_path, layer_rows, module_prefix=f"ple.{layer}")
         for layer, layer_rows in enumerate((rows, second_rows))
     ]
     assert images[0].header["fingerprint"] != images[1].header["fingerprint"]
@@ -1374,7 +1449,7 @@ def test_hot_file_rejects_a_missing_rank_entry_with_its_path(tmp_path):
 
 
 def test_direct_reader_uses_device_block_alignment(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1397,7 +1472,7 @@ def test_unknown_device_block_alignment_stops_before_direct_io(tmp_path, monkeyp
 
 
 def test_direct_reader_retries_native_destroy_after_busy(tmp_path, monkeypatch, caplog):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1422,7 +1497,7 @@ def test_direct_reader_retries_native_destroy_after_busy(tmp_path, monkeypatch, 
 
 
 def test_busy_reader_gc_retains_registered_staging(tmp_path, monkeypatch, caplog):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1459,7 +1534,7 @@ def test_disk_fetcher_calls_raise_after_close():
 def test_fetcher_constructor_closes_decode_reader_when_prefill_reader_fails(
     tmp_path, monkeypatch
 ):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     readers = []
 
     class FakeReader:
@@ -1490,7 +1565,7 @@ def test_fetcher_constructor_closes_decode_reader_when_prefill_reader_fails(
 def test_prefill_pipeline_failure_disables_lookahead_and_decode_continues(
     tmp_path, monkeypatch, caplog
 ):
-    image = disk.build_test_image(tmp_path, _fp8_rows(50))
+    image = build_test_image(tmp_path, _fp8_rows(50))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1580,7 +1655,7 @@ def test_fetcher_close_drains_queued_prefill_before_marking_closed(caplog):
 
 def test_prefill_dynamic_hits_do_not_enter_the_admission_queue(tmp_path, monkeypatch):
     rows = _fp8_rows(25)
-    image = disk.build_test_image(tmp_path, rows)
+    image = build_test_image(tmp_path, rows)
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1710,7 +1785,7 @@ def test_prefill_submission_uses_the_executor_selected_with_its_slot():
 
 
 def test_prefill_truncation_keeps_the_earliest_requested_rows(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1770,14 +1845,9 @@ def test_config_digest_rejects_non_json_values():
         disk.config_digest({"ngram_size": object()})
 
 
-def test_cache_budget_divisor_accounts_for_attention_dp_replication(monkeypatch):
-    monkeypatch.setattr(qwen4_exp_module, "get_attention_dp_size", lambda: 4)
-    assert (
-        qwen4_exp_module._ple_cache_budget_divisor(2, 3, use_attn_tp_group=True) == 24
-    )
-    assert (
-        qwen4_exp_module._ple_cache_budget_divisor(8, 3, use_attn_tp_group=False) == 24
-    )
+def test_cache_budget_divisor_accounts_for_classic_dp_replicas():
+    assert qwen4_exp_module._ple_cache_budget_divisor(2, 3, 4) == 24
+    assert qwen4_exp_module._ple_cache_budget_divisor(8, 3, 1) == 24
 
 
 def test_image_fingerprint_uses_only_explicit_identity_fields():
@@ -1823,7 +1893,7 @@ def test_image_fingerprint_uses_only_explicit_identity_fields():
 
 
 def test_prefill_priority_requires_its_own_reader(tmp_path, monkeypatch):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -1839,7 +1909,7 @@ def test_prefill_priority_requires_its_own_reader(tmp_path, monkeypatch):
 
 def test_fetch_clears_only_rows_outside_the_local_shard(tmp_path, monkeypatch):
     rows = _fp8_rows(25)
-    image = disk.build_test_image(tmp_path, rows)
+    image = build_test_image(tmp_path, rows)
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -2325,7 +2395,9 @@ def test_real_builder_weight_reload_replaces_the_reusable_image(tmp_path):
     changed[0, 0] = (changed[0, 0] + 1) % 0x7F
     changed = changed.view(torch.float8_e4m3fn)
     embedding.prepare_weight_reload()
-    embedding.add_checkpoint_shard("shard_0.weight", changed, 0, 25)
+    embedding.add_checkpoint_shard(
+        "shard_0.weight", attach_checkpoint_source(changed), 0, 25
+    )
     embedding.finalize_image()
 
     assert embedding._image.path != old_image.path
@@ -2522,7 +2594,7 @@ def test_model_resume_storage_reopens_every_disk_embedding():
 
 def test_manifest_rejects_noncontiguous_ranges(tmp_path):
     rows = _fp8_rows(100)
-    image = disk.build_test_image(
+    image = build_test_image(
         tmp_path, rows, config_sha256="manifest-gap", weight_scale=0.5
     )
     manifest_path = image.path.parent / "manifest.json"
@@ -2536,7 +2608,7 @@ def test_manifest_rejects_noncontiguous_ranges(tmp_path):
 
 
 def test_old_image_format_requests_rebuild(tmp_path):
-    image = disk.build_test_image(tmp_path, _fp8_rows(25), config_sha256="old")
+    image = build_test_image(tmp_path, _fp8_rows(25), config_sha256="old")
     with image.path.open("r+b") as handle:
         handle.write(b"PLEDISK2")
     with pytest.raises(ValueError, match=rf"{image.path.parent}.*rebuild"):
@@ -2545,7 +2617,7 @@ def test_old_image_format_requests_rebuild(tmp_path):
 
 def test_weight_scale_change_rebuilds_the_image(tmp_path, caplog):
     rows = _fp8_rows(25)
-    disk.build_test_image(tmp_path, rows, config_sha256="scale", weight_scale=0.25)
+    build_test_image(tmp_path, rows, config_sha256="scale", weight_scale=0.25)
     builder = disk.PLEImageBuilder(tmp_path, "scale", 0, 1, 0, 25)
     builder.add_shard("test.shard_0.weight", rows, 0, 25)
     with caplog.at_level("WARNING"):
@@ -2557,11 +2629,16 @@ def test_weight_scale_change_rebuilds_the_image(tmp_path, caplog):
 
 def test_sampled_payload_change_rebuilds_same_shape_image(tmp_path, caplog):
     rows = _fp8_rows(25)
-    disk.build_test_image(tmp_path, rows, config_sha256="payload", weight_scale=0.5)
+    build_test_image(tmp_path, rows, config_sha256="payload", weight_scale=0.5)
     changed = rows.view(torch.uint8).clone()
     changed[12, 7] ^= 1
     builder = disk.PLEImageBuilder(tmp_path, "payload", 0, 1, 0, 25)
-    builder.add_shard("test.shard_0.weight", changed.view(torch.float8_e4m3fn), 0, 25)
+    builder.add_shard(
+        "test.shard_0.weight",
+        attach_checkpoint_source(changed.view(torch.float8_e4m3fn)),
+        0,
+        25,
+    )
     with caplog.at_level("WARNING"):
         _, reused, _ = builder.finalize(0.5)
     assert not reused
@@ -2570,7 +2647,7 @@ def test_sampled_payload_change_rebuilds_same_shape_image(tmp_path, caplog):
 
 def test_unregistered_staging_reads_with_the_same_pointer(tmp_path, monkeypatch):
     raw = _fp8_rows(50).view(torch.uint8)
-    image = disk.build_test_image(tmp_path, raw.view(torch.float8_e4m3fn))
+    image = build_test_image(tmp_path, raw.view(torch.float8_e4m3fn))
     library = _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True
@@ -2593,7 +2670,7 @@ def test_unregistered_staging_reads_with_the_same_pointer(tmp_path, monkeypatch)
 
 def test_direct_reader_results_survive_the_next_read(tmp_path, monkeypatch):
     raw = _fp8_rows(50).view(torch.uint8)
-    image = disk.build_test_image(tmp_path, raw.view(torch.float8_e4m3fn))
+    image = build_test_image(tmp_path, raw.view(torch.float8_e4m3fn))
     _patch_fetcher_library(monkeypatch, image)
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: True

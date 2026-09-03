@@ -78,63 +78,6 @@ def count_rows(
     return int(tokens.size)
 
 
-def select_rows(
-    counts: list[np.memmap], metadata: PLEMetadata, capacity: int
-) -> tuple[np.ndarray, np.ndarray]:
-    nonzero_rows = sum(int(np.count_nonzero(array)) for array in counts)
-    capacity = min(capacity, nonzero_rows)
-    if capacity == 0:
-        return np.empty(0, dtype=np.uint32), np.empty(0, dtype=np.uint64)
-    nonzero_frequencies = [
-        np.asarray(array[np.flatnonzero(array)], dtype=np.uint64) for array in counts
-    ]
-    combined = np.concatenate(nonzero_frequencies)
-    threshold_index = combined.size - capacity
-    threshold = int(np.partition(combined, threshold_index)[threshold_index])
-    selected_above = sum(int(np.count_nonzero(array > threshold)) for array in counts)
-    tie_remaining = capacity - selected_above
-    ids = []
-    frequencies = []
-    for array, offset in zip(counts, metadata.offsets):
-        local_ids = np.flatnonzero(array > threshold)
-        if tie_remaining:
-            tied = np.flatnonzero(array == threshold)
-            take = min(tie_remaining, tied.size)
-            local_ids = np.concatenate((local_ids, tied[:take]))
-            tie_remaining -= take
-        ids.append((local_ids + int(offset)).astype(np.uint32))
-        frequencies.append(np.asarray(array[local_ids], dtype=np.uint64))
-    global_ids = np.concatenate(ids)
-    global_frequencies = np.concatenate(frequencies)
-    order = np.lexsort((global_ids, np.bitwise_not(global_frequencies)))
-    return global_ids[order], global_frequencies[order]
-
-
-def split_ranks(
-    ids: np.ndarray,
-    frequencies: np.ndarray,
-    total_rows: int,
-    tp_size: int,
-    divisor: int,
-) -> dict[int, np.ndarray]:
-    padded_rows = (total_rows + divisor - 1) // divisor * divisor
-    if padded_rows % tp_size:
-        raise ValueError(
-            f"padded PLE row count {padded_rows} is not divisible by TP={tp_size}"
-        )
-    rows_per_rank = padded_rows // tp_size
-    result = {}
-    for rank in range(tp_size):
-        start = rank * rows_per_rank
-        end = min(total_rows, start + rows_per_rank)
-        mask = (ids >= start) & (ids < end)
-        rank_ids = ids[mask]
-        rank_frequencies = frequencies[mask]
-        order = np.lexsort((rank_ids, np.bitwise_not(rank_frequencies)))
-        result[rank] = rank_ids[order]
-    return result
-
-
 def select_rows_by_rank(
     counts: list[np.memmap],
     metadata: PLEMetadata,

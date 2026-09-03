@@ -129,6 +129,8 @@ class BaseCudaGraphRunner(BaseRunner):
         capture(); the base only declares them.
     """
 
+    routes_model_replay_hook = False
+
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend

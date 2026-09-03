@@ -52,9 +52,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
-    def is_slot_allocated(self, slot: int) -> bool:
-        if not 0 <= slot <= self.size:
-            return False
+    def reserves_padding_slot(self) -> bool:
+        slot = 0
         return not bool(
             self.free_pages.eq(slot).any().item()
             or self.release_pages.eq(slot).any().item()

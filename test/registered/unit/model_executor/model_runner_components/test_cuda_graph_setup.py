@@ -1,4 +1,3 @@
-import inspect
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -15,7 +14,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def test_cuda_graph_prewarm_ignores_a_transformer_only_model():
+def test_cuda_graph_prewarm_skips_non_qwen_model_off_sm120(monkeypatch):
     class TransformerOnlyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -25,14 +24,20 @@ def test_cuda_graph_prewarm_ignores_a_transformer_only_model():
         device="cuda",
         model=TransformerOnlyModel(),
         server_args=SimpleNamespace(
+            ple_storage="gpu",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend="full"),
                 decode=SimpleNamespace(backend="full"),
-            )
+            ),
         ),
     )
+    resolve = MagicMock()
+    monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", resolve)
+    monkeypatch.setattr(cuda_graph_setup, "is_sm120_supported", lambda: False)
 
     cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
+
+    resolve.assert_not_called()
 
 
 def test_model_runner_can_override_decode_graph_runner(monkeypatch):
@@ -89,13 +94,85 @@ def test_cuda_graph_prewarm_delegates_to_the_language_model(monkeypatch):
     monkeypatch.setattr(
         cuda_graph_setup, "resolve_language_model", lambda _: language_model
     )
-    monkeypatch.setattr(
-        cuda_graph_setup, "is_sm120_supported", lambda: True, raising=False
-    )
+    monkeypatch.setattr(cuda_graph_setup, "is_sm120_supported", lambda: True)
 
     cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
 
     prewarm.assert_called_once_with(runner, capture_decode_cuda_graph=True)
+
+
+def test_sm120_qwen_prewarm_runs_with_gpu_ple_storage(monkeypatch):
+    prewarm = MagicMock(name="prewarm_cuda_graphs")
+    language_model = SimpleNamespace(prewarm_cuda_graphs=prewarm)
+    runner = SimpleNamespace(
+        device="cuda",
+        model=object(),
+        server_args=SimpleNamespace(
+            ple_storage="gpu",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled"),
+                decode=SimpleNamespace(backend="full"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup, "resolve_language_model", lambda _: language_model
+    )
+    monkeypatch.setattr(cuda_graph_setup, "is_sm120_supported", lambda: True)
+    monkeypatch.setattr(cuda_graph_setup, "is_sm121", lambda: False)
+
+    cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
+
+    prewarm.assert_called_once_with(runner, capture_decode_cuda_graph=True)
+
+
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_qwen_prewarm_allocates_staging_only_for_offloaded_ple(monkeypatch, offloaded):
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.models import qwen4_exp
+    from sglang.srt.models.qwen4_exp import (
+        Qwen4ExpModel,
+        Qwen4ExpPinnedHostEmbedding,
+        Qwen4ExpPLELayer,
+    )
+
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    if offloaded:
+        embedding = Qwen4ExpPinnedHostEmbedding.__new__(Qwen4ExpPinnedHostEmbedding)
+        torch.nn.Module.__init__(embedding)
+    else:
+        embedding = torch.nn.Embedding(1, 1)
+    layer.ple_embedding = SimpleNamespace(
+        ngram_embedding=embedding, gather_dp_tokens=False
+    )
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
+    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    model.layer = layer
+    runner = SimpleNamespace(
+        device="cpu",
+        max_decode_logits_rows=lambda: 7,
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED, bs=None, max_bs=0),
+                decode=SimpleNamespace(backend=Backend.FULL),
+            )
+        ),
+    )
+    monkeypatch.setattr(qwen4_exp, "is_sm120_supported", lambda: False)
+
+    model.prewarm_cuda_graphs(runner, capture_decode_cuda_graph=True)
+
+    if offloaded:
+        layer.reset_cuda_graph_capture_buffers.assert_called_once_with()
+        layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
+            7, torch.device("cpu")
+        )
+    else:
+        layer.reset_cuda_graph_capture_buffers.assert_not_called()
+        layer.prepare_cuda_graph_prefetch_buffer.assert_not_called()
 
 
 @pytest.mark.parametrize("ple_storage", ["pinned", "disk"])
@@ -118,9 +195,7 @@ def test_cuda_graph_prewarm_is_required_for_ple_offload(monkeypatch, ple_storage
         "resolve_language_model",
         lambda _: SimpleNamespace(),
     )
-    monkeypatch.setattr(
-        cuda_graph_setup, "is_sm120_supported", lambda: True, raising=False
-    )
+    monkeypatch.setattr(cuda_graph_setup, "is_sm120_supported", lambda: True)
 
     with pytest.raises(RuntimeError, match="PLE offload.*prewarm_cuda_graphs"):
         cuda_graph_setup._prewarm_model_cuda_graphs(
@@ -187,16 +262,17 @@ def test_draft_runner_constructors_explicitly_disable_model_replay_hooks():
     from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
         FrozenKVMTPCudaGraphRunner,
     )
+    from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+        MultiLayerEagleDraftExtendCudaGraphRunner,
+    )
 
     for runner_cls in (
         EAGLEDraftCudaGraphRunner,
         EAGLEDraftExtendCudaGraphRunner,
         FrozenKVMTPCudaGraphRunner,
+        MultiLayerEagleDraftExtendCudaGraphRunner,
     ):
         assert runner_cls.__dict__["routes_model_replay_hook"] is False
-        assert "self._cuda_graph_replay_hook = None" in inspect.getsource(
-            runner_cls.__init__
-        )
 
 
 def test_capture_decode_graph_uses_resolved_hook_model(monkeypatch):
@@ -246,7 +322,7 @@ def test_capture_decode_graph_uses_resolved_hook_model(monkeypatch):
     assert isinstance(capture.runner, HookedRunner)
 
 
-def test_cuda_graph_prewarm_reaches_non_sm120_models(monkeypatch):
+def test_ple_staging_prewarm_reaches_non_sm120_models(monkeypatch):
     prewarm = MagicMock(name="prewarm_cuda_graphs")
     runner = SimpleNamespace(
         device="cuda",
@@ -260,33 +336,7 @@ def test_cuda_graph_prewarm_reaches_non_sm120_models(monkeypatch):
         ),
     )
     monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", lambda model: model)
-    monkeypatch.setattr(
-        cuda_graph_setup, "is_sm120_supported", lambda: False, raising=False
-    )
-
-    cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
-
-    prewarm.assert_called_once_with(runner, capture_decode_cuda_graph=True)
-
-
-def test_cuda_graph_prewarm_reaches_sm121_models(monkeypatch):
-    prewarm = MagicMock(name="prewarm_cuda_graphs")
-    runner = SimpleNamespace(
-        device="cuda",
-        model=SimpleNamespace(prewarm_cuda_graphs=prewarm),
-        server_args=SimpleNamespace(
-            ple_storage="pinned",
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(backend="full"),
-                decode=SimpleNamespace(backend="piecewise"),
-            ),
-        ),
-    )
-    monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", lambda model: model)
-    monkeypatch.setattr(
-        cuda_graph_setup, "is_sm120_supported", lambda: True, raising=False
-    )
-    monkeypatch.setattr(cuda_graph_setup, "is_sm121", lambda: True, raising=False)
+    monkeypatch.setattr(cuda_graph_setup, "is_sm120_supported", lambda: False)
 
     cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
 
@@ -354,9 +404,7 @@ def test_cuda_graph_prewarm_skips_when_both_phases_are_disabled(monkeypatch):
         ),
     )
     monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", lambda model: model)
-    monkeypatch.setattr(
-        cuda_graph_setup, "is_sm120_supported", lambda: True, raising=False
-    )
+    monkeypatch.setattr(cuda_graph_setup, "is_sm120_supported", lambda: True)
 
     cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
 

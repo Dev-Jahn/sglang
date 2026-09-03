@@ -11,7 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Checkpoint-independent NumPy helpers for Qwen4 PLE hashing."""
+"""Checkpoint-independent NumPy helpers for Qwen4 PLE hashing.
+
+The NumPy hash supports the Qwen4 three-token layout used by the offline hit
+simulator.  The production embedding owns the general hash path.  The seeded
+token-stream test compares this restricted twin with that production method,
+including EOS history resets, while both paths share the multiplier builder.
+"""
 
 from __future__ import annotations
 

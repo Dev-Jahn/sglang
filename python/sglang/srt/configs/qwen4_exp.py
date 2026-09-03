@@ -16,6 +16,17 @@ PLE_DISK_DEFAULTS = {
     "ple_disk_prefill_read_pages": 128,
     "ple_disk_max_read_pages": None,
     "ple_disk_stats_log_interval": 0,
+    "ple_disk_max_prefill_chunk_tokens": 0,
+}
+
+_PLE_DISK_LAUNCH_FIELDS = tuple(
+    name for name in PLE_DISK_DEFAULTS if name != "ple_disk_max_prefill_chunk_tokens"
+)
+_QWEN4_EXP_MODEL_TYPES = {"qwen4_exp", "qwen4_exp_text"}
+_QWEN4_EXP_ARCHITECTURES = {
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForCausalLMMTP",
 }
 
 
@@ -23,12 +34,25 @@ def apply_ple_runtime_config(config, server_args, *, storage) -> None:
     """Copy resolved Qwen4 PLE launch settings into its text config."""
     text_config = getattr(config, "text_config", config)
     text_config.ple_storage = storage
-    for name in PLE_DISK_DEFAULTS:
+    for name in _PLE_DISK_LAUNCH_FIELDS:
         setattr(text_config, name, getattr(server_args, name))
     chunk_tokens = int(server_args.chunked_prefill_size or 0)
     text_config.ple_disk_max_prefill_chunk_tokens = (
         chunk_tokens if chunk_tokens > 0 else int(server_args.max_prefill_tokens)
     )
+
+
+def apply_sglang_runtime_config(config, server_args) -> bool:
+    """Apply runtime settings when the loaded config belongs to Qwen4-Exp."""
+    architectures = set(getattr(config, "architectures", None) or ())
+    model_type = getattr(config, "model_type", None)
+    if not (
+        architectures.intersection(_QWEN4_EXP_ARCHITECTURES)
+        or model_type in _QWEN4_EXP_MODEL_TYPES
+    ):
+        return False
+    apply_ple_runtime_config(config, server_args, storage=server_args.ple_storage)
+    return True
 
 
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
@@ -68,6 +92,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         ple_disk_prefill_read_pages=PLE_DISK_DEFAULTS["ple_disk_prefill_read_pages"],
         ple_disk_max_read_pages=PLE_DISK_DEFAULTS["ple_disk_max_read_pages"],
         ple_disk_stats_log_interval=PLE_DISK_DEFAULTS["ple_disk_stats_log_interval"],
+        ple_disk_max_prefill_chunk_tokens=PLE_DISK_DEFAULTS[
+            "ple_disk_max_prefill_chunk_tokens"
+        ],
         index_share_for_mtp_iteration=True,
         rope_parameters=None,
         layer_types=None,
@@ -78,7 +105,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         if ple_offload_embedding is not None:
             warnings.warn(
                 "text_config.ple_offload_embedding is deprecated; use "
-                "text_config.ple_storage instead",
+                "the --ple-storage flag instead",
                 FutureWarning,
                 stacklevel=2,
             )
@@ -125,6 +152,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ple_disk_prefill_read_pages = ple_disk_prefill_read_pages
         self.ple_disk_max_read_pages = ple_disk_max_read_pages
         self.ple_disk_stats_log_interval = ple_disk_stats_log_interval
+        self.ple_disk_max_prefill_chunk_tokens = ple_disk_max_prefill_chunk_tokens
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
         # MTP draft decode steps reuse the draft-extend indexer selection
@@ -169,11 +197,6 @@ class Qwen4ExpConfig(PretrainedConfig):
         "text_config": Qwen4ExpTextConfig,
     }
     keys_to_ignore_at_inference = ["past_key_values"]
-
-    def apply_sglang_runtime_config(self, server_args, *, is_draft_model=False):
-        if is_draft_model:
-            return
-        apply_ple_runtime_config(self, server_args, storage=server_args.ple_storage)
 
     def __init__(
         self,

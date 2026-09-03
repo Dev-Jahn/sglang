@@ -19,6 +19,7 @@ import contextlib
 import inspect
 import logging
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, Union, cast
 
@@ -86,7 +87,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.base import allocator_reserves_token_slot
+from sglang.srt.mem_cache.allocator.base import allocator_reserves_padding_slot
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
@@ -841,7 +842,7 @@ class ModelRunner:
                     "Storage-backed graph padding requires a token allocator "
                     "that reserves KV cache slot 0"
                 )
-            if not allocator_reserves_token_slot(self.token_to_kv_pool_allocator, 0):
+            if not allocator_reserves_padding_slot(self.token_to_kv_pool_allocator):
                 raise ValueError(
                     "Storage-backed graph padding requires KV cache slot 0 "
                     "to be reserved"
@@ -1460,7 +1461,6 @@ class ModelRunner:
             return
         hook = cast(ModelBatchHook, self.model)
         hook.prepare_model_batch(schedule_batch, forward_batch)
-        import weakref
 
         def forget(reference, *, key=batch_id, refs=prepared):
             if refs.get(key) is reference:
@@ -1469,8 +1469,7 @@ class ModelRunner:
         try:
             prepared[batch_id] = weakref.ref(forward_batch, forget)
         except TypeError:
-            # Lightweight test doubles may not support weak references.
-            prepared[batch_id] = lambda value=forward_batch: value
+            return
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

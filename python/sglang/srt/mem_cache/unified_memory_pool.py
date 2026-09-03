@@ -945,6 +945,10 @@ class UnifiedMambaSlotAllocator:
     def is_slot_allocated(self, slot) -> bool:
         return self._multi_ended_allocator.is_slot_allocated(int(slot))
 
+    def reserves_padding_slot(self) -> bool:
+        """Return the underlying allocator's construction-time reservation."""
+        return self._multi_ended_allocator.reserves_padding_slot()
+
     def allocator_state_str(self) -> str:
         return self._multi_ended_allocator.allocator_state_str()
 

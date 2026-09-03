@@ -61,6 +61,19 @@ def _require_cuda():
         pytest.skip("the PLE prefetch buffers are a CUDA path")
 
 
+def _offloaded_prewarm_layer():
+    embedding = Qwen4ExpPinnedHostEmbedding.__new__(Qwen4ExpPinnedHostEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(
+        ngram_embedding=embedding, gather_dp_tokens=False
+    )
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
+    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    return layer
+
+
 def test_graph_capture_does_not_bind_the_shared_eager_buffer():
     _require_cuda()
     stub = _Stub()
@@ -142,18 +155,13 @@ def test_capture_probe_uses_cuda_runtime_status_on_nvidia(monkeypatch):
     monkeypatch.setattr(
         "sglang.srt.models.qwen4_exp._is_stream_capturing",
         lambda current: current is stream,
-        raising=False,
     )
 
     assert _Stub._is_capturing()
 
 
 def test_model_prewarm_allocates_on_non_sm120(monkeypatch):
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
-    layer.reset_cuda_graph_capture_buffers = MagicMock()
-    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    layer = _offloaded_prewarm_layer()
     model = torch.nn.Module()
     model.add_module("ple", layer)
     model._prewarm_cuda_graph_jit_kernels = MagicMock()
@@ -181,11 +189,7 @@ def test_model_prewarm_allocates_on_non_sm120(monkeypatch):
 
 
 def test_model_prewarm_allocates_on_sm121(monkeypatch):
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
-    layer.reset_cuda_graph_capture_buffers = MagicMock()
-    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    layer = _offloaded_prewarm_layer()
     model = torch.nn.Module()
     model.add_module("ple", layer)
     model._prewarm_cuda_graph_jit_kernels = MagicMock()
@@ -203,9 +207,7 @@ def test_model_prewarm_allocates_on_sm121(monkeypatch):
         max_decode_logits_rows=lambda: 32,
     )
     monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: True)
-    monkeypatch.setattr(
-        "sglang.srt.models.qwen4_exp.is_sm121", lambda: True, raising=False
-    )
+    monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm121", lambda: True)
 
     Qwen4ExpModel.prewarm_cuda_graphs(model, runner, capture_decode_cuda_graph=True)
 
@@ -216,11 +218,7 @@ def test_model_prewarm_allocates_on_sm121(monkeypatch):
 
 
 def test_model_prewarm_allocates_the_largest_sm120_capture_shape(monkeypatch):
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
-    layer.reset_cuda_graph_capture_buffers = MagicMock()
-    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    layer = _offloaded_prewarm_layer()
     model = torch.nn.Module()
     model.add_module("ple", layer)
     model._prewarm_cuda_graph_jit_kernels = MagicMock()
@@ -247,11 +245,7 @@ def test_model_prewarm_allocates_the_largest_sm120_capture_shape(monkeypatch):
 
 
 def test_model_prewarm_uses_the_runner_decode_capture_extent(monkeypatch):
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    torch.nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(gather_dp_tokens=False)
-    layer.reset_cuda_graph_capture_buffers = MagicMock()
-    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    layer = _offloaded_prewarm_layer()
     model = torch.nn.Module()
     model.add_module("ple", layer)
     model._prewarm_cuda_graph_jit_kernels = MagicMock()

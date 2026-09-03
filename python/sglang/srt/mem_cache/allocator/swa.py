@@ -101,8 +101,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
-    def is_slot_allocated(self, slot: int) -> bool:
-        return self.full_attn_allocator.is_slot_allocated(slot)
+    def reserves_padding_slot(self) -> bool:
+        return self.full_attn_allocator.reserves_padding_slot()
 
     def available_size(self):
         return min(

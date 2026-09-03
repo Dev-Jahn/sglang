@@ -363,6 +363,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         ):
             self.assertEqual(self._construct(*qwen4).ple_storage, "gpu")
 
+    def test_qwen4_checkpoint_ple_storage_is_the_unflagged_default(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        with patch.object(overrides_module, "is_cuda", return_value=True), patch(
+            "sglang.srt.server_args.is_cuda", return_value=True
+        ):
+            args = self._construct(
+                *qwen4,
+                config_extra={"ple_storage": "gpu"},
+            )
+
+        self.assertEqual(args.ple_storage, "gpu")
+        self.assertEqual(args.get_model_config().hf_text_config.ple_storage, "gpu")
+
     def test_qwen4_disk_storage_rejects_bf16_ple_before_model_load(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         image_dir = tempfile.mkdtemp(prefix="qwen4_disk_images_")

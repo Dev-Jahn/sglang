@@ -4,7 +4,6 @@ CI registration for this suite waits for a GPU runner that permits io_uring.
 Run this file directly on a compatible host.
 """
 
-import errno
 import os
 import threading
 from collections import deque
@@ -17,6 +16,7 @@ import torch
 from torch import nn
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.configs.qwen4_exp import PLE_DISK_DEFAULTS
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -26,8 +26,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpDiskEmbedding,
+    Qwen4ExpModel,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
+    Qwen4ExpPLELayer,
 )
 from sglang.srt.models.qwen4_ple_disk import (
     PAGE_BYTES,
@@ -35,9 +37,13 @@ from sglang.srt.models.qwen4_ple_disk import (
     DirectPageReader,
     DiskRowFetcher,
     PLEImageBuilder,
-    build_test_image,
     open_ple_image,
     write_hot_frequency_file,
+)
+from sglang.test.ple_disk_utils import (
+    attach_checkpoint_source,
+    build_test_image,
+    native_reader_unavailable_reason,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -55,33 +61,13 @@ def require_ple_direct_io(tmp_path_factory):
     try:
         reader = DirectPageReader(image, max_pages=1)
         reader.read(np.array([0], dtype=np.int64))
-    except OSError as exc:
-        if exc.errno in {
-            errno.EPERM,
-            errno.EACCES,
-            errno.ENOSYS,
-            errno.EOPNOTSUPP,
-        }:
-            reason = f"PLE io_uring or O_DIRECT is unavailable: {exc}"
-            # Self-hosted runner operators may enable this after confirming the
-            # runner permits io_uring and its scratch filesystem supports O_DIRECT.
-            if hard_fail:
-                pytest.fail(reason)
-            pytest.skip(reason)
-        raise
-    except RuntimeError as exc:
-        message = str(exc)
-        if (
-            "requires sglang-kernel" in message
-            or "qwen4_ple_disk_fetcher" in message
-            or "io_uring support" in message
-            or "Could not determine the logical block size" in message
-        ):
-            reason = f"PLE disk helper or direct-I/O storage is unavailable: {exc}"
-            if hard_fail:
-                pytest.fail(reason)
-            pytest.skip(reason)
-        raise
+    except (OSError, RuntimeError) as exc:
+        reason = native_reader_unavailable_reason(exc)
+        if reason is None:
+            raise
+        if hard_fail:
+            pytest.fail(reason)
+        pytest.skip(reason)
     finally:
         if reader is not None:
             reader.close()
@@ -94,7 +80,7 @@ def _fp8_rows(count: int) -> tuple[torch.Tensor, torch.Tensor]:
     )
     # Avoid NaN FP8 encodings so BF16 equality has ordinary value semantics.
     raw[(raw & 0x7F) == 0x7F] = 0
-    return raw, raw.view(torch.float8_e4m3fn)
+    return raw, attach_checkpoint_source(raw.view(torch.float8_e4m3fn))
 
 
 def _context_ids(contexts: np.ndarray, eos: int, rows_per_head: int) -> np.ndarray:
@@ -156,6 +142,16 @@ def _source_embedding(rows: int):
         num_added_embeddings_per_partition=0,
         weight_scale=torch.tensor([0.25], dtype=torch.bfloat16, device="cuda"),
     )
+
+
+def _disk_config(root, rows: int, **overrides):
+    values = dict(PLE_DISK_DEFAULTS)
+    values.update(
+        ple_disk_dir=str(root),
+        to_dict=lambda: {"model_type": "synthetic-qwen4", "rows": rows},
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 @pytest.mark.parametrize("padded_tokens", [4, 8])
@@ -262,18 +258,17 @@ def test_disk_image_matches_exact_fp8_gather_across_hot_and_cold_rows(tmp_path):
 def test_disk_embedding_async_d2h_fetch_h2d(tmp_path, monkeypatch):
     raw, rows = _fp8_rows(256)
     root = tmp_path
-    config = SimpleNamespace(
-        ple_disk_dir=str(root),
+    config = _disk_config(
+        root,
+        256,
         ple_disk_hot_cache_gb=0.0,
-        ple_disk_hot_frequency_file=None,
         ple_disk_prefill_buffer_tokens=4,
         ple_disk_prefill_read_pages=2,
-        to_dict=lambda: {"model_type": "synthetic-qwen4", "rows": 256},
     )
     monkeypatch.setattr(
         qwen4_exp_module,
         "get_parallel",
-        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0),
+        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0, dp_size=1),
     )
     embedding = Qwen4ExpDiskEmbedding(_source_embedding(256), config, 256)
     embedding.add_checkpoint_shard("synthetic.shard_0.weight", rows, 0, 256)
@@ -330,17 +325,15 @@ def test_disk_embedding_async_d2h_fetch_h2d(tmp_path, monkeypatch):
 def test_disk_graph_step_uses_static_output_and_generation_tags(tmp_path, monkeypatch):
     raw, rows = _fp8_rows(512)
     root = tmp_path
-    config = SimpleNamespace(
-        ple_disk_dir=str(root),
+    config = _disk_config(
+        root,
+        512,
         ple_disk_hot_cache_gb=0.0,
-        ple_disk_hot_frequency_file=None,
-        ple_disk_stats_log_interval=0,
-        to_dict=lambda: {"model_type": "synthetic-qwen4", "rows": 512},
     )
     monkeypatch.setattr(
         qwen4_exp_module,
         "get_parallel",
-        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0),
+        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0, dp_size=1),
     )
     embedding = Qwen4ExpDiskEmbedding(_source_embedding(512), config, 512)
     embedding.add_checkpoint_shard("synthetic.shard_0.weight", rows, 0, 512)
@@ -420,17 +413,15 @@ def test_disk_graph_synthetic_token_loop_matches_pinned(tmp_path, monkeypatch):
     total_rows = 16 * rows_per_head
     _, rows = _fp8_rows(total_rows)
     root = tmp_path
-    config = SimpleNamespace(
-        ple_disk_dir=str(root),
+    config = _disk_config(
+        root,
+        total_rows,
         ple_disk_hot_cache_gb=0.01,
-        ple_disk_hot_frequency_file=None,
-        ple_disk_stats_log_interval=0,
-        to_dict=lambda: {"model_type": "synthetic-qwen4", "rows": total_rows},
     )
     monkeypatch.setattr(
         qwen4_exp_module,
         "get_parallel",
-        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0),
+        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0, dp_size=1),
     )
     monkeypatch.setattr(
         qwen4_exp_module,
@@ -490,16 +481,11 @@ def test_real_ngram_hash_with_eos_matches_pinned_gather(tmp_path, monkeypatch):
     total_rows = 16 * rows_per_head
     _, rows = _fp8_rows(total_rows)
     root = tmp_path
-    config = SimpleNamespace(
-        ple_disk_dir=str(root),
-        ple_disk_hot_cache_gb=0.0,
-        ple_disk_hot_frequency_file=None,
-        to_dict=lambda: {"model_type": "synthetic-qwen4", "rows": total_rows},
-    )
+    config = _disk_config(root, total_rows, ple_disk_hot_cache_gb=0.0)
     monkeypatch.setattr(
         qwen4_exp_module,
         "get_parallel",
-        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0),
+        lambda: SimpleNamespace(tp_rank=0, attn_tp_rank=0, dp_size=1),
     )
     monkeypatch.setattr(
         qwen4_exp_module,
@@ -607,14 +593,13 @@ def test_disk_fetch_reuses_caller_owned_output(tmp_path):
     output = torch.full((*ids.shape, ROW_BYTES), 0xFF, dtype=torch.uint8).pin_memory()
     try:
         actual = fetcher.fetch(ids, out=output)
-        result_pointer = fetcher.reader.result.ctypes.data
         assert actual is output
+        assert not hasattr(fetcher.reader, "result")
         assert torch.equal(actual[0, 0], raw[1])
         assert torch.equal(actual[0, 1], raw[2])
         assert torch.equal(actual[1, 0], torch.zeros(ROW_BYTES, dtype=torch.uint8))
         assert torch.equal(actual[1, 1], raw[5])
-        fetcher.fetch(ids, out=output)
-        assert fetcher.reader.result.ctypes.data == result_pointer
+        assert fetcher.fetch(ids, out=output) is output
     finally:
         fetcher.close()
 
@@ -643,6 +628,12 @@ def test_dynamic_wtinylfu_admission_eviction_and_exactness(tmp_path):
             assert torch.equal(fetcher.fetch(np.array([row_id]))[0], raw[row_id])
             fetcher.dynamic.flush()
 
+        cached = set(int(row_id) for row_id in fetcher.dynamic.tags[0] if row_id >= 0)
+        assert protected in cached
+        assert same_set[-1] in cached
+        assert same_set[1] not in cached
+        assert len(cached) == fetcher.dynamic._WAYS
+
         actual = fetcher.fetch(np.array([protected]))
         assert torch.equal(actual[0], raw[protected])
         assert fetcher.last_fetch_stats.dynamic_hits == 1
@@ -650,6 +641,42 @@ def test_dynamic_wtinylfu_admission_eviction_and_exactness(tmp_path):
         assert fetcher.dynamic.rows.shape[0] == 16
     finally:
         fetcher.close()
+
+
+def test_future_contexts_preserve_request_and_token_order():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    nn.Module.__init__(embedding)
+    embedding._prefill_buffer_tokens = 4
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+    layer._future_lookup_contexts = None
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 2
+    model._ple_layers = lambda: iter([layer])
+    requests = [
+        SimpleNamespace(
+            origin_input_ids=[10, 11, 12, 13, 14],
+            extend_range=SimpleNamespace(end=2),
+        ),
+        SimpleNamespace(
+            origin_input_ids=[20, 21, 22, 23],
+            extend_range=SimpleNamespace(end=1),
+        ),
+    ]
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.arange(3, device="cuda"),
+    )
+
+    model.prepare_model_batch(SimpleNamespace(reqs=requests), forward_batch)
+
+    torch.testing.assert_close(
+        layer._future_lookup_contexts.cpu(),
+        torch.tensor([[10, 11, 12], [11, 12, 13], [12, 13, 14], [2, 20, 21]]),
+    )
 
 
 def test_prefill_pipeline_orders_rows_and_stays_double_buffered(tmp_path):

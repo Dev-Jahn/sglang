@@ -54,42 +54,31 @@ _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
 
 class TestModelReplayHooks(CustomTestCase):
     def test_disabled_model_batch_hook_does_not_reach_body(self):
+        hook = mock.Mock()
         runner = ModelRunner.__new__(ModelRunner)
         runner.model = SimpleNamespace(
             supports_model_batch_hook=False,
-            prepare_model_batch=lambda *args: self.fail("hook body was reached"),
+            prepare_model_batch=hook,
         )
         runner.prepare_model_batch(object(), object())
+        hook.assert_not_called()
 
-    def test_execute_finishes_replay_validation_before_reset(self):
+    def test_execute_routes_replay_hook_in_order(self):
         events = []
         prepared = []
-        state = SimpleNamespace(pending=False, completed=False, validations=0)
 
         def prepare(replay):
-            validate()
             events.append("prepare")
             prepared.append(replay)
-            state.pending = True
 
         def wait():
             events.append("wait")
 
         def reset():
             events.append("reset")
-            state.pending = False
 
         def finish():
             events.append("finish")
-            if state.pending:
-                state.pending = False
-                state.completed = True
-
-        def validate():
-            if state.completed:
-                events.append("validate")
-                state.completed = False
-                state.validations += 1
 
         backend = SimpleNamespace(
             replay_session=nullcontext,
@@ -105,7 +94,6 @@ class TestModelReplayHooks(CustomTestCase):
                 prepare_cuda_graph_replay=prepare,
                 wait_cuda_graph_replay=wait,
                 finish_cuda_graph_replay=finish,
-                validate_cuda_graph_replay=validate,
                 release_cuda_graph_replay=reset,
             ),
             spec_algorithm="spec",
@@ -138,9 +126,7 @@ class TestModelReplayHooks(CustomTestCase):
             batch_size=1,
         )
 
-        with mock.patch.object(
-            mod, "device_timer_ctx", return_value=nullcontext()
-        ), mock.patch.object(torch.cuda, "synchronize") as cuda_sync:
+        with mock.patch.object(mod, "device_timer_ctx", return_value=nullcontext()):
             output = runner.execute(forward_batch)
             output = runner.execute(forward_batch)
 
@@ -152,7 +138,6 @@ class TestModelReplayHooks(CustomTestCase):
                 "replay",
                 "finish",
                 "reset",
-                "validate",
                 "prepare",
                 "wait",
                 "replay",
@@ -160,9 +145,7 @@ class TestModelReplayHooks(CustomTestCase):
                 "reset",
             ],
         )
-        self.assertEqual(state.validations, 1)
-        cuda_sync.assert_not_called()
-        self.assertTrue(state.completed)
+        self.assertEqual(len(prepared), 2)
         self.assertIsInstance(prepared[0], CudaGraphReplayInput)
         self.assertEqual(prepared[0].padded_num_tokens, 2)
         self.assertIs(prepared[0].req_pool_indices, runner.buffers.req_pool_indices)

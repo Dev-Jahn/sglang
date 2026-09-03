@@ -109,6 +109,7 @@ def test_disk_storage_accepts_a_creatable_directory(tmp_path):
     target = tmp_path / "new" / "images"
     args = _server_args(ple_storage="disk", ple_disk_dir=str(target))
     args._handle_offload_compatibility()
+    assert args.ple_disk_dir == str(target)
 
 
 def test_disk_storage_rejects_an_unreadable_hot_file(tmp_path):
@@ -129,6 +130,7 @@ def test_disk_storage_accepts_a_readable_hot_file_template(tmp_path):
         ple_disk_hot_frequency_file=str(tmp_path / "hot-{layer}.bin"),
     )
     args._handle_offload_compatibility()
+    assert args.ple_disk_hot_frequency_file.endswith("hot-{layer}.bin")
 
 
 def test_disk_storage_accepts_literal_braces_in_a_hot_file_path(tmp_path):
@@ -142,6 +144,7 @@ def test_disk_storage_accepts_literal_braces_in_a_hot_file_path(tmp_path):
         ple_disk_hot_frequency_file=str(hot_file),
     )
     args._handle_offload_compatibility()
+    assert args.ple_disk_hot_frequency_file == str(hot_file)
 
 
 def test_max_read_pages_rejects_io_uring_entry_overflow():
@@ -270,6 +273,30 @@ def test_deprecated_no_ple_offload_embedding_alias_maps_to_gpu(caplog):
     assert namespace.ple_storage == "gpu"
     assert "--no-ple-offload-embedding" in caplog.text
     assert "--ple-storage gpu" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--ple-offload-embedding", "--ple-storage", "gpu"],
+        ["--ple-storage", "gpu", "--ple-offload-embedding"],
+        ["--no-ple-offload-embedding", "--ple-storage", "pinned"],
+        ["--ple-storage", "pinned", "--no-ple-offload-embedding"],
+    ],
+)
+def test_deprecated_ple_alias_conflict_names_both_flags(arguments, capsys):
+    parser = server_args_module.argparse.ArgumentParser()
+    server_args_module.ServerArgs.add_cli_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model-path", "dummy", *arguments])
+
+    message = capsys.readouterr().err
+    assert "--ple-storage" in message
+    assert any(
+        option in message
+        for option in ("--ple-offload-embedding", "--no-ple-offload-embedding")
+    )
 
 
 if __name__ == "__main__":

@@ -91,11 +91,28 @@ class DeprecatedStoreConstAction(argparse.Action):
         super().__init__(option_strings, dest, nargs=nargs, default=default, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
+        explicit_option = getattr(namespace, f"_{self.dest}_explicit_option", None)
+        current = getattr(namespace, self.dest, None)
+        if explicit_option is not None and current != self.const_value:
+            parser.error(f"{option_string} conflicts with {explicit_option}")
         replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
         print_deprecated_warning(
             f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
         )
         setattr(namespace, self.dest, self.const_value)
+        setattr(namespace, f"_{self.dest}_deprecated_option", option_string)
+
+
+class StoreWithDeprecatedAliasCheckAction(argparse.Action):
+    """Store a value and reject a conflicting deprecated alias."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        deprecated_option = getattr(namespace, f"_{self.dest}_deprecated_option", None)
+        current = getattr(namespace, self.dest, None)
+        if deprecated_option is not None and current != values:
+            parser.error(f"{option_string} conflicts with {deprecated_option}")
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit_option", option_string)
 
 
 class DeprecatedAliasStoreAction(argparse.Action):

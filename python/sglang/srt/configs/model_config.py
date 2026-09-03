@@ -610,11 +610,10 @@ class ModelConfig:
             speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
-        runtime_config_hook = getattr(
-            model_config.hf_config, "apply_sglang_runtime_config", None
-        )
-        if runtime_config_hook is not None:
-            runtime_config_hook(server_args, is_draft_model=is_draft_model)
+        if getattr(server_args, "_declarations_materialized", False):
+            from sglang.srt.configs.qwen4_exp import apply_sglang_runtime_config
+
+            apply_sglang_runtime_config(model_config.hf_config, server_args)
         return model_config
 
     def _config_draft_model(self):

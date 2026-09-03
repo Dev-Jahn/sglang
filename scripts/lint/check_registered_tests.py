@@ -40,28 +40,21 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # form. Anything else needs stage=/runner_config=, or its effective_suite matches
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
+_ALTERNATE_TEST_RUNNERS = {
+    "multigpu_bench_main",
+    "multigpu_pytest_main",
+    "multiprocess_main",
+}
+_DIRECT_MAIN_RUNNER_FILES = {
+    "test/registered/kernels/ops/communication/test_amd_deterministic_custom_allreduce.py",
+    "test/registered/kernels/ops/communication/test_amd_nccl_allreduce_determinism.py",
+}
 
 
-def _defines_testcase(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            if any("TestCase" in ast.unparse(base) for base in node.bases):
-                return True
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "type"
-            and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Tuple)
-            and any("TestCase" in ast.unparse(base) for base in node.args[1].elts)
-        ):
-            return True
-    return False
-
-
-def _main_runs_test_framework(tree: ast.Module) -> tuple[bool, bool]:
+def _main_entrypoint_status(tree: ast.Module, filename: str) -> tuple[bool, bool, bool]:
     has_main = False
-    runs_tests = False
+    runs_framework = False
+    runs_alternate = False
     for node in tree.body:
         if not isinstance(node, ast.If):
             continue
@@ -88,8 +81,17 @@ def _main_runs_test_framework(tree: ast.Module) -> tuple[bool, bool]:
                 and isinstance(child.func.value, ast.Name)
                 and child.func.value.id in ("pytest", "unittest")
             ):
-                runs_tests = True
-    return has_main, runs_tests
+                runs_framework = True
+        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if not isinstance(child, ast.Call):
+                continue
+            if isinstance(child.func, ast.Name) and (
+                child.func.id in _ALTERNATE_TEST_RUNNERS
+                or child.func.id.startswith("test_")
+                or (child.func.id == "main" and filename in _DIRECT_MAIN_RUNNER_FILES)
+            ):
+                runs_alternate = True
+    return has_main, runs_framework, runs_alternate
 
 
 def main() -> int:
@@ -119,15 +121,19 @@ def main() -> int:
         try:
             registries, _ = ci_register.ut_parse_one_file(f)
             tree = ast.parse(Path(f).read_text(encoding="utf-8"), filename=f)
-            has_main_block, runs_tests = _main_runs_test_framework(tree)
+            has_main_block, runs_framework, runs_alternate = _main_entrypoint_status(
+                tree, f
+            )
         except Exception:
             # Skip files that can't be parsed (syntax errors, etc.)
             continue
         if len(registries) == 0:
             missing.append(f)
             continue
+        is_registered_benchmark = "/benchmark/" in f
         if any(r.disabled is None for r in registries) and (
-            not has_main_block or (_defines_testcase(tree) and not runs_tests)
+            not has_main_block
+            or not (runs_framework or runs_alternate or is_registered_benchmark)
         ):
             dead_tests.append(f)
         for r in registries:
@@ -190,8 +196,9 @@ def main() -> int:
             "ERROR: Enabled registered test file(s) have no test entry point: "
             "the registered file is executed as `python3 file.py`, but its "
             '`if __name__ == "__main__"` block is missing or does not call '
-            "unittest.main() or pytest.main(), so the tests are skipped while the "
-            "file reports success. Make __main__ run the tests (put any CLI "
+            "unittest.main() or pytest.main(), and does not use a registered "
+            "benchmark or multi-process test runner. The tests are skipped while "
+            "the file reports success. Make __main__ run the tests (put any CLI "
             "entry point behind an explicit flag):\n"
         )
         for f in dead_tests:

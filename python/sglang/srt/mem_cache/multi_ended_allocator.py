@@ -327,6 +327,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return False
         return int(self.virtual_to_physical[virt_page].item()) != -1
 
+    def reserves_padding_slot(self) -> bool:
+        """Return whether the initial mapping reserves virtual slot zero."""
+        return self.is_slot_allocated(0)
+
     def allocator_state_str(self) -> str:
         return (
             f"sub_pool={self.sub_pool_name!r}, grow_direction={self.grow_direction}, "
@@ -1974,6 +1978,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
 
+    def reserves_padding_slot(self) -> bool:
+        """Delegate the padding reservation contract to the virtual-id owner."""
+        return self.full_attn_allocator.reserves_padding_slot()
+
     def allocator_state_str(self) -> str:
         return self.full_attn_allocator.allocator_state_str()
 
@@ -2440,6 +2448,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the full side (which owns the virtual ids)."""
         return self.full_attn_allocator.is_slot_allocated(slot)
+
+    def reserves_padding_slot(self) -> bool:
+        """Delegate the padding reservation contract to the virtual-id owner."""
+        return self.full_attn_allocator.reserves_padding_slot()
 
     def allocator_state_str(self) -> str:
         return self.full_attn_allocator.allocator_state_str()

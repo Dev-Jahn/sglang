@@ -139,12 +139,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     exist) attaches them and runs capture.
     """
 
+    routes_model_replay_hook = False
+
     def __init__(self, eagle_worker: MultiLayerEagleDraftWorker, step: int):
         # Parse args
         self.step = step
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.mtp_model_runner(self.step)
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        self._cuda_graph_replay_hook = None
 
         # Fields the parent's capture() reads:
         self.device = model_runner.device

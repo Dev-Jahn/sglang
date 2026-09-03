@@ -79,7 +79,7 @@ def test_close_failure_reaches_collectives_before_raising(monkeypatch):
             ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
         )
 
-    assert events == ["close", "all_reduce", "barrier"]
+    assert events == ["barrier", "close", "all_reduce", "barrier"]
 
 
 def test_resume_failure_reaches_collectives_before_raising(monkeypatch):
@@ -197,12 +197,50 @@ def test_close_failure_preserves_state_for_a_later_resume(monkeypatch):
         )
 
     assert manager.stashed_model_static_state == {"saved": True}
-    assert events == ["export", "close", "barrier"]
+    assert events == ["export", "barrier", "close", "barrier"]
     manager.resume_memory_occupation(
         ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
     )
     assert ("import", {"saved": True}) in events
     assert "resume_storage" in events
+
+
+def test_release_without_storage_hook_still_reaches_tp_barrier(monkeypatch):
+    events = []
+    model = torch.nn.Linear(1, 1)
+    manager = SchedulerWeightUpdaterManager(
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=model,
+                server_args=SimpleNamespace(weight_cache_mode="off"),
+            )
+        ),
+        draft_worker=None,
+        tp_cpu_group=object(),
+        memory_saver_adapter=SimpleNamespace(
+            pause=lambda tag: events.append(("pause", tag))
+        ),
+        flush_cache=lambda **kwargs: True,
+        is_fully_idle=lambda: True,
+    )
+    monkeypatch.setattr(weight_updater, "_export_static_state", lambda _: {})
+    monkeypatch.setattr(
+        weight_updater.torch.distributed,
+        "barrier",
+        lambda *, group: events.append(("barrier", group)),
+    )
+    monkeypatch.setattr(
+        weight_updater.torch,
+        "get_device_module",
+        lambda: SimpleNamespace(synchronize=lambda: events.append("synchronize")),
+    )
+
+    manager.release_memory_occupation(
+        ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    )
+
+    assert events[0][0] == "barrier"
+    assert events[1] == ("pause", GPU_MEMORY_TYPE_WEIGHTS)
 
 
 if __name__ == "__main__":

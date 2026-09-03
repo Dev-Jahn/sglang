@@ -73,6 +73,18 @@ logger = logging.getLogger(__name__)
 CLIENT_CONNECTION_TIMEOUT = 30.0
 
 
+def _model_config_for_loading(server_args):
+    from sglang.srt.configs.model_config import ModelConfig
+
+    model_config = ModelConfig.from_server_args(server_args)
+    if server_args.ple_storage not in (None, "gpu"):
+        raise ValueError(
+            "The weight-cache daemon requires --ple-storage gpu for "
+            "Qwen4-Exp because CUDA IPC exports device-resident weights"
+        )
+    return model_config
+
+
 class WeightCacheDaemon:
     """Persistent GPU weight cache for a single TP rank.
 
@@ -207,7 +219,6 @@ class WeightCacheDaemon:
 
         # Lazy imports to avoid circular dependencies and speed up startup
         from sglang.srt.configs.device_config import DeviceConfig
-        from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
         from sglang.srt.server_args import ServerArgs
 
@@ -222,19 +233,14 @@ class WeightCacheDaemon:
             ep_size=self.ep_size,
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
+            revision=self.revision,
         )
         publish(server_args, role="weight_cache_daemon")
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
-        model_config = ModelConfig(
-            model_path=self.model_path,
-            trust_remote_code=self.trust_remote_code,
-            revision=self.revision,
-            dtype=self.dtype,
-            quantization=self.quantization,
-        )
+        model_config = _model_config_for_loading(server_args)
 
         # Build cache config fingerprint BEFORE loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via

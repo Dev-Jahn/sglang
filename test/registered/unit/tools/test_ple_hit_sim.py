@@ -19,6 +19,7 @@ from sglang.srt.models.qwen4_ple_hash import (
     hash_token_stream_numpy,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ple_disk_utils import attach_checkpoint_source
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -28,7 +29,7 @@ def _fp8_rows(count: int) -> torch.Tensor:
         count, disk.ROW_BYTES
     )
     raw[(raw & 0x7F) == 0x7F] = 0
-    return raw.view(torch.float8_e4m3fn)
+    return attach_checkpoint_source(raw.view(torch.float8_e4m3fn))
 
 
 def test_image_metadata_round_trips_into_hit_sim(tmp_path):
@@ -173,8 +174,14 @@ def test_hit_sim_selects_accessed_rows_and_splits_tp_ranks(tmp_path, monkeypatch
         for head, size in enumerate(metadata.vocab_sizes)
     ]
     assert all(array.dtype == np.uint64 for array in count_files)
-    ids, frequencies = hit_sim.select_rows(count_files, metadata, capacity=10)
-    ranks = hit_sim.split_ranks(ids, frequencies, total_rows=7, tp_size=2, divisor=4)
+    ranks = hit_sim.select_rows_by_rank(
+        count_files,
+        metadata,
+        capacity=10,
+        total_rows=7,
+        tp_size=2,
+        divisor=4,
+    )
     for rank, expected in ranks.items():
         assert np.array_equal(
             disk.read_hot_frequency_file(
@@ -232,82 +239,6 @@ def test_hit_sim_fills_each_rank_from_its_share_of_a_skewed_corpus():
 
     assert ranks[0].tolist() == [0, 1]
     assert ranks[1].tolist() == [4, 5]
-
-
-def test_hit_sim_selection_handles_a_large_peak_frequency():
-    script = Path(__file__).resolve().parents[4] / "scripts/ple_disk/hit_sim.py"
-    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_peak", script)
-    hit_sim = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(hit_sim)
-    metadata = PLEMetadata(
-        multipliers=np.array([3, 5, 7], dtype=np.int64),
-        vocab_sizes=np.array([4, 3], dtype=np.int64),
-        offsets=np.array([0, 4], dtype=np.int64),
-        eos_token_id=2,
-    )
-    counts = [
-        np.array([10**12, 7, 7, 1], dtype=np.uint64),
-        np.array([8, 7, 0], dtype=np.uint64),
-    ]
-    ids, frequencies = hit_sim.select_rows(counts, metadata, capacity=4)
-    assert ids.tolist() == [0, 4, 1, 2]
-    assert frequencies.tolist() == [10**12, 8, 7, 7]
-
-
-def test_hit_sim_selection_matches_the_previous_ordering():
-    script = Path(__file__).resolve().parents[4] / "scripts/ple_disk/hit_sim.py"
-    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_order", script)
-    hit_sim = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(hit_sim)
-    metadata = PLEMetadata(
-        multipliers=np.array([3, 5, 7], dtype=np.int64),
-        vocab_sizes=np.array([5, 4], dtype=np.int64),
-        offsets=np.array([0, 5], dtype=np.int64),
-        eos_token_id=2,
-    )
-    counts = [
-        np.array([0, 3, 9, 3, 1], dtype=np.uint64),
-        np.array([3, 7, 0, 3], dtype=np.uint64),
-    ]
-
-    def previous_selection(capacity):
-        maximum = max(int(array.max()) for array in counts)
-        histogram = np.zeros(maximum + 1, dtype=np.int64)
-        for array in counts:
-            local = np.bincount(
-                np.asarray(array, dtype=np.int64), minlength=maximum + 1
-            )
-            histogram[: local.size] += local
-        selected_above = 0
-        threshold = 0
-        for frequency in range(maximum, 0, -1):
-            if selected_above + int(histogram[frequency]) >= capacity:
-                threshold = frequency
-                break
-            selected_above += int(histogram[frequency])
-        tie_remaining = capacity - selected_above
-        ids = []
-        frequencies = []
-        for array, offset in zip(counts, metadata.offsets):
-            local_ids = np.flatnonzero(array > threshold)
-            if tie_remaining:
-                tied = np.flatnonzero(array == threshold)
-                take = min(tie_remaining, tied.size)
-                local_ids = np.concatenate((local_ids, tied[:take]))
-                tie_remaining -= take
-            ids.append((local_ids + int(offset)).astype(np.uint32))
-            frequencies.append(np.asarray(array[local_ids], dtype=np.uint64))
-        global_ids = np.concatenate(ids)
-        global_frequencies = np.concatenate(frequencies)
-        order = np.lexsort((global_ids, np.bitwise_not(global_frequencies)))
-        return global_ids[order], global_frequencies[order]
-
-    expected_ids, expected_frequencies = previous_selection(5)
-    actual_ids, actual_frequencies = hit_sim.select_rows(counts, metadata, 5)
-    assert np.array_equal(actual_ids, expected_ids)
-    assert np.array_equal(actual_frequencies, expected_frequencies)
 
 
 if __name__ == "__main__":

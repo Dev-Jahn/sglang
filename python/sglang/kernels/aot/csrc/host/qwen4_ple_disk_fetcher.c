@@ -39,13 +39,6 @@ struct fetcher {
 #define EUCLEAN 117
 #endif
 
-enum fetcher_failure_stage {
-  FETCHER_FAILURE_NONE = 0,
-  FETCHER_FAILURE_SETUP = 1,
-  FETCHER_FAILURE_REGISTER_BUFFER = 2,
-  FETCHER_FAILURE_REGISTER_FILE = 3,
-};
-
 unsigned ple_fetcher_abi_version(void) {
   return PLE_FETCHER_ABI_VERSION;
 }
@@ -64,6 +57,12 @@ static long submit_ring(struct fetcher* f, unsigned submit) {
 #ifdef PLE_FETCHER_TESTING
   extern unsigned ple_test_submit_limit;
   extern unsigned ple_test_partial_count;
+  extern unsigned ple_test_submission_interrupts;
+  if (ple_test_submission_interrupts) {
+    --ple_test_submission_interrupts;
+    errno = EINTR;
+    return -1;
+  }
   if (ple_test_submit_limit && submit > ple_test_submit_limit) {
     submit = ple_test_submit_limit;
     ++ple_test_partial_count;
@@ -71,7 +70,47 @@ static long submit_ring(struct fetcher* f, unsigned submit) {
 #endif
   return enter_ring(f->ring_fd, submit, 0, 0);
 }
-static long enter_ring_bounded(struct fetcher* f) {
+static int deadline_remaining_ns(const struct timespec* deadline, uint64_t* remaining_ns) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return -errno;
+  int64_t seconds = (int64_t)deadline->tv_sec - (int64_t)now.tv_sec;
+  int64_t nanoseconds = (int64_t)deadline->tv_nsec - (int64_t)now.tv_nsec;
+  int64_t total = seconds * 1000000000LL + nanoseconds;
+  if (total <= 0) return -ETIMEDOUT;
+  *remaining_ns = (uint64_t)total;
+  return 0;
+}
+
+static int make_read_deadline(struct timespec* deadline) {
+  if (clock_gettime(CLOCK_MONOTONIC, deadline) < 0) return -errno;
+  unsigned budget_ms = PLE_FETCHER_LOCK_BUDGET_MS;
+#ifdef PLE_FETCHER_TESTING
+  extern unsigned ple_test_deadline_override_ms;
+  if (ple_test_deadline_override_ms) budget_ms = ple_test_deadline_override_ms;
+#endif
+  deadline->tv_sec += budget_ms / 1000U;
+  deadline->tv_nsec += (long)(budget_ms % 1000U) * 1000000L;
+  if (deadline->tv_nsec >= 1000000000L) {
+    ++deadline->tv_sec;
+    deadline->tv_nsec -= 1000000000L;
+  }
+  return 0;
+}
+
+static int deadline_reached(const struct timespec* deadline) {
+  uint64_t remaining_ns;
+  return deadline_remaining_ns(deadline, &remaining_ns) < 0;
+}
+
+static long enter_ring_bounded(struct fetcher* f, const struct timespec* deadline) {
+  uint64_t remaining_ns = PLE_FETCHER_WAIT_NS;
+  if (deadline) {
+    int deadline_status = deadline_remaining_ns(deadline, &remaining_ns);
+    if (deadline_status < 0) {
+      errno = -deadline_status;
+      return -1;
+    }
+  }
 #ifdef PLE_FETCHER_TESTING
   extern int ple_test_stall_completion;
   extern unsigned ple_test_stall_wakes;
@@ -92,9 +131,10 @@ static long enter_ring_bounded(struct fetcher* f) {
     ple_test_completion_on_last_wake = 0;
   }
 #endif
+  if (remaining_ns > PLE_FETCHER_WAIT_NS) remaining_ns = PLE_FETCHER_WAIT_NS;
   struct qwen4_ple_kernel_timespec timeout = {
-      .tv_sec = 0,
-      .tv_nsec = PLE_FETCHER_WAIT_NS,
+      .tv_sec = (int64_t)(remaining_ns / 1000000000ULL),
+      .tv_nsec = (int64_t)(remaining_ns % 1000000000ULL),
   };
   struct io_uring_getevents_arg arg = {
       .ts = (uintptr_t)&timeout,
@@ -108,12 +148,12 @@ static long register_ring(int fd, unsigned op, const void* arg, unsigned nr) {
 
 void* ple_fetcher_create(
     int file_fd, void* buffer, size_t buffer_bytes, unsigned max_pages, int register_buffer, int* failure_stage) {
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_NONE;
+  if (failure_stage) *failure_stage = PLE_FETCHER_FAILURE_NONE;
   if (!buffer || !max_pages || buffer_bytes < (size_t)max_pages * 4096 || ((uintptr_t)buffer & 4095)) {
     errno = EINVAL;
     return NULL;
   }
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_SETUP;
+  if (failure_stage) *failure_stage = PLE_FETCHER_FAILURE_SETUP;
   struct fetcher* f = calloc(1, sizeof(*f));
   if (!f) return NULL;
   f->ring_fd = -1;
@@ -163,12 +203,12 @@ void* ple_fetcher_create(
   f->cqes = f->cq_ptr + p.cq_off.cqes;
   struct iovec iov = {buffer, buffer_bytes};
   if (f->fixed_buffer) {
-    if (failure_stage) *failure_stage = FETCHER_FAILURE_REGISTER_BUFFER;
+    if (failure_stage) *failure_stage = PLE_FETCHER_FAILURE_REGISTER_BUFFER;
     if (register_ring(f->ring_fd, IORING_REGISTER_BUFFERS, &iov, 1) < 0) goto fail;
   }
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_REGISTER_FILE;
+  if (failure_stage) *failure_stage = PLE_FETCHER_FAILURE_REGISTER_FILE;
   if (register_ring(f->ring_fd, IORING_REGISTER_FILES, &file_fd, 1) < 0) goto fail;
-  if (failure_stage) *failure_stage = FETCHER_FAILURE_NONE;
+  if (failure_stage) *failure_stage = PLE_FETCHER_FAILURE_NONE;
   return f;
 fail: {
   int saved = errno;
@@ -215,7 +255,13 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result, i
   return completed;
 }
 
-static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned* waits, unsigned max_waits) {
+static int reap_bounded(
+    struct fetcher* f,
+    unsigned count,
+    int* result,
+    unsigned* waits,
+    unsigned max_waits,
+    const struct timespec* deadline) {
   unsigned completed = 0;
   while (completed < count) {
     unsigned reaped = reap_available(f, count - completed, result, 0);
@@ -224,7 +270,8 @@ static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned
     if (reaped) continue;
     long rc;
     do {
-      rc = enter_ring_bounded(f);
+      if (deadline && deadline_reached(deadline)) return -ETIMEDOUT;
+      rc = enter_ring_bounded(f, deadline);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0 && errno != ETIME) return -errno;
     reaped = reap_available(f, count - completed, result, 0);
@@ -241,11 +288,17 @@ static int poison_fetcher(struct fetcher* f) {
   return -EUCLEAN;
 }
 
-static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned count, unsigned completed) {
+static int quiesce_after_error(
+    struct fetcher* f, unsigned submitted, unsigned count, unsigned completed, const struct timespec* deadline) {
   unsigned attempts = 0;
   while (submitted < count && attempts++ < PLE_FETCHER_QUIESCE_WAITS) {
     long rc;
     do {
+      if (deadline_reached(deadline)) {
+        rc = -1;
+        errno = ETIMEDOUT;
+        break;
+      }
       rc = submit_ring(f, count - submitted);
     } while (rc < 0 && errno == EINTR);
     if (rc <= 0) break;
@@ -256,7 +309,8 @@ static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned c
   int ignored_result = 0;
   unsigned quiesce_waits = 0;
   if (submitted > completed &&
-      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_QUIESCE_WAITS) < 0) {
+      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_QUIESCE_WAITS, deadline) <
+          0) {
     return poison_fetcher(f);
   }
   if (submitted != count) {
@@ -289,6 +343,9 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
   f->has_last_error = 0;
   f->last_error_index = 0;
   f->last_error_result = 0;
+  struct timespec deadline;
+  int deadline_status = make_read_deadline(&deadline);
+  if (deadline_status < 0) return finish_read(f, deadline_status);
   unsigned tail = __atomic_load_n(f->sq_tail, __ATOMIC_RELAXED);
   unsigned head = __atomic_load_n(f->sq_head, __ATOMIC_ACQUIRE);
   if (tail - head + count > *f->sq_entries) return finish_read(f, -ENOSPC);
@@ -313,11 +370,16 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
   unsigned waits = 0;
   while (submitted < count) {
     do {
+      if (deadline_reached(&deadline)) {
+        rc = -1;
+        errno = ETIMEDOUT;
+        break;
+      }
       rc = submit_ring(f, count - submitted);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0 || rc == 0) {
       int error = rc < 0 ? -errno : -EIO;
-      if (quiesce_after_error(f, submitted, count, 0) < 0) return finish_read(f, -EUCLEAN);
+      if (quiesce_after_error(f, submitted, count, 0, &deadline) < 0) return finish_read(f, -EUCLEAN);
       return finish_read(f, error);
     }
     submitted += (unsigned)rc;
@@ -331,11 +393,11 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
     if (completed == count) break;
     if (!reaped) {
       do {
-        rc = enter_ring_bounded(f);
+        rc = enter_ring_bounded(f, &deadline);
       } while (rc < 0 && errno == EINTR);
       if (rc < 0 && errno != ETIME) {
         int error = -errno;
-        if (quiesce_after_error(f, count, count, completed) < 0) return finish_read(f, -EUCLEAN);
+        if (quiesce_after_error(f, count, count, completed, &deadline) < 0) return finish_read(f, -EUCLEAN);
         return finish_read(f, error);
       }
       reaped = reap_available(f, count - completed, &result, 1);
@@ -343,7 +405,7 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
       if (completed == count) break;
       if (reaped) continue;
       if (!ple_fetcher_retry_after_timeout(&waits)) {
-        if (quiesce_after_error(f, count, count, completed) < 0) return finish_read(f, -EUCLEAN);
+        if (quiesce_after_error(f, count, count, completed, &deadline) < 0) return finish_read(f, -EUCLEAN);
         return finish_read(f, -ETIMEDOUT);
       }
       continue;
@@ -387,7 +449,7 @@ int ple_fetcher_destroy(void* opaque) {
     unsigned drain_count = f->outstanding;
     unsigned drain_waits = 0;
     int ignored_result = 0;
-    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_DRAIN_WAITS) < 0) {
+    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_DRAIN_WAITS, NULL) < 0) {
       /* The ring and all mappings stay allocated because the kernel may still
        * complete a request into the registered staging buffer. */
       __atomic_store_n(&f->terminal_leaked, 1, __ATOMIC_RELEASE);
@@ -415,6 +477,8 @@ int ple_test_stall_completion = 0;
 unsigned ple_test_stall_wakes = 0;
 unsigned ple_test_successful_empty_wakes = 0;
 int ple_test_completion_on_last_wake = 0;
+unsigned ple_test_submission_interrupts = 0;
+unsigned ple_test_deadline_override_ms = 0;
 
 void ple_fetcher_test_limit_submissions(unsigned pages) {
   ple_test_submit_limit = pages;
@@ -439,6 +503,14 @@ void ple_fetcher_test_successful_empty_wakes(unsigned wakes) {
 
 void ple_fetcher_test_completion_on_last_wake(int enabled) {
   ple_test_completion_on_last_wake = !!enabled;
+}
+
+void ple_fetcher_test_interrupt_submissions(unsigned interrupts) {
+  ple_test_submission_interrupts = interrupts;
+}
+
+void ple_fetcher_test_deadline_ms(unsigned milliseconds) {
+  ple_test_deadline_override_ms = milliseconds;
 }
 
 int ple_fetcher_test_ring_open(void* opaque) {

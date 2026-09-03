@@ -1361,24 +1361,29 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     fast at boot).
     """
     from sglang.srt.configs.qwen4_exp import (
-        apply_ple_runtime_config,
         resolve_ple_storage,
     )
 
     overrides: Dict[str, Any] = {}
     ple_storage = resolve_ple_storage(server_args)
+    text_config = getattr(hf_config, "text_config", hf_config)
     if ple_storage is None:
-        import torch
+        checkpoint_storage = resolve_ple_storage(text_config)
+        if checkpoint_storage is not None:
+            if checkpoint_storage not in ("gpu", "pinned", "disk"):
+                raise ValueError(
+                    "Qwen4-Exp checkpoint ple_storage must be gpu, pinned, or disk"
+                )
+            overrides["ple_storage"] = checkpoint_storage
+        else:
+            import torch
 
-        use_pinned = (
-            is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
-        )
-        overrides["ple_storage"] = "pinned" if use_pinned else "gpu"
+            use_pinned = (
+                is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
+            )
+            overrides["ple_storage"] = "pinned" if use_pinned else "gpu"
 
     resolved_storage = overrides.get("ple_storage", ple_storage)
-    apply_ple_runtime_config(hf_config, server_args, storage=resolved_storage)
-
-    text_config = getattr(hf_config, "text_config", hf_config)
     if (
         resolved_storage == "disk"
         and getattr(text_config, "ple_embedding_dtype", None) != "float8_e4m3fn"

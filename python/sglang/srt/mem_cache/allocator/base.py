@@ -24,12 +24,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-def allocator_reserves_token_slot(allocator, slot: int) -> bool:
-    """Return whether the allocator owns ``slot`` outside its free space."""
+def allocator_reserves_padding_slot(allocator) -> bool:
+    """Return whether slot zero is reserved for padded graph tokens.
+
+    This startup query is called immediately after allocator construction,
+    before request allocations can make an ordinary slot appear busy.
+    """
 
     if not isinstance(allocator, BaseTokenToKVPoolAllocator):
         return False
-    return allocator.is_slot_allocated(slot)
+    return allocator.reserves_padding_slot()
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -70,8 +74,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
-    def is_slot_allocated(self, slot: int) -> bool:
-        """Return whether a token slot is allocated or permanently reserved."""
+    def reserves_padding_slot(self) -> bool:
+        """Return whether initial free space excludes slot zero for padding.
+
+        This is a construction-time contract.  It does not report whether an
+        ordinary slot is occupied by a live request.
+        """
         raise NotImplementedError()
 
     def free_group_begin(self):

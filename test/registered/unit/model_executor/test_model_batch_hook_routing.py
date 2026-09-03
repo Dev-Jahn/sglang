@@ -185,19 +185,37 @@ def test_split_prefill_entry_prepares_later_chunks(routed_batch):
 
 
 def test_model_batch_hook_runs_once_for_a_prepared_forward_batch():
+    class WeakrefBatch:
+        pass
+
     events = []
     model = SimpleNamespace(
         supports_model_batch_hook=True,
         prepare_model_batch=lambda batch, prepared: events.append((batch, prepared)),
     )
     runner = SimpleNamespace(model=model)
-    forward_batch = SimpleNamespace()
+    forward_batch = WeakrefBatch()
     batch = object()
 
     ModelRunner.prepare_model_batch(runner, batch, forward_batch)
     ModelRunner.prepare_model_batch(runner, batch, forward_batch)
 
     assert events == [(batch, forward_batch)]
+
+
+def test_model_batch_hook_registry_does_not_retain_nonweakref_batches():
+    events = []
+    model = SimpleNamespace(
+        supports_model_batch_hook=True,
+        prepare_model_batch=lambda batch, prepared: events.append(prepared),
+    )
+    runner = SimpleNamespace(model=model)
+    forward_batch = object()
+
+    ModelRunner.prepare_model_batch(runner, None, forward_batch)
+
+    assert events == [forward_batch]
+    assert runner._prepared_model_batch_refs == {}
 
 
 if __name__ == "__main__":

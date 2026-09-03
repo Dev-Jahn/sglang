@@ -40,6 +40,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
+    StoreWithDeprecatedAliasCheckAction,
 )
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -53,6 +54,7 @@ from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_b
 from sglang.srt.configs.qwen4_exp import (
     PLE_DISK_DEFAULTS,
     PLE_DISK_MAX_PREFILL_BUFFER_TOKENS,
+    apply_sglang_runtime_config,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -2625,6 +2627,8 @@ class ServerArgs:
             "io_uring reads; 'gpu' uses the normal device embedding. When "
             "unset, BF16 Qwen4 CUDA models select pinned storage.",
             choices=["gpu", "pinned", "disk"],
+            action=StoreWithDeprecatedAliasCheckAction,
+            action_kwargs={"choices": ["gpu", "pinned", "disk"]},
             resolvable=True,
         ),
         NS("exec.offload"),
@@ -3842,6 +3846,7 @@ class ServerArgs:
 
         materialize_declarations(self)
         self._handle_offload_compatibility(resolved=True)
+        apply_sglang_runtime_config(self.get_model_config().hf_config, self)
 
     def _validate_ple_disk_args(self):
         from sglang.srt.utils.ple_disk import (

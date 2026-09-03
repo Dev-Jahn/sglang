@@ -1,18 +1,17 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "qwen4_ple_disk_fetcher.h"
 
 #define PAGE_BYTES 4096
-#define FETCHER_FAILURE_REGISTER_BUFFER 2
-#define FETCHER_FAILURE_NONE 0
-
 #ifndef EUCLEAN
 #define EUCLEAN 117
 #endif
@@ -45,14 +44,15 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   errno = 0;
   void* invalid_fetcher =
       ple_fetcher_create(file_fd, (unsigned char*)buffer + 1, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
-  if (invalid_fetcher || errno != EINVAL || failure_stage != FETCHER_FAILURE_NONE) {
+  if (invalid_fetcher || errno != EINVAL || failure_stage != PLE_FETCHER_FAILURE_NONE) {
     fprintf(stderr, "invalid create returned %p errno=%d stage=%d\n", invalid_fetcher, errno, failure_stage);
     goto done;
   }
   fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
   if (!fetcher) {
     int error = errno;
-    if (register_buffer && failure_stage == FETCHER_FAILURE_REGISTER_BUFFER && (skip_errno(error) || error == ENOMEM)) {
+    if (register_buffer && failure_stage == PLE_FETCHER_FAILURE_REGISTER_BUFFER &&
+        (skip_errno(error) || error == ENOMEM)) {
       printf("PLE fetcher registered-buffer scenarios skipped: %s\n", strerror(error));
       result = unavailable_result();
       goto done;
@@ -68,6 +68,37 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
         register_buffer,
         failure_stage,
         strerror(error));
+    goto done;
+  }
+
+  void* deadline_fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
+  if (!deadline_fetcher) {
+    fprintf(stderr, "deadline test fetcher creation failed: %s\n", strerror(errno));
+    goto done;
+  }
+  struct timespec deadline_start;
+  struct timespec deadline_end;
+  clock_gettime(CLOCK_MONOTONIC, &deadline_start);
+  ple_fetcher_test_deadline_ms(20);
+  ple_fetcher_test_interrupt_submissions(UINT_MAX);
+  uint64_t deadline_offset = PAGE_BYTES;
+  int deadline_rc = ple_fetcher_read(deadline_fetcher, &deadline_offset, 1, buffer, 2 * PAGE_BYTES);
+  clock_gettime(CLOCK_MONOTONIC, &deadline_end);
+  ple_fetcher_test_interrupt_submissions(0);
+  ple_fetcher_test_deadline_ms(0);
+  int64_t deadline_elapsed_ns = (int64_t)(deadline_end.tv_sec - deadline_start.tv_sec) * 1000000000LL +
+                                (int64_t)(deadline_end.tv_nsec - deadline_start.tv_nsec);
+  if (deadline_rc != -EUCLEAN || deadline_elapsed_ns < 0 || deadline_elapsed_ns > 500000000LL) {
+    fprintf(
+        stderr,
+        "EINTR deadline returned %d after %llu ns\n",
+        deadline_rc,
+        (unsigned long long)(deadline_elapsed_ns < 0 ? 0 : deadline_elapsed_ns));
+    ple_fetcher_destroy(deadline_fetcher);
+    goto done;
+  }
+  if (ple_fetcher_destroy(deadline_fetcher) != 0) {
+    fprintf(stderr, "deadline test fetcher destroy failed\n");
     goto done;
   }
 
@@ -229,6 +260,8 @@ done:
   ple_fetcher_test_stall_wakes(0);
   ple_fetcher_test_successful_empty_wakes(0);
   ple_fetcher_test_completion_on_last_wake(0);
+  ple_fetcher_test_interrupt_submissions(0);
+  ple_fetcher_test_deadline_ms(0);
   if (fetcher) {
     int destroy_rc = ple_fetcher_destroy(fetcher);
     if (destroy_rc && result == 0) {
@@ -267,7 +300,12 @@ int main(void) {
   int file_fd = open(path, O_RDONLY | O_DIRECT);
   unlink(path);
   if (file_fd < 0) {
-    if (skip_errno(errno) || errno == EINVAL) {
+    if (errno == EINVAL) {
+      fprintf(
+          stderr, "O_DIRECT is unavailable in TMPDIR=%s; TMPDIR must point to a block-backed filesystem\n", temp_dir);
+      return 1;
+    }
+    if (skip_errno(errno)) {
       printf("PLE fetcher CTest skipped: O_DIRECT is unavailable: %s\n", strerror(errno));
       return unavailable_result();
     }

@@ -259,6 +259,7 @@ class SchedulerWeightUpdaterManager:
             self._assert_weight_cache_inactive("release_memory_occupation")
             model = self.tp_worker.model_runner.model
             self.stashed_model_static_state = _export_static_state(model)
+            torch.distributed.barrier(group=self.tp_cpu_group)
             if getattr(model, "supports_storage_lifecycle_hook", False):
                 self._run_tp_storage_operation(
                     cast(StorageLifecycleHook, model).close,

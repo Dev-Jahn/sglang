@@ -809,7 +809,7 @@ def test_graph_validation_recycles_every_consumed_ready_entry():
     assert len(layer._graph_validation_free_slots) == 2
 
 
-def test_forward_batch_declares_model_batch_hook_state():
+def test_forward_batch_has_no_persistent_model_batch_hook_field():
     assert "_model_batch_hook_prepared" not in ForwardBatch.__dataclass_fields__
 
 

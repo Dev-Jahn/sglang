@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from typing import (
     Any,
     AsyncIterator,
@@ -128,6 +129,26 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
+
+
+def _translate_legacy_ple_storage_kwargs(kwargs: Dict[str, Any]) -> None:
+    if "ple_offload_embedding" not in kwargs:
+        return
+    legacy = kwargs.pop("ple_offload_embedding")
+    storage = "pinned" if legacy else "gpu"
+    explicit = kwargs.get("ple_storage")
+    if explicit is not None and explicit != storage:
+        raise ValueError(
+            "ple_offload_embedding conflicts with the explicit ple_storage value"
+        )
+    warnings.warn(
+        "Engine(ple_offload_embedding=...) is deprecated; use ple_storage instead",
+        FutureWarning,
+        stacklevel=3,
+    )
+    kwargs["ple_storage"] = storage
+
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
@@ -237,6 +258,7 @@ class Engine(EngineScoreMixin, EngineBase):
             server_args = kwargs["server_args"]
         else:
             # Construct server_args from kwargs
+            _translate_legacy_ple_storage_kwargs(kwargs)
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"

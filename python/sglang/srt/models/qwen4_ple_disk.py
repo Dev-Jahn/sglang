@@ -63,14 +63,13 @@ MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK = "0.4.6.post2"
 CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 FETCHER_FAILURE_SETUP = 1
 FETCHER_FAILURE_REGISTER_BUFFER = 2
+FETCHER_FAILURE_REGISTER_FILE = 3
 FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
 _METADATA_HEADER = struct.Struct("<8sI")
 _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 # Intentionally unbounded: releasing any entry could let the kernel write into
 # freed memory after a native reader teardown timed out or stayed busy.
 _RETAINED_POISONED_STAGING = []
-_missing_checkpoint_source_identity_warned = False
-_missing_checkpoint_source_identity_lock = threading.Lock()
 
 
 def resolve_hot_frequency_file(
@@ -306,20 +305,6 @@ _PLE_IMAGE_CONFIG_FIELDS = (
     "ple_embedding_dtype",
     "eos_token_id",
 )
-
-
-def _warn_missing_checkpoint_source_identity() -> None:
-    global _missing_checkpoint_source_identity_warned
-    if _missing_checkpoint_source_identity_warned:
-        return
-    with _missing_checkpoint_source_identity_lock:
-        if _missing_checkpoint_source_identity_warned:
-            return
-        logger.warning(
-            "A PLE checkpoint shard has no checkpoint source identity; image "
-            "reuse will compare the tensor name, byte count, and sampled rows"
-        )
-        _missing_checkpoint_source_identity_warned = True
 
 
 def config_digest(config) -> str:
@@ -749,9 +734,15 @@ class PLEImageBuilder:
                 f"{loaded_weight.dtype} for {name}"
             )
         source = getattr(loaded_weight, "_sglang_checkpoint_source", None)
-        if source is None:
-            _warn_missing_checkpoint_source_identity()
-            source = {}
+        if not isinstance(source, Mapping) or not {
+            "file",
+            "size",
+            "mtime_ns",
+        }.issubset(source):
+            raise ValueError(
+                "PLE disk storage requires checkpoint source identity on every "
+                f"weight shard; {name} was yielded without it"
+            )
         item = {
             "name": name,
             "rows": int(loaded_weight.shape[0]),
@@ -760,25 +751,29 @@ class PLEImageBuilder:
             "row_start": int(row_start),
             "row_end": int(row_end),
             "sample_sha256": _sample_row_payload(loaded_weight),
-            "source_file": str(source.get("file", name)),
-            "source_file_size": int(source.get("size", loaded_weight.nbytes)),
-            "source_file_mtime_ns": int(source.get("mtime_ns", 0)),
+            "source_file": str(source["file"]),
+            "source_file_size": int(source["size"]),
+            "source_file_mtime_ns": int(source["mtime_ns"]),
         }
         if self._reuse is not None:
             expected = self._expected_by_name.get(name)
             content_changed = expected is None or self._comparable_manifest_item(
                 expected
             ) != self._comparable_manifest_item(item)
-            mtime_changed = expected is not None and int(
-                expected.get("source_file_mtime_ns", 0)
-            ) != int(item["source_file_mtime_ns"])
-            if content_changed or mtime_changed:
+            if content_changed:
                 logger.warning(
                     "PLE checkpoint identity changed for %s; rebuilding %s",
                     name,
                     self.module_prefix,
                 )
                 self._materialize_reuse_rows()
+            elif expected is not None and int(
+                expected.get("source_file_mtime_ns", 0)
+            ) != int(item["source_file_mtime_ns"]):
+                logger.debug(
+                    "PLE checkpoint mtime changed for %s; sampled content matches",
+                    name,
+                )
         self.manifest.append(item)
         ov_start = max(int(row_start), self.vocab_start)
         ov_end = min(int(row_end), self.vocab_end)
@@ -1077,33 +1072,6 @@ class PLEImageBuilder:
                 self._raw_path.unlink(missing_ok=True)
             finally:
                 self._raw_path = None
-
-
-def build_test_image(
-    root: str | Path,
-    rows: torch.Tensor,
-    *,
-    rank: int = 0,
-    tp_size: int = 1,
-    vocab_start: int = 0,
-    config_sha256: str = "test-config",
-    weight_scale: float = 1.0,
-    module_prefix: str = "ple",
-) -> PLEImage:
-    builder = PLEImageBuilder(
-        root,
-        config_sha256,
-        rank,
-        tp_size,
-        vocab_start,
-        vocab_start + rows.shape[0],
-        module_prefix=module_prefix,
-    )
-    builder.add_shard(
-        "test.shard_0.weight", rows, vocab_start, vocab_start + rows.shape[0]
-    )
-    image, _, _ = builder.finalize(weight_scale)
-    return image
 
 
 def write_hot_frequency_file(
@@ -1744,6 +1712,26 @@ def _find_helper_library() -> Path:
     )
 
 
+def _load_helper_library():
+    library = ctypes.CDLL(str(_find_helper_library()), use_errno=True)
+    try:
+        library.ple_fetcher_abi_version.argtypes = []
+        library.ple_fetcher_abi_version.restype = ctypes.c_uint
+        library.ple_fetcher_lock_budget_ms.argtypes = []
+        library.ple_fetcher_lock_budget_ms.restype = ctypes.c_uint
+        abi_version = library.ple_fetcher_abi_version()
+    except AttributeError as exc:
+        raise RuntimeError(
+            "PLE disk fetcher lacks the required ABI version symbol"
+        ) from exc
+    if abi_version != PLE_FETCHER_ABI_VERSION:
+        raise RuntimeError(
+            "PLE disk fetcher ABI mismatch: expected "
+            f"{PLE_FETCHER_ABI_VERSION}, found {abi_version}"
+        )
+    return library
+
+
 class DirectPageReader:
     """Direct page reader with serialized access to its staging area."""
 
@@ -1768,29 +1756,13 @@ class DirectPageReader:
         self.staging = self._staging_allocation[
             alignment_offset : alignment_offset + staging_bytes
         ]
-        self.result = np.empty((self.max_pages, PAGE_BYTES), dtype=np.uint8)
         self.offsets = np.empty(self.max_pages, dtype=np.uint64)
         self._read_lock = threading.Lock()
         self._poisoned = False
         self._staging_retained = False
         if self.staging.data_ptr() & (self.alignment - 1):
             raise RuntimeError("PLE registered staging buffer is not O_DIRECT aligned")
-        self.lib = ctypes.CDLL(str(_find_helper_library()), use_errno=True)
-        try:
-            self.lib.ple_fetcher_abi_version.argtypes = []
-            self.lib.ple_fetcher_abi_version.restype = ctypes.c_uint
-            self.lib.ple_fetcher_lock_budget_ms.argtypes = []
-            self.lib.ple_fetcher_lock_budget_ms.restype = ctypes.c_uint
-            abi_version = self.lib.ple_fetcher_abi_version()
-        except AttributeError as exc:
-            raise RuntimeError(
-                "PLE disk fetcher lacks the required ABI version symbol"
-            ) from exc
-        if abi_version != PLE_FETCHER_ABI_VERSION:
-            raise RuntimeError(
-                "PLE disk fetcher ABI mismatch: expected "
-                f"{PLE_FETCHER_ABI_VERSION}, found {abi_version}"
-            )
+        self.lib = _load_helper_library()
         self._read_lock_timeout_seconds = self.lib.ple_fetcher_lock_budget_ms() / 1000.0
         self.lib.ple_fetcher_create.argtypes = [
             ctypes.c_int,
@@ -1859,6 +1831,15 @@ class DirectPageReader:
                     "PLE io_uring requires Linux kernel 5.11 or later; "
                     "upgrade the kernel or use --ple-storage pinned",
                 )
+            if error in (errno.EPERM, errno.EACCES) and (
+                failure_stage.value == FETCHER_FAILURE_REGISTER_FILE
+            ):
+                raise OSError(
+                    error,
+                    "PLE io_uring file registration is blocked by the container "
+                    "seccomp policy; allow io_uring_register or use "
+                    "--ple-storage pinned",
+                )
             raise OSError(error, os.strerror(error))
 
     def read(self, page_ids: np.ndarray) -> np.ndarray:
@@ -1900,11 +1881,7 @@ class DirectPageReader:
             raise IndexError("PLE page id outside image")
         result = None
         if not return_staging:
-            result = (
-                self.result[: page_ids.size]
-                if page_ids.size <= self.max_pages
-                else np.empty((page_ids.size, PAGE_BYTES), dtype=np.uint8)
-            )
+            result = np.empty((page_ids.size, PAGE_BYTES), dtype=np.uint8)
         pages = self.staging[:0].numpy().reshape(0, PAGE_BYTES)
         for begin in range(0, page_ids.size, self.max_pages):
             chunk = page_ids[begin : begin + self.max_pages]

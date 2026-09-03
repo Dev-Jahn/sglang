@@ -44,6 +44,8 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_sm120_supported,
+    is_sm121,
     log_info_on_rank0,
 )
 from sglang.srt.utils.ple_disk import resolve_model_runner_ple_storage
@@ -106,7 +108,8 @@ def _prewarm_model_cuda_graphs(
 
     ple_storage = resolve_model_runner_ple_storage(model_runner)
     ple_offload_enabled = ple_storage in ("pinned", "disk")
-    if not ple_offload_enabled:
+    sm120_jit_prewarm = is_sm120_supported() and not is_sm121()
+    if not (ple_offload_enabled or sm120_jit_prewarm):
         return
     language_model = resolve_language_model(model_runner.model)
     prewarm = getattr(language_model, "prewarm_cuda_graphs", None)

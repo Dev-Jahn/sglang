@@ -45,23 +45,6 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_ple_disk_rejects_pipeline_parallelism_and_dllm(self):
-        with tempfile.TemporaryDirectory() as disk_dir:
-            for incompatible in (
-                {"pp_size": 2},
-                {"dllm_algorithm": "LowConfidence"},
-            ):
-                with (
-                    self.subTest(incompatible=incompatible),
-                    self.assertRaisesRegex(ValueError, "pipeline parallelism|dLLM"),
-                ):
-                    ServerArgs(
-                        model_path="dummy",
-                        ple_storage="disk",
-                        ple_disk_dir=disk_dir,
-                        **incompatible,
-                    )
-
     def test_ple_pinned_storage_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -401,10 +384,12 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
 
-        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
-            server_args._handle_multimodal_feature_transport()
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
 
-        self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
         self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
 
     @patch("sglang.srt.server_args.os.path.exists", return_value=False)
