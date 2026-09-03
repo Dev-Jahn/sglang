@@ -225,6 +225,7 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
+from sglang.srt.utils.ple_disk import resolve_model_runner_ple_storage
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
@@ -834,18 +835,16 @@ class ModelRunner:
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
-        from sglang.srt.configs.qwen4_exp import resolve_ple_storage
-
-        if resolve_ple_storage(self.server_args, "gpu") == "disk":
+        if resolve_model_runner_ple_storage(self, "gpu") == "disk":
             if self.token_to_kv_pool_allocator is None:
                 raise ValueError(
-                    "Qwen4 PLE disk masking requires a token allocator that "
-                    "reserves KV cache slot 0"
+                    "Storage-backed graph padding requires a token allocator "
+                    "that reserves KV cache slot 0"
                 )
             if not allocator_reserves_token_slot(self.token_to_kv_pool_allocator, 0):
                 raise ValueError(
-                    "Qwen4 PLE disk masking requires KV cache slot 0 to be "
-                    "reserved and absent from allocator free lists"
+                    "Storage-backed graph padding requires KV cache slot 0 "
+                    "to be reserved"
                 )
         self.memory_pool_config = result.memory_pool_config
         if self.is_hybrid_swa:
@@ -1445,13 +1444,33 @@ class ModelRunner:
     def prepare_model_batch(
         self, schedule_batch: Optional[Any], forward_batch: ForwardBatch
     ) -> None:
+        """Run a model batch hook once at the TP-worker scheduling boundary.
+
+        Pipeline ranks use the same boundary. Split prefill reuses one
+        ForwardBatch, so later chunks are suppressed by the runner tracker.
+        """
         if not getattr(self.model, "supports_model_batch_hook", False):
             return
-        if getattr(forward_batch, "_model_batch_hook_prepared", False):
+        prepared = getattr(self, "_prepared_model_batch_refs", None)
+        if prepared is None:
+            prepared = self._prepared_model_batch_refs = {}
+        batch_id = id(forward_batch)
+        prior = prepared.get(batch_id)
+        if prior is not None and prior() is forward_batch:
             return
         hook = cast(ModelBatchHook, self.model)
         hook.prepare_model_batch(schedule_batch, forward_batch)
-        forward_batch._model_batch_hook_prepared = True
+        import weakref
+
+        def forget(reference, *, key=batch_id, refs=prepared):
+            if refs.get(key) is reference:
+                refs.pop(key, None)
+
+        try:
+            prepared[batch_id] = weakref.ref(forward_batch, forget)
+        except TypeError:
+            # Lightweight test doubles may not support weak references.
+            prepared[batch_id] = lambda value=forward_batch: value
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

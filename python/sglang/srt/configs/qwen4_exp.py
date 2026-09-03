@@ -4,6 +4,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+from sglang.srt.utils.ple_disk import resolve_ple_storage as resolve_ple_storage
 
 PLE_DISK_MAX_PREFILL_BUFFER_TOKENS = 65536
 PLE_DISK_DEFAULTS = {
@@ -18,9 +19,16 @@ PLE_DISK_DEFAULTS = {
 }
 
 
-def resolve_ple_storage(config, default=None):
-    storage = getattr(config, "ple_storage", None)
-    return storage if storage is not None else default
+def apply_ple_runtime_config(config, server_args, *, storage) -> None:
+    """Copy resolved Qwen4 PLE launch settings into its text config."""
+    text_config = getattr(config, "text_config", config)
+    text_config.ple_storage = storage
+    for name in PLE_DISK_DEFAULTS:
+        setattr(text_config, name, getattr(server_args, name))
+    chunk_tokens = int(server_args.chunked_prefill_size or 0)
+    text_config.ple_disk_max_prefill_chunk_tokens = (
+        chunk_tokens if chunk_tokens > 0 else int(server_args.max_prefill_tokens)
+    )
 
 
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):

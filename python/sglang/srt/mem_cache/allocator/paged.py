@@ -169,6 +169,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return out_indices
 
+    def is_slot_allocated(self, slot: int) -> bool:
+        page = slot // self.page_size
+        if slot < 0 or page >= self.num_pages:
+            return False
+        return not bool(
+            self.free_pages.eq(page).any().item()
+            or self.release_pages.eq(page).any().item()
+        )
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

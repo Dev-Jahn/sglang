@@ -31,6 +31,9 @@ class _FailingStorageModel(torch.nn.Module):
         self.events.append("close")
         raise OSError("rank-local close failure")
 
+    def resume_storage(self):
+        self.events.append("resume_storage")
+
 
 class _FailingResumeModel(torch.nn.Module):
     supports_storage_lifecycle_hook = True
@@ -115,7 +118,7 @@ def test_resume_failure_reaches_collectives_before_raising(monkeypatch):
             ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
         )
 
-    assert events == ["resume_storage", "all_reduce", "barrier"]
+    assert events == ["barrier", "resume_storage", "all_reduce", "barrier"]
     assert manager.stashed_model_static_state == {}
 
 
@@ -147,6 +150,59 @@ def test_peer_storage_failure_is_raised_after_barrier(monkeypatch):
         )
 
     assert events == ["operation", "all_reduce", "barrier"]
+
+
+def test_close_failure_preserves_state_for_a_later_resume(monkeypatch):
+    events = []
+    model = _FailingStorageModel(events)
+    adapter = SimpleNamespace(
+        pause=lambda tag: events.append("pause"),
+        resume=lambda tag: events.append("resume"),
+    )
+    manager = SchedulerWeightUpdaterManager(
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=model,
+                server_args=SimpleNamespace(weight_cache_mode="off"),
+            )
+        ),
+        draft_worker=None,
+        tp_cpu_group=object(),
+        memory_saver_adapter=adapter,
+        flush_cache=lambda **kwargs: True,
+        is_fully_idle=lambda: True,
+    )
+    monkeypatch.setattr(
+        weight_updater,
+        "_export_static_state",
+        lambda candidate: events.append("export") or {"saved": True},
+    )
+    monkeypatch.setattr(
+        weight_updater,
+        "_import_static_state",
+        lambda candidate, state: events.append(("import", state)),
+    )
+    monkeypatch.setattr(
+        weight_updater.torch.distributed, "all_reduce", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        weight_updater.torch.distributed,
+        "barrier",
+        lambda *args, **kwargs: events.append("barrier"),
+    )
+
+    with pytest.raises(OSError, match="rank-local close failure"):
+        manager.release_memory_occupation(
+            ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        )
+
+    assert manager.stashed_model_static_state == {"saved": True}
+    assert events == ["export", "close", "barrier"]
+    manager.resume_memory_occupation(
+        ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    )
+    assert ("import", {"saved": True}) in events
+    assert "resume_storage" in events
 
 
 if __name__ == "__main__":

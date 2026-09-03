@@ -35,6 +35,11 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     fprintf(stderr, "posix_memalign failed: %s\n", strerror(allocation_error));
     return 1;
   }
+  if (ple_fetcher_abi_version() != PLE_FETCHER_ABI_VERSION ||
+      ple_fetcher_lock_budget_ms() != PLE_FETCHER_LOCK_BUDGET_MS) {
+    fprintf(stderr, "fetcher ABI or lock budget mismatch\n");
+    goto done;
+  }
 
   int failure_stage = 0;
   errno = 0;
@@ -122,7 +127,7 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   /* The last allowed wake may make a completion visible. Reap it before
    * deciding that the no-progress budget is exhausted. */
   ple_fetcher_test_completion_on_last_wake(1);
-  ple_fetcher_test_successful_empty_wakes(PLE_FETCHER_MAX_WAITS);
+  ple_fetcher_test_successful_empty_wakes(PLE_FETCHER_READ_WAITS);
   rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
   if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
     fprintf(stderr, "completion on final wake check failed: %d\n", rc);
@@ -130,18 +135,20 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   }
 
   unsigned timeouts = 0;
-  for (unsigned index = 1; index < PLE_FETCHER_MAX_WAITS; ++index) {
+  for (unsigned index = 1; index < PLE_FETCHER_READ_WAITS; ++index) {
     if (!ple_fetcher_retry_after_timeout(&timeouts)) {
       fprintf(stderr, "timeout budget ended at %u\n", index);
       goto done;
     }
   }
-  if (ple_fetcher_retry_after_timeout(&timeouts) || (uint64_t)timeouts * PLE_FETCHER_WAIT_NS != 5000000000ULL) {
+  if (ple_fetcher_retry_after_timeout(&timeouts) ||
+      (uint64_t)(timeouts + PLE_FETCHER_QUIESCE_WAITS) * PLE_FETCHER_WAIT_NS >
+          (uint64_t)PLE_FETCHER_LOCK_BUDGET_MS * 1000000ULL) {
     fprintf(stderr, "timeout budget accounting failed: timeouts=%u\n", timeouts);
     goto done;
   }
 
-  ple_fetcher_test_stall_wakes(PLE_FETCHER_MAX_WAITS + 2);
+  ple_fetcher_test_stall_wakes(PLE_FETCHER_READ_WAITS + 2);
   rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
   if (rc != -ETIMEDOUT) {
     fprintf(stderr, "read-timeout quiesce returned %d instead of %d\n", rc, -ETIMEDOUT);
@@ -150,6 +157,20 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
   if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
     fprintf(stderr, "read after timeout quiesce failed: %d\n", rc);
+    goto done;
+  }
+
+  ple_fetcher_test_stall_wakes(PLE_FETCHER_READ_WAITS + 2);
+  rc = ple_fetcher_read(fetcher, &invalid_offset, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -ETIMEDOUT) {
+    fprintf(stderr, "late-error quiesce returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  failed_index = 99;
+  io_result = 99;
+  rc = ple_fetcher_last_error(fetcher, &failed_index, &io_result);
+  if (rc != 0) {
+    fprintf(stderr, "quiesce replaced last_error: rc=%d index=%u result=%d\n", rc, failed_index, io_result);
     goto done;
   }
 

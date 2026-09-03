@@ -72,6 +72,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def size_full(self) -> int:
         return self._size_full
 
+    def is_slot_allocated(self, slot: int) -> bool:
+        return self.logical_attn_allocator.is_slot_allocated(slot)
+
     @property
     def size(self) -> int:
         return self._size_full
@@ -332,6 +335,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def size_full(self) -> int:
         return self._size_full
+
+    def is_slot_allocated(self, slot: int) -> bool:
+        return self.logical_attn_allocator.is_slot_allocated(slot)
 
     @property
     def size(self) -> int:

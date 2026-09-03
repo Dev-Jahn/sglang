@@ -111,6 +111,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.ple_disk import resolve_model_runner_ple_storage
 from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
@@ -207,7 +208,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
-    supports_ple_disk_replay_hook = True
+    routes_model_replay_hook = True
 
     def __init__(
         self,
@@ -219,8 +220,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     ):
         super().__init__(model_runner)
 
-        hf_text_config = getattr(model_runner.model_config, "hf_text_config", None)
-        if getattr(hf_text_config, "ple_storage", None) == "disk":
+        if resolve_model_runner_ple_storage(model_runner, "gpu") == "disk":
             replay_model = resolve_language_model(model_runner.model)
             self._cuda_graph_replay_hook = cast("CudaGraphReplayHook", replay_model)
         else:
@@ -1405,7 +1405,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            replay_hook = getattr(self, "_cuda_graph_replay_hook", None)
+            replay_hook = self._cuda_graph_replay_hook
             try:
                 if replay_hook is not None:
                     padded_num_tokens = (
@@ -1424,6 +1424,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             forward_mode=self.capture_forward_mode,
                             batch_size=self.bs,
                             runtime_forward_batch=forward_batch,
+                            runner_graph_key=self._replay_graph_key,
                         )
                     )
                 if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():

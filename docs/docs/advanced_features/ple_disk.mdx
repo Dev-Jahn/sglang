@@ -47,6 +47,8 @@ python -m sglang.launch_server \
 
 This example starts with an empty static hot cache because it does not pass `--ple-disk-hot-frequency-file`. It uses the default 2 GiB dynamic cache budget.
 
+Dynamic-cache hit frequencies are updated synchronously with vectorized sketch operations. Miss admission and row installation use the bounded background queue.
+
 SGLang checks each 4 KiB image page against its stored CRC before using the rows. An incomplete install, older image format, or incompatible manifest produces an error that names the directory to delete before rebuilding.
 
 Disk mode keeps decode CUDA graphs enabled. It disables prefill CUDA graphs and sets both `--cuda-graph-backend-prefill disabled` and `--disable-prefill-cuda-graph`. An explicitly enabled prefill graph backend is rejected after JSON, convenience, and legacy graph options have been resolved.

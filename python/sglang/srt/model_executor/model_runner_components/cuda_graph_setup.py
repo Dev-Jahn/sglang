@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     log_info_on_rank0,
 )
+from sglang.srt.utils.ple_disk import resolve_model_runner_ple_storage
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -80,7 +81,9 @@ def _validate_ple_disk_cuda_graph_replay(
             "to expose supports_cuda_graph_replay_hook=True"
         )
     runner_cls = _decode_graph_runner_cls(model_runner)
-    if runner_cls.__dict__.get("supports_ple_disk_replay_hook", False) is not True:
+    # Require each concrete runner to opt in. Inheriting the flag is not enough
+    # because a subclass may bypass the constructor that wires the hook.
+    if runner_cls.__dict__.get("routes_model_replay_hook", False) is not True:
         raise RuntimeError(
             f"{runner_cls.__name__} is not approved for PLE disk CUDA graph replay; "
             "the runner must route replay through the PLE hook"
@@ -101,13 +104,12 @@ def _prewarm_model_cuda_graphs(
     if not (prefill_enabled or decode_enabled):
         return
 
+    ple_storage = resolve_model_runner_ple_storage(model_runner)
+    ple_offload_enabled = ple_storage in ("pinned", "disk")
+    if not ple_offload_enabled:
+        return
     language_model = resolve_language_model(model_runner.model)
     prewarm = getattr(language_model, "prewarm_cuda_graphs", None)
-    hf_text_config = getattr(
-        getattr(model_runner, "model_config", None), "hf_text_config", None
-    )
-    ple_storage = getattr(hf_text_config, "ple_storage", None)
-    ple_offload_enabled = ple_storage in ("pinned", "disk")
     if prewarm is None:
         if ple_offload_enabled:
             raise RuntimeError(
@@ -507,10 +509,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
         return no_capture
 
-    hf_text_config = getattr(
-        getattr(model_runner, "model_config", None), "hf_text_config", None
-    )
-    if getattr(hf_text_config, "ple_storage", None) == "disk":
+    if resolve_model_runner_ple_storage(model_runner, "gpu") == "disk":
         language_model = resolve_language_model(model_runner.model)
         _validate_ple_disk_cuda_graph_replay(model_runner, language_model)
 

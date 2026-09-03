@@ -258,13 +258,12 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
             model = self.tp_worker.model_runner.model
-
-            def release_weights() -> None:
-                if getattr(model, "supports_storage_lifecycle_hook", False):
-                    cast(StorageLifecycleHook, model).close()
-                self.stashed_model_static_state = _export_static_state(model)
-
-            self._run_tp_storage_operation(release_weights, "weight storage release")
+            self.stashed_model_static_state = _export_static_state(model)
+            if getattr(model, "supports_storage_lifecycle_hook", False):
+                self._run_tp_storage_operation(
+                    cast(StorageLifecycleHook, model).close,
+                    "weight storage release",
+                )
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
@@ -290,13 +289,13 @@ class SchedulerWeightUpdaterManager:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             model = self.tp_worker.model_runner.model
-
-            def resume_weights() -> None:
-                _import_static_state(model, self.stashed_model_static_state)
-                if getattr(model, "supports_storage_lifecycle_hook", False):
-                    cast(StorageLifecycleHook, model).resume_storage()
-
-            self._run_tp_storage_operation(resume_weights, "weight storage resume")
+            torch.distributed.barrier(group=self.tp_cpu_group)
+            _import_static_state(model, self.stashed_model_static_state)
+            if getattr(model, "supports_storage_lifecycle_hook", False):
+                self._run_tp_storage_operation(
+                    cast(StorageLifecycleHook, model).resume_storage,
+                    "weight storage resume",
+                )
             del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:

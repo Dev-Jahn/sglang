@@ -135,6 +135,47 @@ def split_ranks(
     return result
 
 
+def select_rows_by_rank(
+    counts: list[np.memmap],
+    metadata: PLEMetadata,
+    capacity: int,
+    total_rows: int,
+    tp_size: int,
+    divisor: int,
+) -> dict[int, np.ndarray]:
+    """Select an equal share of the total row budget within every TP rank."""
+    padded_rows = (total_rows + divisor - 1) // divisor * divisor
+    if padded_rows % tp_size:
+        raise ValueError(
+            f"padded PLE row count {padded_rows} is not divisible by TP={tp_size}"
+        )
+    rows_per_rank = padded_rows // tp_size
+    rank_capacity = capacity // tp_size
+    result = {}
+    for rank in range(tp_size):
+        start = rank * rows_per_rank
+        end = min(total_rows, start + rows_per_rank)
+        rank_ids = []
+        rank_frequencies = []
+        for array, offset in zip(counts, metadata.offsets):
+            local_start = max(0, start - int(offset))
+            local_end = min(array.size, end - int(offset))
+            if local_end <= local_start:
+                continue
+            window = array[local_start:local_end]
+            selected = np.flatnonzero(window)
+            rank_ids.append((selected + local_start + int(offset)).astype(np.uint32))
+            rank_frequencies.append(np.asarray(window[selected], dtype=np.uint64))
+        if not rank_ids:
+            result[rank] = np.empty(0, dtype=np.uint32)
+            continue
+        ids = np.concatenate(rank_ids)
+        frequencies = np.concatenate(rank_frequencies)
+        order = np.lexsort((ids, np.bitwise_not(frequencies)))[:rank_capacity]
+        result[rank] = ids[order]
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=Path, required=True)
@@ -163,11 +204,12 @@ def main() -> None:
     counts = open_counts(args.work_dir, metadata)
     token_count = count_rows(args.tokens, metadata, counts, args.chunk_tokens)
     capacity = int(args.budget_gib * (1 << 30) // ROW_BYTES)
-    ids, frequencies = select_rows(counts, metadata, capacity)
-    ranks = split_ranks(
-        ids,
-        frequencies,
-        int(metadata.vocab_sizes.sum()),
+    total_rows = int(metadata.vocab_sizes.sum())
+    ranks = select_rows_by_rank(
+        counts,
+        metadata,
+        capacity,
+        total_rows,
         args.tp_size,
         args.padding_divisor,
     )
@@ -175,7 +217,7 @@ def main() -> None:
         args.output,
         ranks,
         fingerprint=fingerprint,
-        total_rows=int(metadata.vocab_sizes.sum()),
+        total_rows=total_rows,
         tp_size=args.tp_size,
         padding_divisor=args.padding_divisor,
     )
@@ -183,7 +225,7 @@ def main() -> None:
         json.dumps(
             {
                 "tokens": token_count,
-                "selected_rows": int(ids.size),
+                "selected_rows": sum(int(values.size) for values in ranks.values()),
                 "per_rank": {
                     str(rank): int(values.size) for rank, values in ranks.items()
                 },

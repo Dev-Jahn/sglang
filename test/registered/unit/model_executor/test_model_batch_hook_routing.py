@@ -148,7 +148,7 @@ def test_prebuilt_extend_entry_skips_disk_lookahead_without_schedule_batch():
     assert layer._future_lookup_contexts is None
 
 
-def test_dllm_entry_prepares_the_model_batch(routed_batch):
+def test_dllm_helper_relies_on_the_generation_entry_preparation(routed_batch):
     events, forward_batch, runner = routed_batch
     algorithm = SimpleNamespace(
         fdfo=False,
@@ -164,7 +164,7 @@ def test_dllm_entry_prepares_the_model_batch(routed_batch):
 
     tp_worker.TpModelWorker._forward_batch_generation_dllm(worker, forward_batch, None)
 
-    assert ("prepare", None, forward_batch) in events
+    assert ("prepare", None, forward_batch) not in events
 
 
 def test_split_prefill_entry_prepares_later_chunks(routed_batch):

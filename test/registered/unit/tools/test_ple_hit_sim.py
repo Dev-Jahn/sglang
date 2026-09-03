@@ -204,6 +204,36 @@ def test_hit_sim_counting_records_each_head(tmp_path):
     assert counts[1].tolist() == [0, 3, 1]
 
 
+def test_hit_sim_fills_each_rank_from_its_share_of_a_skewed_corpus():
+    script = Path(__file__).resolve().parents[4] / "scripts/ple_disk/hit_sim.py"
+    spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_skew", script)
+    hit_sim = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(hit_sim)
+    metadata = PLEMetadata(
+        multipliers=np.array([3, 5, 7], dtype=np.int64),
+        vocab_sizes=np.array([4, 4], dtype=np.int64),
+        offsets=np.array([0, 4], dtype=np.int64),
+        eos_token_id=2,
+    )
+    counts = [
+        np.array([100, 90, 80, 70], dtype=np.uint64),
+        np.array([4, 3, 2, 1], dtype=np.uint64),
+    ]
+
+    ranks = hit_sim.select_rows_by_rank(
+        counts,
+        metadata,
+        capacity=4,
+        total_rows=8,
+        tp_size=2,
+        divisor=4,
+    )
+
+    assert ranks[0].tolist() == [0, 1]
+    assert ranks[1].tolist() == [4, 5]
+
+
 def test_hit_sim_selection_handles_a_large_peak_frequency():
     script = Path(__file__).resolve().parents[4] / "scripts/ple_disk/hit_sim.py"
     spec = importlib.util.spec_from_file_location("qwen4_ple_hit_sim_peak", script)

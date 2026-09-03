@@ -1213,6 +1213,7 @@ def multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
+        source = _checkpoint_source_identity(st_file)
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
@@ -1220,7 +1221,7 @@ def multi_thread_safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 result = {k: f.get_tensor(k) for k in f.keys()}
 
-        return st_file, result
+        return st_file, source, result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -1237,9 +1238,9 @@ def multi_thread_safetensors_weights_iterator(
             futures_iter = concurrent.futures.as_completed(futures)
 
         for future in futures_iter:
-            st_file, state_dict = future.result()
+            st_file, source, state_dict = future.result()
             for name, param in state_dict.items():
-                yield name, param
+                yield name, _set_checkpoint_source(param, source)
             del state_dict
             if drop_cache_after_load:
                 _drop_file_cache_after_load(st_file)
@@ -1268,13 +1269,14 @@ def buffered_multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
+        source = _checkpoint_source_identity(st_file)
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+        return source, result
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
@@ -1296,7 +1298,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
         ) as pbar:
             while pending:
                 st_file, future = pending.popleft()
-                state_dict = future.result()
+                source, state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
                 # Replenish: submit the next file to keep the buffer full.
@@ -1305,7 +1307,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     pending.append((next_file, executor.submit(_load_file, next_file)))
 
                 for name in sorted(state_dict.keys()):
-                    yield name, state_dict[name]
+                    yield name, _set_checkpoint_source(state_dict[name], source)
                 del state_dict
                 if drop_cache_after_load:
                     # DONTNEED reduces page-cache pressure after copying weights,

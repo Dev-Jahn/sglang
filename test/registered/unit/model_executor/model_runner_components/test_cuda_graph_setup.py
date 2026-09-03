@@ -1,8 +1,10 @@
+import inspect
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
+import torch
 
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -11,6 +13,26 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_cuda_graph_prewarm_ignores_a_transformer_only_model():
+    class TransformerOnlyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = torch.nn.Linear(2, 2)
+
+    runner = SimpleNamespace(
+        device="cuda",
+        model=TransformerOnlyModel(),
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="full"),
+                decode=SimpleNamespace(backend="full"),
+            )
+        ),
+    )
+
+    cuda_graph_setup._prewarm_model_cuda_graphs(runner, capture_decode_cuda_graph=True)
 
 
 def test_model_runner_can_override_decode_graph_runner(monkeypatch):
@@ -57,10 +79,11 @@ def test_cuda_graph_prewarm_delegates_to_the_language_model(monkeypatch):
         device="cuda",
         model=object(),
         server_args=SimpleNamespace(
+            ple_storage="pinned",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend="full"),
                 decode=SimpleNamespace(backend="piecewise"),
-            )
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -119,7 +142,7 @@ def test_disk_cuda_graph_requires_replay_hook_on_resolved_model():
             )
         ),
         _decode_cuda_graph_runner_cls=lambda: type(
-            "HookedRunner", (), {"supports_ple_disk_replay_hook": True}
+            "HookedRunner", (), {"routes_model_replay_hook": True}
         ),
     )
     with pytest.raises(RuntimeError, match="supports_cuda_graph_replay_hook"):
@@ -154,11 +177,33 @@ def test_disk_cuda_graph_rejects_unlisted_replay_runner():
         )
 
 
+def test_draft_runner_constructors_explicitly_disable_model_replay_hooks():
+    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+        EAGLEDraftCudaGraphRunner,
+    )
+    from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+        EAGLEDraftExtendCudaGraphRunner,
+    )
+    from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
+        FrozenKVMTPCudaGraphRunner,
+    )
+
+    for runner_cls in (
+        EAGLEDraftCudaGraphRunner,
+        EAGLEDraftExtendCudaGraphRunner,
+        FrozenKVMTPCudaGraphRunner,
+    ):
+        assert runner_cls.__dict__["routes_model_replay_hook"] is False
+        assert "self._cuda_graph_replay_hook = None" in inspect.getsource(
+            runner_cls.__init__
+        )
+
+
 def test_capture_decode_graph_uses_resolved_hook_model(monkeypatch):
     language_model = SimpleNamespace(supports_cuda_graph_replay_hook=True)
 
     class HookedRunner:
-        supports_ple_disk_replay_hook = True
+        routes_model_replay_hook = True
 
         def __init__(self, model_runner):
             self.model_runner = model_runner
@@ -207,10 +252,11 @@ def test_cuda_graph_prewarm_reaches_non_sm120_models(monkeypatch):
         device="cuda",
         model=SimpleNamespace(prewarm_cuda_graphs=prewarm),
         server_args=SimpleNamespace(
+            ple_storage="pinned",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend="full"),
                 decode=SimpleNamespace(backend="piecewise"),
-            )
+            ),
         ),
     )
     monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", lambda model: model)
@@ -229,10 +275,11 @@ def test_cuda_graph_prewarm_reaches_sm121_models(monkeypatch):
         device="cuda",
         model=SimpleNamespace(prewarm_cuda_graphs=prewarm),
         server_args=SimpleNamespace(
+            ple_storage="pinned",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend="full"),
                 decode=SimpleNamespace(backend="piecewise"),
-            )
+            ),
         ),
     )
     monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", lambda model: model)

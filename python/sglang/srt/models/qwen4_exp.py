@@ -64,7 +64,11 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
-from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner import (
+    get_capture_dsa_variant,
+    get_capture_lora_variant,
+    get_is_capture_mode,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     _is_stream_capturing,
 )
@@ -174,14 +178,22 @@ def _ple_graph_key(
     batch: Optional[_PLEBatch],
     forward_batch: Optional[ForwardBatch],
     lookup_tokens: int,
-) -> Tuple[ForwardMode, int]:
+    *,
+    runner_graph_key: Optional[Any] = None,
+) -> Tuple[ForwardMode, int, Optional[str], Optional[str]]:
     if batch is not None:
         mode = batch.mode
     elif forward_batch is not None:
         mode = _get_ple_forward_mode(forward_batch)
     else:
         raise RuntimeError("PLE graph key requires a batch or forward mode")
-    return mode, lookup_tokens
+    if runner_graph_key is None:
+        lora_variant = get_capture_lora_variant()
+        dsa_variant = get_capture_dsa_variant()
+    else:
+        lora_variant = getattr(runner_graph_key, "variant_label", None)
+        dsa_variant = getattr(runner_graph_key, "dsa_variant", None)
+    return mode, lookup_tokens, lora_variant, dsa_variant
 
 
 def _prepare_ple_batch(
@@ -634,7 +646,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             seed=int(getattr(self.config, "seed", 1234)),
             ple_layer_index=self.ple_layer_index,
         )
-        return torch.from_numpy(values)
+        return torch.tensor(values, dtype=torch.long)
 
     @staticmethod
     def _find_nth_prime_after(start: int, n: int) -> int:
@@ -1373,6 +1385,10 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         if self._future is not None:
             raise RuntimeError("previous PLE disk fetch was not consumed")
         expected_shape = (*input_ids.shape, self.embedding_dim)
+        if _is_ple_cuda_graph_capturing() and out is None:
+            raise RuntimeError(
+                "PLE disk graph capture requires a preallocated output buffer"
+            )
         output = (
             out
             if out is not None
@@ -1573,7 +1589,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
 
         if self._image_builder is not None:
             self._image_builder.close()
-        self._image_builder = PLEImageBuilder(**self._builder_args)
+        self._image_builder = PLEImageBuilder(**self._builder_args, allow_reuse=False)
         self._weight_reload_pending = False
 
     @property
@@ -1908,11 +1924,13 @@ class Qwen4ExpPLELayer(nn.Module):
         self,
         lookup_tokens: int,
         lookup_ids: torch.Tensor,
-        graph_key: Optional[Tuple[ForwardMode, int]] = None,
+        graph_key: Optional[
+            Tuple[ForwardMode, int, Optional[str], Optional[str]]
+        ] = None,
     ) -> torch.Tensor:
         if self._is_capturing():
             if graph_key is None:
-                graph_key = (ForwardMode.DECODE, lookup_tokens)
+                graph_key = (ForwardMode.DECODE, lookup_tokens, None, None)
             return self._select_graph_prefetch_buffer(graph_key, allocate=True)
 
         buffer = self._eager_prefetch_buffer
@@ -1923,11 +1941,11 @@ class Qwen4ExpPLELayer(nn.Module):
 
     def _select_graph_prefetch_buffer(
         self,
-        graph_key: Tuple[ForwardMode, int],
+        graph_key: Tuple[ForwardMode, int, Optional[str], Optional[str]],
         *,
         allocate: bool = False,
     ) -> torch.Tensor:
-        _, lookup_tokens = graph_key
+        _, lookup_tokens, *_ = graph_key
         if self._graph_prefetch_buffer is not None:
             if not allocate and graph_key not in self._graph_lookup_id_buffers:
                 raise RuntimeError(
@@ -2009,6 +2027,11 @@ class Qwen4ExpPLELayer(nn.Module):
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
 
         if capturing_disk:
+            if graph_key in self._graph_lookup_id_buffers:
+                raise RuntimeError(
+                    "PLE graph capture key is already owned by another graph: "
+                    f"{graph_key}"
+                )
             self._graph_lookup_id_buffers[graph_key] = lookup_ids
             self._graph_lookup_validation_due.add(graph_key)
             offloaded_embedding.gather(lookup_ids, out=output_view)
@@ -2053,7 +2076,9 @@ class Qwen4ExpPLELayer(nn.Module):
         self._future_lookup_contexts = contexts
 
     def _graph_lookup_validation_required(
-        self, graph_key: Tuple[ForwardMode, int], replay_step: int
+        self,
+        graph_key: Tuple[ForwardMode, int, Optional[str], Optional[str]],
+        replay_step: int,
     ) -> bool:
         interval = self._graph_lookup_validation_interval
         if interval < 0:
@@ -2070,7 +2095,9 @@ class Qwen4ExpPLELayer(nn.Module):
         self,
         batch: Optional[_PLEBatch],
         lookup_ids: Optional[torch.Tensor],
-        graph_key: Optional[Tuple[ForwardMode, int]] = None,
+        graph_key: Optional[
+            Tuple[ForwardMode, int, Optional[str], Optional[str]]
+        ] = None,
     ) -> None:
         offloaded_embedding = self.ple_embedding.ngram_embedding
         if not isinstance(offloaded_embedding, Qwen4ExpDiskEmbedding):
@@ -2244,7 +2271,7 @@ class Qwen4ExpPLELayer(nn.Module):
                     self, "_graph_replay_capture_expected_key", None
                 )
                 if capture_expected_key is not None:
-                    mode, lookup_tokens = capture_expected_key
+                    mode, lookup_tokens, *_ = capture_expected_key
                     raise RuntimeError(
                         "PLE disk graph replay did not stage its captured buffer "
                         f"for {mode.name} with {lookup_tokens} lookup tokens"
@@ -2351,6 +2378,8 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is not None:
             embeddings = self._consume_prefetched_embeddings(forward_batch)
         else:
+            if isinstance(self.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
+                raise RuntimeError("PLE disk forward requires prefetched embeddings")
             embeddings = self.ple_embedding(batch, forward_batch)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
@@ -2912,7 +2941,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         replay.runtime_forward_batch,
                         batch.physical_tokens,
                     )
-                    ple.prepare_cuda_graph_replay(batch, lookup_ids)
+                    graph_key = _ple_graph_key(
+                        batch,
+                        None,
+                        lookup_ids.shape[0],
+                        runner_graph_key=replay.runner_graph_key,
+                    )
+                    ple.prepare_cuda_graph_replay(batch, lookup_ids, graph_key)
                 else:
                     lookup_tokens = (
                         replay.runtime_forward_batch.global_dp_buffer_len
@@ -2922,6 +2957,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         None,
                         replay.runtime_forward_batch,
                         lookup_tokens,
+                        runner_graph_key=replay.runner_graph_key,
                     )
                     ple.prepare_cuda_graph_replay(None, None, graph_key)
         except BaseException:

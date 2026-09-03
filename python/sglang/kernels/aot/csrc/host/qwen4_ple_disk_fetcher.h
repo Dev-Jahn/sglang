@@ -5,19 +5,25 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define PLE_FETCHER_ABI_VERSION 1U
 #define PLE_FETCHER_WAIT_NS 100000000L
-#define PLE_FETCHER_MAX_WAITS 50U
+#define PLE_FETCHER_TOTAL_READ_WAITS 50U
+#define PLE_FETCHER_QUIESCE_WAITS 10U
+#define PLE_FETCHER_READ_WAITS (PLE_FETCHER_TOTAL_READ_WAITS - PLE_FETCHER_QUIESCE_WAITS)
+#define PLE_FETCHER_LOCK_BUDGET_MS ((PLE_FETCHER_TOTAL_READ_WAITS * PLE_FETCHER_WAIT_NS) / 1000000U + 500U)
 #define PLE_FETCHER_DESTROY_BUSY_WAITS 5000U
 /* The destroy drain waits at most 50 times for 100 ms, about five seconds. */
 #define PLE_FETCHER_DESTROY_DRAIN_WAITS 50U
 
 static inline int ple_fetcher_retry_after_timeout(unsigned* timeouts) {
   ++*timeouts;
-  return *timeouts < PLE_FETCHER_MAX_WAITS;
+  return *timeouts < PLE_FETCHER_READ_WAITS;
 }
 
 /* Calls on a handle must be externally serialized. A single caller owns the
  * handle, and no read or last_error call may be in flight during destroy. */
+unsigned ple_fetcher_abi_version(void);
+unsigned ple_fetcher_lock_budget_ms(void);
 void* ple_fetcher_create(
     int file_fd, void* buffer, size_t buffer_bytes, unsigned max_pages, int register_buffer, int* failure_stage);
 int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void* buffer, size_t buffer_bytes);

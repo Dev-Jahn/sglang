@@ -1360,7 +1360,10 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     neither that nor --disable-radix-cache holds (the QSA pool then fails
     fast at boot).
     """
-    from sglang.srt.configs.qwen4_exp import resolve_ple_storage
+    from sglang.srt.configs.qwen4_exp import (
+        apply_ple_runtime_config,
+        resolve_ple_storage,
+    )
 
     overrides: Dict[str, Any] = {}
     ple_storage = resolve_ple_storage(server_args)
@@ -1372,9 +1375,12 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         )
         overrides["ple_storage"] = "pinned" if use_pinned else "gpu"
 
+    resolved_storage = overrides.get("ple_storage", ple_storage)
+    apply_ple_runtime_config(hf_config, server_args, storage=resolved_storage)
+
     text_config = getattr(hf_config, "text_config", hf_config)
     if (
-        ple_storage == "disk"
+        resolved_storage == "disk"
         and getattr(text_config, "ple_embedding_dtype", None) != "float8_e4m3fn"
     ):
         raise ValueError(

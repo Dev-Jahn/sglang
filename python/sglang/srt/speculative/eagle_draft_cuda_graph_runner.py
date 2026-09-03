@@ -89,6 +89,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     the parent's capture() / backend contract is satisfied.
     """
 
+    routes_model_replay_hook = False
+
     def __init__(
         self,
         eagle_worker: EagleDraftWorker,
@@ -103,6 +105,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.model_runner = model_runner = eagle_worker.draft_runner
         else:
             self.model_runner = model_runner = eagle_worker.model_runner
+        # Draft weights have no storage replay hook.
+        self._cuda_graph_replay_hook = None
 
         # Fields the parent's capture() reads:
         self.device = model_runner.device

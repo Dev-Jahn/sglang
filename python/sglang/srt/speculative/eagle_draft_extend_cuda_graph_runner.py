@@ -78,6 +78,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     replay, can_run_graph for EAGLE-specific draft-extend semantics.
     """
 
+    routes_model_replay_hook = False
+
     def __init__(
         self,
         eagle_worker: EagleDraftWorker,
@@ -88,6 +90,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.draft_runner
+        # Draft weights have no storage replay hook.
+        self._cuda_graph_replay_hook = None
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:

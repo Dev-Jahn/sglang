@@ -60,9 +60,7 @@ def require_ple_direct_io(tmp_path_factory):
             errno.EPERM,
             errno.EACCES,
             errno.ENOSYS,
-            errno.EINVAL,
             errno.EOPNOTSUPP,
-            errno.ENOMEM,
         }:
             reason = f"PLE io_uring or O_DIRECT is unavailable: {exc}"
             # Self-hosted runner operators may enable this after confirming the

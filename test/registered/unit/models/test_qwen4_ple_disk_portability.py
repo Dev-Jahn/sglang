@@ -12,6 +12,7 @@ import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 import numpy as np
 import pytest
@@ -223,28 +224,86 @@ def test_disk_decode_masks_padding_when_fusion_is_disabled(monkeypatch):
     assert batch.valid_tokens.tolist() == [True, False]
 
 
-def test_disk_padding_slot_must_be_absent_from_allocator_free_lists():
+def test_disk_padding_slot_uses_each_real_allocator_contract():
     from sglang.srt.mem_cache.allocator.base import allocator_reserves_token_slot
+    from sglang.srt.mem_cache.allocator.hisparse import (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        HiSparseTokenToKVPoolAllocator,
+    )
+    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+    from sglang.srt.mem_cache.multi_ended_allocator import (
+        MultiEndedAllocator,
+        UnifiedMambaTokenToKVPoolAllocator,
+        UnifiedSWATokenToKVPoolAllocator,
+    )
 
-    valid = SimpleNamespace(
-        free_pages=torch.tensor([1, 2]),
-        release_pages=torch.tensor([], dtype=torch.long),
-    )
-    invalid = SimpleNamespace(
-        free_pages=torch.tensor([0, 1]),
-        release_pages=torch.tensor([], dtype=torch.long),
-    )
+    token = TokenToKVPoolAllocator(8, torch.bfloat16, "cpu", None, False)
+    paged = PagedTokenToKVPoolAllocator(8, 2, torch.bfloat16, "cpu", None, False)
+    multi = MultiEndedAllocator.__new__(MultiEndedAllocator)
+    multi.page_size = 2
+    multi.num_pages = 4
+    multi.virtual_to_physical = torch.tensor([0, -1, -1, -1])
 
-    assert allocator_reserves_token_slot(valid, 0)
-    unified_valid = SimpleNamespace(
-        full_attn_allocator=SimpleNamespace(free_virtual_ids=torch.tensor([1, 2])),
+    swa = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
+    swa.full_attn_allocator = token
+    hisparse = HiSparseTokenToKVPoolAllocator.__new__(HiSparseTokenToKVPoolAllocator)
+    hisparse.logical_attn_allocator = paged
+    deepseek_hisparse = DeepSeekV4HiSparseTokenToKVPoolAllocator.__new__(
+        DeepSeekV4HiSparseTokenToKVPoolAllocator
     )
-    unified_invalid = SimpleNamespace(
-        full_attn_allocator=SimpleNamespace(free_virtual_ids=torch.tensor([0, 1])),
+    deepseek_hisparse.logical_attn_allocator = paged
+    unified_mamba = UnifiedMambaTokenToKVPoolAllocator.__new__(
+        UnifiedMambaTokenToKVPoolAllocator
     )
-    assert allocator_reserves_token_slot(unified_valid, 0)
-    assert not allocator_reserves_token_slot(unified_invalid, 0)
-    assert not allocator_reserves_token_slot(invalid, 0)
+    unified_mamba.full_attn_allocator = multi
+    unified_swa = UnifiedSWATokenToKVPoolAllocator.__new__(
+        UnifiedSWATokenToKVPoolAllocator
+    )
+    unified_swa.full_attn_allocator = multi
+
+    for allocator in (
+        token,
+        paged,
+        multi,
+        swa,
+        hisparse,
+        deepseek_hisparse,
+        unified_mamba,
+        unified_swa,
+    ):
+        assert allocator_reserves_token_slot(allocator, 0)
+
+    token.free_pages = torch.tensor([0, 1])
+    assert not allocator_reserves_token_slot(token, 0)
+
+
+def test_layer_multipliers_follow_the_default_device_context():
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(module)
+    module.unigram_vocab_size = 32
+    module.config = SimpleNamespace(seed=1234)
+    module.ple_layer_index = 0
+
+    with torch.device("meta"):
+        multipliers = module._build_layer_multipliers(3)
+        offsets = torch.tensor([0, 11], dtype=torch.long)
+
+    assert multipliers.device == offsets.device
+    assert multipliers.dtype == torch.long
+
+
+def test_fused_hash_capability_accepts_cuda_resident_contract():
+    from sglang.kernels.ops.qwen4_ple import can_fuse_qwen4_ngram_hash
+
+    contexts = torch.zeros((2, 3), dtype=torch.long)
+    multipliers = torch.ones(3, dtype=torch.long)
+    vocab_sizes = torch.ones(16, dtype=torch.long)
+    offsets = torch.zeros(16, dtype=torch.long)
+    with patch.object(torch.Tensor, "is_cuda", new_callable=PropertyMock) as is_cuda:
+        is_cuda.return_value = True
+        assert can_fuse_qwen4_ngram_hash(contexts, multipliers, vocab_sizes, offsets)
 
 
 def test_checkpoint_ple_offload_embedding_maps_to_storage_with_warning():
@@ -296,16 +355,20 @@ class _FakeFetcherLibrary:
         failure_stage=0,
         read_results=(),
         last_error=None,
+        abi_version=disk.PLE_FETCHER_ABI_VERSION,
     ):
         self.image_bytes = image_bytes
         self.create_errno = create_errno
         self.failure_stage = failure_stage
         self.read_results = iter(read_results)
         self.last_error = last_error
+        self.abi_version = abi_version
         self.create_args = None
         self.read_buffer = None
         self.read_buffer_bytes = None
         self.ple_fetcher_create = _FakeFunction(self._create)
+        self.ple_fetcher_abi_version = _FakeFunction(lambda: self.abi_version)
+        self.ple_fetcher_lock_budget_ms = _FakeFunction(lambda: 5500)
         self.ple_fetcher_read = _FakeFunction(self._read)
         self.ple_fetcher_last_error = _FakeFunction(self._last_error)
         self.ple_fetcher_destroy = _FakeFunction(lambda handle: 0)
@@ -596,6 +659,7 @@ def test_native_short_read_keeps_later_reads_quiescent(tmp_path, monkeypatch):
             "requires sglang-kernel" in message
             or "qwen4_ple_disk_fetcher" in message
             or "io_uring support" in message
+            or "required ABI version symbol" in message
         ):
             pytest.skip(str(exc))
         raise
@@ -677,8 +741,8 @@ def test_locked_pages_returns_the_crc_checked_staging_view(tmp_path, monkeypatch
 def test_direct_reader_waits_for_a_concurrent_caller_with_a_budget(monkeypatch):
     reader = disk.DirectPageReader.__new__(disk.DirectPageReader)
     reader._read_lock = threading.Lock()
+    reader._read_lock_timeout_seconds = 0.01
     reader.max_pages = 1
-    monkeypatch.setattr(disk, "DIRECT_READER_LOCK_TIMEOUT_SECONDS", 0.01)
     reader._read_lock.acquire()
     try:
         with pytest.raises(TimeoutError, match="timed out waiting"):
@@ -686,6 +750,17 @@ def test_direct_reader_waits_for_a_concurrent_caller_with_a_budget(monkeypatch):
                 pass
     finally:
         reader._read_lock.release()
+
+
+def test_direct_reader_rejects_a_fetcher_abi_mismatch(tmp_path, monkeypatch):
+    image = disk.build_test_image(tmp_path, _fp8_rows(25))
+    _patch_fetcher_library(monkeypatch, image, abi_version=0)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+
+    with pytest.raises(RuntimeError, match="ABI mismatch: expected 1, found 0"):
+        disk.DirectPageReader(image, max_pages=1)
 
 
 def test_installed_fetcher_create_rejects_an_invalid_buffer():
@@ -855,7 +930,7 @@ def test_manifest_from_newer_install_rejects_older_image(tmp_path):
         disk.PLEImageBuilder(tmp_path, "torn-install", 0, 1, 0, 25)
 
 
-def test_manifest_source_identity_controls_reuse(tmp_path):
+def test_manifest_source_identity_controls_reuse(tmp_path, caplog):
     source = tmp_path / "checkpoint.safetensors"
     source.write_bytes(b"checkpoint-v1")
     rows = _fp8_rows(25)
@@ -871,7 +946,7 @@ def test_manifest_source_identity_controls_reuse(tmp_path):
 
     first = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
     first.add_shard("shard", set_source_identity(rows), 0, 25)
-    _, reused, _ = first.finalize(0.5)
+    first_image, reused, _ = first.finalize(0.5)
     assert not reused
 
     same = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
@@ -882,9 +957,12 @@ def test_manifest_source_identity_controls_reuse(tmp_path):
     stat = source.stat()
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
     touched = disk.PLEImageBuilder(tmp_path, "source-identity", 0, 1, 0, 25)
-    touched.add_shard("shard", set_source_identity(rows), 0, 25)
-    with pytest.raises(ValueError, match="manifest mismatch.*delete"):
-        touched.finalize(0.5)
+    with caplog.at_level("WARNING"):
+        touched.add_shard("shard", set_source_identity(rows), 0, 25)
+    touched_image, reused, _ = touched.finalize(0.5)
+    assert not reused
+    assert touched_image.path == first_image.path
+    assert "identity changed" in caplog.text
 
 
 def test_missing_checkpoint_source_identity_warns_once(tmp_path, monkeypatch, caplog):
@@ -1352,14 +1430,17 @@ def test_busy_reader_gc_retains_registered_staging(tmp_path, monkeypatch, caplog
     retained = []
     monkeypatch.setattr(disk, "_RETAINED_POISONED_STAGING", retained)
     reader = disk.DirectPageReader(image, max_pages=1)
+    fd = reader.fd
     staging = reader._staging_allocation
     reader.lib.ple_fetcher_destroy = _FakeFunction(lambda handle: -errno.EBUSY)
 
     with caplog.at_level("ERROR"):
-        reader.__del__()
+        del reader
+        gc.collect()
 
     assert retained == [staging]
     assert "garbage collection" in caplog.text
+    os.close(fd)
 
 
 def test_disk_fetcher_calls_raise_after_close():
@@ -2197,6 +2278,66 @@ def test_weight_reload_builds_replacement_while_live_image_serves(monkeypatch):
     assert created[0].shards[0][0] == "shard_0.weight"
 
 
+def test_real_builder_weight_reload_replaces_the_reusable_image(tmp_path):
+    rows = _fp8_rows(25)
+    builder_args = {
+        "root": tmp_path,
+        "config_sha256": "real-reload",
+        "rank": 0,
+        "tp_size": 1,
+        "vocab_start": 0,
+        "vocab_end": 25,
+    }
+    first = disk.PLEImageBuilder(**builder_args)
+    first.add_shard("shard_0.weight", rows, 0, 25)
+    old_image, _, _ = first.finalize(0.5)
+
+    class Fetcher:
+        def __init__(self):
+            self.closed = False
+            self.hot = SimpleNamespace(
+                rows=torch.empty(0, dtype=torch.uint8),
+                bitmap=np.empty(0, dtype=np.uint64),
+                rank_prefix=np.empty(0, dtype=np.uint32),
+            )
+            self.reader = SimpleNamespace(staging=torch.empty(0, dtype=torch.uint8))
+            self.dynamic = SimpleNamespace(rows=torch.empty(0, dtype=torch.uint8))
+            self._prefill_slots = []
+
+        def close(self):
+            self.closed = True
+
+    old_fetcher = Fetcher()
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._weight_reload_pending = False
+    embedding._image_builder = None
+    embedding._builder_args = builder_args
+    embedding._image = old_image
+    embedding._fetcher = old_fetcher
+    embedding._build_fetcher = lambda image: Fetcher()
+    embedding.weight_scale = torch.tensor(0.5)
+    embedding._rank = 0
+    embedding._hot_frequency_file = None
+    embedding._hot_cache_gb = 0.0
+
+    changed = rows.clone().view(torch.uint8)
+    changed[0, 0] = (changed[0, 0] + 1) % 0x7F
+    changed = changed.view(torch.float8_e4m3fn)
+    embedding.prepare_weight_reload()
+    embedding.add_checkpoint_shard("shard_0.weight", changed, 0, 25)
+    embedding.finalize_image()
+
+    assert embedding._image.path != old_image.path
+    assert old_fetcher.closed
+    assert list(tmp_path.glob("*/rank0.bin")) == [embedding._image.path]
+    startup = disk.PLEImageBuilder(**builder_args)
+    try:
+        assert startup._reuse.path == embedding._image.path
+    finally:
+        startup.close()
+
+
 def test_failed_weight_reload_keeps_the_previous_image_serving(monkeypatch):
     class Builder:
         def __init__(self, **kwargs):
@@ -2402,24 +2543,29 @@ def test_old_image_format_requests_rebuild(tmp_path):
         disk.PLEImageBuilder(tmp_path, "old", 0, 1, 0, 25)
 
 
-def test_weight_scale_stale_image_is_still_rejected(tmp_path):
+def test_weight_scale_change_rebuilds_the_image(tmp_path, caplog):
     rows = _fp8_rows(25)
     disk.build_test_image(tmp_path, rows, config_sha256="scale", weight_scale=0.25)
     builder = disk.PLEImageBuilder(tmp_path, "scale", 0, 1, 0, 25)
     builder.add_shard("test.shard_0.weight", rows, 0, 25)
-    with pytest.raises(ValueError, match="weight_scale mismatch.*delete"):
-        builder.finalize(0.5)
+    with caplog.at_level("WARNING"):
+        image, reused, _ = builder.finalize(0.5)
+    assert not reused
+    assert image.header["weight_scale"] == 0.5
+    assert "scale changed" in caplog.text
 
 
-def test_sampled_payload_change_rejects_same_shape_reuse(tmp_path):
+def test_sampled_payload_change_rebuilds_same_shape_image(tmp_path, caplog):
     rows = _fp8_rows(25)
     disk.build_test_image(tmp_path, rows, config_sha256="payload", weight_scale=0.5)
     changed = rows.view(torch.uint8).clone()
     changed[12, 7] ^= 1
     builder = disk.PLEImageBuilder(tmp_path, "payload", 0, 1, 0, 25)
     builder.add_shard("test.shard_0.weight", changed.view(torch.float8_e4m3fn), 0, 25)
-    with pytest.raises(ValueError, match="manifest mismatch.*delete"):
-        builder.finalize(0.5)
+    with caplog.at_level("WARNING"):
+        _, reused, _ = builder.finalize(0.5)
+    assert not reused
+    assert "identity changed" in caplog.text
 
 
 def test_unregistered_staging_reads_with_the_same_pointer(tmp_path, monkeypatch):
@@ -2486,9 +2632,8 @@ def test_disk_gather_uses_the_driver_capture_predicate(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(qwen4_exp_module, "_is_stream_capturing", lambda stream: True)
 
-    output = embedding.gather(torch.tensor([0], dtype=torch.long))
-
-    assert output.shape == (1, 4)
+    with pytest.raises(RuntimeError, match="requires a preallocated output"):
+        embedding.gather(torch.tensor([0], dtype=torch.long))
 
 
 if __name__ == "__main__":

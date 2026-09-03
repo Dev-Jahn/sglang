@@ -23,11 +23,13 @@ Reuses ut_parse_one_file() from ci_register.py (AST-based parsing)
 to match the same logic used by run_suite.py's collect_tests().
 """
 
+import ast
 import glob
 import importlib.util
 import os
 import re
 import sys
+from pathlib import Path
 
 # Suite names of the form `{stage}-test-{runner_config}` are exactly what the
 # modern stage=/runner_config= form produces, so a legacy suite= carrying this
@@ -38,6 +40,56 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # form. Anything else needs stage=/runner_config=, or its effective_suite matches
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
+
+
+def _defines_testcase(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            if any("TestCase" in ast.unparse(base) for base in node.bases):
+                return True
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "type"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Tuple)
+            and any("TestCase" in ast.unparse(base) for base in node.args[1].elts)
+        ):
+            return True
+    return False
+
+
+def _main_runs_test_framework(tree: ast.Module) -> tuple[bool, bool]:
+    has_main = False
+    runs_tests = False
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "__name__"
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == "__main__"
+        ):
+            continue
+        has_main = True
+        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if not isinstance(child, ast.Call) or not isinstance(
+                child.func, ast.Attribute
+            ):
+                continue
+            if (
+                child.func.attr == "main"
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id in ("pytest", "unittest")
+            ):
+                runs_tests = True
+    return has_main, runs_tests
 
 
 def main() -> int:
@@ -65,14 +117,18 @@ def main() -> int:
     dead_tests = []  # (file) -- enabled registered files with no test entry point
     for f in files:
         try:
-            registries, has_main_entry = ci_register.ut_parse_one_file(f)
+            registries, _ = ci_register.ut_parse_one_file(f)
+            tree = ast.parse(Path(f).read_text(encoding="utf-8"), filename=f)
+            has_main_block, runs_tests = _main_runs_test_framework(tree)
         except Exception:
             # Skip files that can't be parsed (syntax errors, etc.)
             continue
         if len(registries) == 0:
             missing.append(f)
             continue
-        if any(r.disabled is None for r in registries) and not has_main_entry:
+        if any(r.disabled is None for r in registries) and (
+            not has_main_block or (_defines_testcase(tree) and not runs_tests)
+        ):
             dead_tests.append(f)
         for r in registries:
             # Pure legacy form on a CUDA registry: suite set, stage/runner unset.

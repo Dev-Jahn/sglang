@@ -120,5 +120,29 @@ def test_safetensors_loader_attaches_source_identity(tmp_path, disable_mmap):
     }
 
 
+def test_all_standard_safetensors_iterators_attach_source_identity(tmp_path):
+    source = tmp_path / "checkpoint.safetensors"
+    safetensors.torch.save_file({"weight": torch.arange(4)}, source)
+    iterators = (
+        weight_utils.safetensors_weights_iterator([str(source)]),
+        weight_utils.multi_thread_safetensors_weights_iterator(
+            [str(source)], max_workers=1
+        ),
+        weight_utils.buffered_multi_thread_safetensors_weights_iterator(
+            [str(source)], max_workers=1
+        ),
+    )
+    expected = {
+        "file": source.name,
+        "size": source.stat().st_size,
+        "mtime_ns": source.stat().st_mtime_ns,
+    }
+
+    for iterator in iterators:
+        name, tensor = next(iterator)
+        assert name == "weight"
+        assert tensor._sglang_checkpoint_source == expected
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

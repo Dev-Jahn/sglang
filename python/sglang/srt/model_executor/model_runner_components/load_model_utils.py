@@ -13,7 +13,6 @@ import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.qwen4_exp import resolve_ple_storage
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -28,6 +27,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.ple_disk import resolve_ple_storage
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -278,43 +278,6 @@ def load_model_with_memory_saver(
 ) -> LoadedModel:
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
-
-    if not is_draft_worker:
-        architectures = model_config.hf_config.architectures or []
-        is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
-        ple_storage = resolve_ple_storage(server_args)
-        if ple_storage not in (None, "gpu") and not is_qwen4_exp:
-            raise ValueError(
-                f"--ple-storage {ple_storage} only supports "
-                "Qwen4ExpForConditionalGeneration"
-            )
-        if is_qwen4_exp:
-            model_config.hf_text_config.ple_storage = ple_storage
-            model_config.hf_text_config.ple_disk_dir = server_args.ple_disk_dir
-            model_config.hf_text_config.ple_disk_hot_cache_gb = (
-                server_args.ple_disk_hot_cache_gb
-            )
-            model_config.hf_text_config.ple_disk_hot_frequency_file = (
-                server_args.ple_disk_hot_frequency_file
-            )
-            model_config.hf_text_config.ple_disk_dynamic_cache_gb = (
-                server_args.ple_disk_dynamic_cache_gb
-            )
-            model_config.hf_text_config.ple_disk_prefill_buffer_tokens = (
-                server_args.ple_disk_prefill_buffer_tokens
-            )
-            model_config.hf_text_config.ple_disk_prefill_read_pages = (
-                server_args.ple_disk_prefill_read_pages
-            )
-            model_config.hf_text_config.ple_disk_max_read_pages = (
-                server_args.ple_disk_max_read_pages
-            )
-            model_config.hf_text_config.ple_disk_stats_log_interval = (
-                server_args.ple_disk_stats_log_interval
-            )
-            model_config.hf_text_config.ple_disk_max_prefill_chunk_tokens = max(
-                0, int(server_args.chunked_prefill_size or 0)
-            )
 
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup

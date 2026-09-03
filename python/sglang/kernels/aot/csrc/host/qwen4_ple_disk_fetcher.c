@@ -46,6 +46,14 @@ enum fetcher_failure_stage {
   FETCHER_FAILURE_REGISTER_FILE = 3,
 };
 
+unsigned ple_fetcher_abi_version(void) {
+  return PLE_FETCHER_ABI_VERSION;
+}
+
+unsigned ple_fetcher_lock_budget_ms(void) {
+  return PLE_FETCHER_LOCK_BUDGET_MS;
+}
+
 static long setup(unsigned entries, struct io_uring_params* p) {
   return syscall(__NR_io_uring_setup, entries, p);
 }
@@ -174,7 +182,7 @@ fail: {
 }
 }
 
-static unsigned reap_available(struct fetcher* f, unsigned limit, int* result) {
+static unsigned reap_available(struct fetcher* f, unsigned limit, int* result, int record_detail) {
 #ifdef PLE_FETCHER_TESTING
   extern int ple_test_stall_completion;
   extern unsigned ple_test_stall_wakes;
@@ -190,7 +198,7 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result) {
     struct io_uring_cqe* cqe = &f->cqes[head & *f->cq_mask];
     if (cqe->res != 4096 && *result == 0) {
       *result = cqe->res < 0 ? cqe->res : -EIO;
-      if (!f->has_last_error) {
+      if (record_detail && !f->has_last_error) {
         f->has_last_error = 1;
         f->last_error_index = (unsigned)cqe->user_data;
         f->last_error_result = cqe->res;
@@ -210,7 +218,7 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result) {
 static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned* waits, unsigned max_waits) {
   unsigned completed = 0;
   while (completed < count) {
-    unsigned reaped = reap_available(f, count - completed, result);
+    unsigned reaped = reap_available(f, count - completed, result, 0);
     completed += reaped;
     if (completed == count) return 0;
     if (reaped) continue;
@@ -219,7 +227,7 @@ static int reap_bounded(struct fetcher* f, unsigned count, int* result, unsigned
       rc = enter_ring_bounded(f);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0 && errno != ETIME) return -errno;
-    reaped = reap_available(f, count - completed, result);
+    reaped = reap_available(f, count - completed, result, 0);
     completed += reaped;
     if (completed == count) return 0;
     if (reaped) continue;
@@ -235,7 +243,7 @@ static int poison_fetcher(struct fetcher* f) {
 
 static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned count, unsigned completed) {
   unsigned attempts = 0;
-  while (submitted < count && attempts++ < PLE_FETCHER_MAX_WAITS) {
+  while (submitted < count && attempts++ < PLE_FETCHER_QUIESCE_WAITS) {
     long rc;
     do {
       rc = submit_ring(f, count - submitted);
@@ -248,7 +256,7 @@ static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned c
   int ignored_result = 0;
   unsigned quiesce_waits = 0;
   if (submitted > completed &&
-      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_MAX_WAITS) < 0) {
+      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_QUIESCE_WAITS) < 0) {
     return poison_fetcher(f);
   }
   if (submitted != count) {
@@ -318,7 +326,7 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
   unsigned completed = 0;
   int result = 0;
   while (completed < count) {
-    unsigned reaped = reap_available(f, count - completed, &result);
+    unsigned reaped = reap_available(f, count - completed, &result, 1);
     completed += reaped;
     if (completed == count) break;
     if (!reaped) {
@@ -330,7 +338,7 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
         if (quiesce_after_error(f, count, count, completed) < 0) return finish_read(f, -EUCLEAN);
         return finish_read(f, error);
       }
-      reaped = reap_available(f, count - completed, &result);
+      reaped = reap_available(f, count - completed, &result, 1);
       completed += reaped;
       if (completed == count) break;
       if (reaped) continue;

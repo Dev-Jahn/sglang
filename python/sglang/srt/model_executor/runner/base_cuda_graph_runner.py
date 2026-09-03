@@ -133,6 +133,12 @@ class BaseCudaGraphRunner(BaseRunner):
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
 
+    def __init__(self, model_runner: ModelRunner) -> None:
+        super().__init__(model_runner)
+        # Decode runners that own a model replay hook replace this explicitly.
+        # Draft runners have no storage-backed model state to stage.
+        self._cuda_graph_replay_hook = None
+
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
         """Return the smallest buckets[i] >= raw_size.

@@ -139,6 +139,12 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def _prepare_model_for_weight_update(self: WeightUpdater):
+        model = self.get_model()
+        if getattr(model, "supports_storage_lifecycle_hook", False):
+            cast(StorageLifecycleHook, model).prepare_weight_reload()
+        return model
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -179,8 +185,7 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
-            if getattr(model, "supports_storage_lifecycle_hook", False):
-                cast(StorageLifecycleHook, model).prepare_weight_reload()
+            self._prepare_model_for_weight_update()
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
@@ -244,6 +249,8 @@ class WeightUpdater:
         if error is not None:
             return False, error
 
+        model = self._prepare_model_for_weight_update()
+
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -273,7 +280,7 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
-            self.get_model().load_weights(weights)
+            model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -330,6 +337,7 @@ class WeightUpdater:
 
         monkey_patch_torch_reductions()
         self._assert_weight_cache_inactive("update_weights_from_tensor")
+        model = self._prepare_model_for_weight_update()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -345,12 +353,12 @@ class WeightUpdater:
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
+            _model_load_weights_direct(model, named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
+            custom_loader(model, named_tensors)
         elif load_format is None:
-            self.get_model().load_weights(named_tensors)
+            model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -393,6 +401,8 @@ class WeightUpdater:
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
+
+        self._prepare_model_for_weight_update()
 
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (

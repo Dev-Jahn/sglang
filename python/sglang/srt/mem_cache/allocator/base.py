@@ -25,32 +25,11 @@ if TYPE_CHECKING:
 
 
 def allocator_reserves_token_slot(allocator, slot: int) -> bool:
-    """Return whether every allocator free list excludes ``slot``."""
+    """Return whether the allocator owns ``slot`` outside its free space."""
 
-    pending = [allocator]
-    seen = set()
-    found_free_list = False
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        for name in ("free_pages", "release_pages", "free_slots", "free_virtual_ids"):
-            values = getattr(current, name, None)
-            if isinstance(values, torch.Tensor):
-                found_free_list = True
-                if bool(values.eq(slot).any().item()):
-                    return False
-        for name in (
-            "full_attn_allocator",
-            "swa_attn_allocator",
-            "logical_attn_allocator",
-            "hisparse_attn_allocator",
-        ):
-            child = getattr(current, name, None)
-            if child is not None:
-                pending.append(child)
-    return found_free_list
+    if not isinstance(allocator, BaseTokenToKVPoolAllocator):
+        return False
+    return allocator.is_slot_allocated(slot)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -90,6 +69,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def is_slot_allocated(self, slot: int) -> bool:
+        """Return whether a token slot is allocated or permanently reserved."""
+        raise NotImplementedError()
 
     def free_group_begin(self):
         self.is_not_in_free_group = False

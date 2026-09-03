@@ -552,7 +552,6 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
-        self.model_runner.prepare_model_batch(batch, forward_batch)
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]

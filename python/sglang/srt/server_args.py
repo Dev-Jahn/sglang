@@ -3878,26 +3878,38 @@ class ServerArgs:
         self._validate_ple_disk_args()
         storage = self.ple_storage
         changed_disk_options = []
+        if resolved and storage not in (None, "gpu") and hasattr(self, "model_path"):
+            architectures = self.get_model_config().hf_config.architectures or []
+            if "Qwen4ExpForConditionalGeneration" not in architectures:
+                raise ValueError(
+                    f"--ple-storage {storage} is unavailable for the selected "
+                    "model architecture"
+                )
         if storage == "disk":
-            if self.pp_size > 1:
-                raise ValueError(
-                    "--ple-storage disk does not support pipeline parallelism "
-                    "(--pp-size > 1)"
-                )
-            if self.dllm_algorithm is not None:
-                raise ValueError(
-                    "--ple-storage disk does not support dLLM (--dllm-algorithm)"
-                )
-            if self.enable_multi_layer_eagle:
-                raise ValueError(
-                    "--ple-storage disk does not support multi-layer speculative "
-                    "decoding (--enable-multi-layer-eagle)"
-                )
-            if self.enable_dp_attention:
-                raise ValueError(
-                    "--ple-storage disk does not support DP-attention token "
-                    "gathering (--enable-dp-attention)"
-                )
+            if resolved:
+                if self.pp_size > 1:
+                    raise ValueError(
+                        "--ple-storage disk does not support pipeline parallelism "
+                        "(--pp-size > 1)"
+                    )
+                if self.dllm_algorithm is not None:
+                    raise ValueError(
+                        "--ple-storage disk does not support dLLM (--dllm-algorithm)"
+                    )
+                if self.enable_multi_layer_eagle:
+                    raise ValueError(
+                        "--ple-storage disk does not support multi-layer speculative "
+                        "decoding (--enable-multi-layer-eagle)"
+                    )
+                if self.enable_dp_attention:
+                    raise ValueError(
+                        "--ple-storage disk does not support DP-attention token "
+                        "gathering (--enable-dp-attention)"
+                    )
+                if self.enable_pdmux:
+                    raise ValueError(
+                        "--ple-storage disk does not support --enable-pdmux"
+                    )
             if not self.ple_disk_dir:
                 raise ValueError("--ple-storage disk requires --ple-disk-dir")
             image_root = Path(self.ple_disk_dir)
@@ -8995,6 +9007,15 @@ class ServerArgs:
             new_flag="--ple-storage pinned",
             default=argparse.SUPPRESS,
             help="Deprecated alias for --ple-storage pinned.",
+        )
+        parser.add_argument(
+            "--no-ple-offload-embedding",
+            action=DeprecatedStoreConstAction,
+            dest="ple_storage",
+            const_value="gpu",
+            new_flag="--ple-storage gpu",
+            default=argparse.SUPPRESS,
+            help="Deprecated alias for --ple-storage gpu.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",

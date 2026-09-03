@@ -58,12 +58,12 @@ CRC_MAGIC = b"PLCRC001"
 HOT_MAGIC = b"PLHOT001"
 FORMAT_VERSION = 3
 HOT_FORMAT_VERSION = 1
+PLE_FETCHER_ABI_VERSION = 1
 MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK = "0.4.6.post2"
 CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 FETCHER_FAILURE_SETUP = 1
 FETCHER_FAILURE_REGISTER_BUFFER = 2
 FETCHER_ERR_POISONED = getattr(errno, "EUCLEAN", 117)
-DIRECT_READER_LOCK_TIMEOUT_SECONDS = 5.0
 _METADATA_HEADER = struct.Struct("<8sI")
 _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 # Intentionally unbounded: releasing any entry could let the kernel write into
@@ -358,7 +358,15 @@ def checkpoint_fingerprint(
         "dtype": str(dtype),
         "module_prefix": str(module_prefix),
         "shards": sorted(
-            (dict(item) for item in manifest), key=lambda item: item["name"]
+            (
+                {
+                    key: value
+                    for key, value in dict(item).items()
+                    if key != "source_file_mtime_ns"
+                }
+                for item in manifest
+            ),
+            key=lambda item: item["name"],
         ),
     }
     return hashlib.sha256(
@@ -524,6 +532,7 @@ class PLEImageBuilder:
         valid_vocab_size: Optional[int] = None,
         dtype: str = "float8_e4m3fn",
         ple_metadata: Optional[Mapping] = None,
+        allow_reuse: bool = True,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -541,6 +550,7 @@ class PLEImageBuilder:
         self.valid_vocab_size = int(valid_vocab_size or vocab_end)
         self.dtype = str(dtype)
         self.ple_metadata = dict(ple_metadata) if ple_metadata is not None else None
+        self.allow_reuse = bool(allow_reuse)
         if self.image_count <= 0:
             raise ValueError("image_count must be positive")
         if self.padded_vocab_size % self.tp_size:
@@ -552,7 +562,7 @@ class PLEImageBuilder:
         self.intervals: list[tuple[int, int]] = []
         self._raw_fd: Optional[int] = None
         self._raw_path: Optional[Path] = None
-        self._reuse = self._find_reuse_candidate()
+        self._reuse = self._find_reuse_candidate() if self.allow_reuse else None
         self._expected_manifest = None
         if self._reuse is None:
             rows_per_rank = self.padded_vocab_size // self.tp_size
@@ -589,10 +599,26 @@ class PLEImageBuilder:
             self._expected_manifest = manifest_doc.get("shards")
             if not isinstance(self._expected_manifest, list):
                 raise ValueError(f"PLE image manifest lacks shards: {manifest_path}")
+            self._expected_by_name = {
+                item["name"]: item for item in self._expected_manifest
+            }
+        else:
+            self._expected_by_name = {}
+
+    def _generation_is_complete(self, directory: Path) -> bool:
+        if not (directory / "manifest.json").is_file():
+            return False
+        return all(
+            (directory / f"rank{rank}.bin").is_file()
+            and (directory / f"rank{rank}.crc32").is_file()
+            for rank in range(self.tp_size)
+        )
 
     def _find_reuse_candidate(self) -> Optional[PLEImage]:
         matches = []
         for path in self.root.glob(f"*/rank{self.rank}.bin"):
+            if not self._generation_is_complete(path.parent):
+                continue
             try:
                 header = _read_metadata_page(path, IMAGE_MAGIC)
             except OSError:
@@ -619,9 +645,17 @@ class PLEImageBuilder:
                     ) from exc
                 matches.append(image)
         if len(matches) > 1:
-            raise ValueError(
-                "multiple PLE disk images match this module/config/rank; remove "
-                f"stale images under {self.root}"
+            matches.sort(
+                key=lambda image: max(
+                    (image.path.parent / f"rank{rank}.bin").stat().st_mtime_ns
+                    for rank in range(self.tp_size)
+                ),
+                reverse=True,
+            )
+            logger.warning(
+                "Multiple complete PLE images match %s; using the newest generation %s",
+                self.module_prefix,
+                matches[0].path.parent,
             )
         return matches[0] if matches else None
 
@@ -640,6 +674,50 @@ class PLEImageBuilder:
             self._raw_fd = fd
             self._raw_path = path
         return self._raw_fd
+
+    @staticmethod
+    def _comparable_manifest_item(item: Mapping) -> dict:
+        return {
+            key: value
+            for key, value in dict(item).items()
+            if key != "source_file_mtime_ns"
+        }
+
+    def _materialize_reuse_rows(self) -> None:
+        image = self._reuse
+        if image is None:
+            return
+        raw_fd = self._ensure_raw()
+        image_fd = os.open(image.path, os.O_RDONLY)
+        try:
+            for first_page in range(0, image.num_pages, 1024):
+                page_count = min(1024, image.num_pages - first_page)
+                packed = os.pread(
+                    image_fd,
+                    page_count * PAGE_BYTES,
+                    (first_page + 1) * PAGE_BYTES,
+                )
+                if len(packed) != page_count * PAGE_BYTES:
+                    raise IOError("short read while unpacking a reusable PLE image")
+                pages = np.frombuffer(packed, dtype=np.uint8).reshape(
+                    page_count, PAGE_BYTES
+                )
+                rows = pages[:, : ROWS_PER_PAGE * ROW_BYTES].reshape(-1, ROW_BYTES)
+                row_start = first_page * ROWS_PER_PAGE
+                row_count = min(rows.shape[0], self.num_rows - row_start)
+                payload = memoryview(rows[:row_count].copy()).cast("B")
+                written = 0
+                offset = row_start * ROW_BYTES
+                while written < len(payload):
+                    count = os.pwrite(raw_fd, payload[written:], offset + written)
+                    if count <= 0:
+                        raise IOError(
+                            "short write while unpacking a reusable PLE image"
+                        )
+                    written += count
+        finally:
+            os.close(image_fd)
+        self._reuse = None
 
     def add_shard(
         self, name: str, loaded_weight: torch.Tensor, row_start: int, row_end: int
@@ -686,6 +764,21 @@ class PLEImageBuilder:
             "source_file_size": int(source.get("size", loaded_weight.nbytes)),
             "source_file_mtime_ns": int(source.get("mtime_ns", 0)),
         }
+        if self._reuse is not None:
+            expected = self._expected_by_name.get(name)
+            content_changed = expected is None or self._comparable_manifest_item(
+                expected
+            ) != self._comparable_manifest_item(item)
+            mtime_changed = expected is not None and int(
+                expected.get("source_file_mtime_ns", 0)
+            ) != int(item["source_file_mtime_ns"])
+            if content_changed or mtime_changed:
+                logger.warning(
+                    "PLE checkpoint identity changed for %s; rebuilding %s",
+                    name,
+                    self.module_prefix,
+                )
+                self._materialize_reuse_rows()
         self.manifest.append(item)
         ov_start = max(int(row_start), self.vocab_start)
         ov_end = min(int(row_end), self.vocab_end)
@@ -746,19 +839,27 @@ class PLEImageBuilder:
         )
         if self._reuse is not None:
             expected = sorted(self._expected_manifest, key=lambda item: item["name"])
-            if expected != manifest:
-                raise ValueError(
-                    "PLE disk image shard manifest mismatch; delete "
-                    f"{self._reuse.path.parent} before rebuilding"
+            expected_payload = [
+                self._comparable_manifest_item(item) for item in expected
+            ]
+            manifest_payload = [
+                self._comparable_manifest_item(item) for item in manifest
+            ]
+            if expected_payload != manifest_payload:
+                logger.warning(
+                    "PLE checkpoint manifest changed; rebuilding %s",
+                    self.module_prefix,
                 )
+                self._materialize_reuse_rows()
+            elif float(self._reuse.header.get("weight_scale")) != float(weight_scale):
+                logger.warning(
+                    "PLE checkpoint scale changed; rebuilding %s", self.module_prefix
+                )
+                self._materialize_reuse_rows()
+        if self._reuse is not None:
             if self._reuse.header.get("fingerprint") != fingerprint:
                 raise ValueError(
                     "PLE disk image fingerprint mismatch; delete "
-                    f"{self._reuse.path.parent} before rebuilding"
-                )
-            if float(self._reuse.header.get("weight_scale")) != float(weight_scale):
-                raise ValueError(
-                    "PLE disk image weight_scale mismatch; delete "
                     f"{self._reuse.path.parent} before rebuilding"
                 )
             return (
@@ -913,12 +1014,14 @@ class PLEImageBuilder:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+
             os.replace(tmp_image, image_path)
             directory_fd = os.open(final_dir, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            self._remove_superseded_generations(final_dir)
 
             elapsed = max(time.perf_counter() - started, 1e-12)
             stats = {
@@ -942,6 +1045,26 @@ class PLEImageBuilder:
                 manifest_tmp.unlink(missing_ok=True)
             if ple_metadata_tmp is not None:
                 ple_metadata_tmp.unlink(missing_ok=True)
+
+    def _remove_superseded_generations(self, current_dir: Path) -> None:
+        if not self._generation_is_complete(current_dir):
+            return
+        for path in self.root.glob("*/rank0.bin"):
+            directory = path.parent
+            if directory == current_dir or not self._generation_is_complete(directory):
+                continue
+            try:
+                header = _read_metadata_page(path, IMAGE_MAGIC)
+            except (OSError, ValueError):
+                continue
+            if (
+                header.get("config_sha256") == self.config_sha256
+                and int(header.get("tp_size", -1)) == self.tp_size
+                and header.get("module_prefix") == self.module_prefix
+                and int(header.get("padded_vocab_size", -1)) == self.padded_vocab_size
+                and int(header.get("valid_vocab_size", -1)) == self.valid_vocab_size
+            ):
+                shutil.rmtree(directory)
 
     def close(self) -> None:
         if self._raw_fd is not None:
@@ -1341,15 +1464,25 @@ class WTinyLFURowCache:
         )
 
     def _increment(self, row_id: int) -> None:
-        columns = self._sketch_indices(row_id)
-        for depth, column in enumerate(columns):
-            value = int(self.sketch[depth, column])
-            if value < 255:
-                self.sketch[depth, column] = value + 1
-        self._sample_count += 1
+        self._increment_many(np.asarray([row_id], dtype=np.int64))
+
+    def _increment_many(self, row_ids: np.ndarray) -> None:
+        values = np.asarray(row_ids, dtype=np.uint64).reshape(-1)
+        if not values.size:
+            return
+        for depth, multiplier in enumerate(self._HASH_MIX):
+            mixed = values * multiplier
+            mixed ^= mixed >> np.uint64(29)
+            columns = mixed & np.uint64(self.sketch_width - 1)
+            unique, counts = np.unique(columns.astype(np.int64), return_counts=True)
+            current = self.sketch[depth, unique].astype(np.uint16)
+            self.sketch[depth, unique] = np.minimum(current + counts, 255).astype(
+                np.uint8
+            )
+        self._sample_count += values.size
         if self._sample_count >= self._reset_interval:
             self.sketch >>= np.uint8(1)
-            self._sample_count = 0
+            self._sample_count %= self._reset_interval
 
     def lookup_into(
         self,
@@ -1374,8 +1507,7 @@ class WTinyLFURowCache:
                 slots = sets[selected] * self._WAYS + ways
                 output[selected] = cached_rows[slots]
                 if record_hits:
-                    for row_id in ids[selected]:
-                        self._increment(int(row_id))
+                    self._increment_many(ids[selected])
         return hit
 
     def record(self, local_ids: np.ndarray, exact_rows: Optional[np.ndarray]) -> None:
@@ -1644,6 +1776,22 @@ class DirectPageReader:
         if self.staging.data_ptr() & (self.alignment - 1):
             raise RuntimeError("PLE registered staging buffer is not O_DIRECT aligned")
         self.lib = ctypes.CDLL(str(_find_helper_library()), use_errno=True)
+        try:
+            self.lib.ple_fetcher_abi_version.argtypes = []
+            self.lib.ple_fetcher_abi_version.restype = ctypes.c_uint
+            self.lib.ple_fetcher_lock_budget_ms.argtypes = []
+            self.lib.ple_fetcher_lock_budget_ms.restype = ctypes.c_uint
+            abi_version = self.lib.ple_fetcher_abi_version()
+        except AttributeError as exc:
+            raise RuntimeError(
+                "PLE disk fetcher lacks the required ABI version symbol"
+            ) from exc
+        if abi_version != PLE_FETCHER_ABI_VERSION:
+            raise RuntimeError(
+                "PLE disk fetcher ABI mismatch: expected "
+                f"{PLE_FETCHER_ABI_VERSION}, found {abi_version}"
+            )
+        self._read_lock_timeout_seconds = self.lib.ple_fetcher_lock_budget_ms() / 1000.0
         self.lib.ple_fetcher_create.argtypes = [
             ctypes.c_int,
             ctypes.c_void_p,
@@ -1725,9 +1873,10 @@ class DirectPageReader:
             self._read_lock.release()
 
     def _acquire_read_lock(self) -> None:
-        if not self._read_lock.acquire(timeout=DIRECT_READER_LOCK_TIMEOUT_SECONDS):
+        if not self._read_lock.acquire(timeout=self._read_lock_timeout_seconds):
             raise TimeoutError(
-                "PLE direct page reader timed out waiting 5.0s for another caller"
+                "PLE direct page reader timed out waiting "
+                f"{self._read_lock_timeout_seconds:.1f}s for another caller"
             )
 
     @contextmanager

@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
@@ -377,21 +378,43 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
         image_dir = tempfile.mkdtemp(prefix="qwen4_disk_images_")
         self.addCleanup(shutil.rmtree, image_dir, ignore_errors=True)
-        with self.assertRaisesRegex(ValueError, "requires float8_e4m3fn PLE rows"):
-            self._construct(
+        with patch.object(overrides_module, "is_cuda", return_value=True), patch(
+            "sglang.srt.server_args.is_cuda", return_value=True
+        ):
+            with self.assertRaisesRegex(ValueError, "requires float8_e4m3fn PLE rows"):
+                self._construct(
+                    *qwen4,
+                    config_extra={"quantization_config": {"quant_method": "fp8"}},
+                    ple_storage="disk",
+                    ple_disk_dir=image_dir,
+                )
+
+            accepted = self._construct(
                 *qwen4,
-                config_extra={"quantization_config": {"quant_method": "fp8"}},
+                config_extra={"ple_embedding_dtype": "float8_e4m3fn"},
                 ple_storage="disk",
                 ple_disk_dir=image_dir,
+                enable_dp_attention=True,
+                dp_size=1,
+                chunked_prefill_size=-1,
             )
-
-        accepted = self._construct(
-            *qwen4,
-            config_extra={"ple_embedding_dtype": "float8_e4m3fn"},
-            ple_storage="disk",
-            ple_disk_dir=image_dir,
-        )
         self.assertEqual(accepted.ple_storage, "disk")
+        self.assertFalse(accepted.enable_dp_attention)
+        text_config = accepted.get_model_config().hf_text_config
+        self.assertEqual(text_config.ple_storage, "disk")
+        self.assertEqual(
+            text_config.ple_disk_max_prefill_chunk_tokens,
+            accepted.max_prefill_tokens,
+        )
+
+    def test_shared_runner_modules_do_not_import_qwen4_config(self):
+        root = Path(__file__).resolve().parents[3]
+        for relative in (
+            "python/sglang/srt/model_executor/model_runner.py",
+            "python/sglang/srt/model_executor/model_runner_components/load_model_utils.py",
+        ):
+            source = (root / relative).read_text()
+            self.assertNotIn("sglang.srt.configs.qwen4_exp", source)
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")

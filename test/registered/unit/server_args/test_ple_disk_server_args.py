@@ -29,6 +29,7 @@ def _server_args(**overrides):
         "dllm_algorithm": None,
         "enable_dp_attention": False,
         "enable_multi_layer_eagle": False,
+        "enable_pdmux": False,
     }
     values.update(overrides)
     args = object.__new__(server_args_module.ServerArgs)
@@ -219,7 +220,16 @@ def test_disk_storage_rejects_graph_hook_bypass_modes(tmp_path, option, message)
         **{option: True},
     )
     with pytest.raises(ValueError, match=message):
-        args._handle_offload_compatibility()
+        args._handle_offload_compatibility(resolved=True)
+
+
+def test_disk_storage_rejects_pdmux_after_resolution(tmp_path):
+    args = _server_args(
+        ple_storage="disk", ple_disk_dir=str(tmp_path), enable_pdmux=True
+    )
+    args._handle_offload_compatibility()
+    with pytest.raises(ValueError, match="enable-pdmux"):
+        args._handle_offload_compatibility(resolved=True)
 
 
 def test_auto_selected_pinned_storage_names_the_explicit_escape():
@@ -246,6 +256,20 @@ def test_deprecated_ple_offload_embedding_alias_maps_to_pinned(caplog):
     assert namespace.ple_storage == "pinned"
     assert "--ple-offload-embedding" in caplog.text
     assert "--ple-storage pinned" in caplog.text
+
+
+def test_deprecated_no_ple_offload_embedding_alias_maps_to_gpu(caplog):
+    parser = server_args_module.argparse.ArgumentParser()
+    server_args_module.ServerArgs.add_cli_args(parser)
+
+    with caplog.at_level("WARNING"):
+        namespace = parser.parse_args(
+            ["--model-path", "dummy", "--no-ple-offload-embedding"]
+        )
+
+    assert namespace.ple_storage == "gpu"
+    assert "--no-ple-offload-embedding" in caplog.text
+    assert "--ple-storage gpu" in caplog.text
 
 
 if __name__ == "__main__":

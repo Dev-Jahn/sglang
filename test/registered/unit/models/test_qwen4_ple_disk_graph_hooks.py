@@ -151,7 +151,7 @@ def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
     assert layer._prefetch_state[0].shape == (4, 16, 10)
     assert layer._future_lookup_contexts is None
     captured_ids[0, 0] = -1
-    key = (ForwardMode.DECODE, 4)
+    key = (ForwardMode.DECODE, 4, None, None)
     assert layer._graph_lookup_id_buffers[key].data_ptr() == captured_ids.data_ptr()
     assert layer._graph_lookup_id_buffers[key][0, 0].item() == -1
 
@@ -198,9 +198,128 @@ def test_disk_capture_keys_equal_token_counts_by_forward_mode(monkeypatch):
         layer._prefetch_state = None
 
     assert set(layer._graph_lookup_id_buffers) == {
-        (ForwardMode.DECODE, 4),
-        (ForwardMode.TARGET_VERIFY, 4),
+        (ForwardMode.DECODE, 4, None, None),
+        (ForwardMode.TARGET_VERIFY, 4, None, None),
     }
+
+
+def test_disk_capture_key_keeps_runner_variants_separate(monkeypatch):
+    offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(offloaded)
+    offloaded.gather = lambda input_ids, out: out
+    ngram_embedding = SimpleNamespace(
+        ngram_embedding=offloaded,
+        ngram_heads=1,
+        gather_dp_tokens=False,
+        compute_ngram_ids=lambda batch: torch.arange(4).view(4, 1),
+        _prepare_embedding_lookup=lambda ids, forward_batch, physical_tokens: (
+            ids,
+            physical_tokens,
+        ),
+    )
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = ngram_embedding
+    layer._prefetch_stream = object()
+    layer._prefetch_state = None
+    layer._future_lookup_contexts = None
+    layer._graph_lookup_id_buffers = {}
+    layer._graph_lookup_validation_due = set()
+    layer._is_capturing = lambda: True
+    layer._get_prefetch_buffer = lambda tokens, ids, graph_key: torch.empty(
+        (tokens, 1, 4), dtype=torch.bfloat16
+    )
+    variants = iter(["lora", "nolora", "lora"])
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "get_capture_lora_variant",
+        lambda: next(variants),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "get_capture_dsa_variant",
+        lambda: None,
+        raising=False,
+    )
+    batch = SimpleNamespace(
+        mode=ForwardMode.DECODE, physical_tokens=4, processed_tokens=4
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.arange(4),
+        global_dp_buffer_len=None,
+        forward_mode=ForwardMode.DECODE,
+        _original_forward_mode=None,
+    )
+
+    layer.start_prefetch(batch, forward_batch)
+    layer._prefetch_state = None
+    layer.start_prefetch(batch, forward_batch)
+
+    assert len(layer._graph_lookup_id_buffers) == 2
+    layer._prefetch_state = None
+    with pytest.raises(RuntimeError, match="already owned by another graph"):
+        layer.start_prefetch(batch, forward_batch)
+
+
+def test_disk_ple_forward_rejects_a_missing_prefetch():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+    layer._prefetch_state = None
+
+    with pytest.raises(RuntimeError, match="requires prefetched embeddings"):
+        layer.forward(
+            torch.zeros((1, 4)),
+            SimpleNamespace(),
+            SimpleNamespace(processed_tokens=1),
+        )
+
+
+def test_production_layer_one_capture_starts_prefetch(monkeypatch):
+    events = []
+
+    class Layer(torch.nn.Module):
+        def __init__(self, ple=None):
+            super().__init__()
+            self.ple = ple
+
+        def forward(self, **kwargs):
+            events.append("layer")
+            if self.ple is not None:
+                assert self.ple.prefetched
+            return kwargs["hidden_states"], kwargs["residual"]
+
+    ple = SimpleNamespace(
+        prefetched=False,
+        start_prefetch=lambda batch, forward_batch: (
+            events.append("prefetch"),
+            setattr(ple, "prefetched", True),
+        ),
+    )
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.embed_tokens = lambda input_ids: torch.zeros((input_ids.numel(), 4))
+    model.layers = torch.nn.ModuleList([Layer(), Layer(ple)])
+    model._start_layer = 0
+    model._end_layer = 2
+    model.has_ple = True
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 2
+    model._ple_disk_storage = True
+    model.hyper_connection_mixer = SimpleNamespace(
+        mix=lambda hidden_states: (hidden_states, None)
+    )
+    batch = SimpleNamespace(marker="capture")
+    monkeypatch.setattr(qwen4_exp_module, "_prepare_ple_batch", lambda *a, **k: batch)
+    monkeypatch.setattr(qwen4_exp_module, "_commit_ple_batch", lambda *a, **k: None)
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    model._forward_impl(torch.tensor([1]), torch.tensor([0]), forward_batch)
+
+    assert events == ["prefetch", "layer", "layer"]
 
 
 def test_disk_capture_uses_one_key_when_batch_and_runtime_modes_differ(monkeypatch):
@@ -251,7 +370,7 @@ def test_disk_capture_uses_one_key_when_batch_and_runtime_modes_differ(monkeypat
     layer.start_prefetch(batch, forward_batch)
     layer._consume_prefetched_embeddings(forward_batch)
 
-    expected = {(ForwardMode.TARGET_VERIFY, 4)}
+    expected = {(ForwardMode.TARGET_VERIFY, 4, None, None)}
     assert set(layer._graph_lookup_id_buffers) == expected
     assert set(layer._graph_embedding_snapshot_buffers) == expected
 
@@ -259,7 +378,7 @@ def test_disk_capture_uses_one_key_when_batch_and_runtime_modes_differ(monkeypat
 def test_graph_replay_prepares_shared_batch_once(monkeypatch):
     from sglang.srt.model_executor.forward_batch_info import CudaGraphReplayInput
 
-    prepared_batch = SimpleNamespace(physical_tokens=2)
+    prepared_batch = SimpleNamespace(physical_tokens=2, mode=ForwardMode.DECODE)
     forward_batch = SimpleNamespace(input_ids=torch.arange(1))
     prepare_calls = []
     monkeypatch.setattr(
@@ -282,7 +401,7 @@ def test_graph_replay_prepares_shared_batch_once(monkeypatch):
         )
         return SimpleNamespace(
             ple_embedding=ngram,
-            prepare_cuda_graph_replay=lambda batch, lookup_ids: received.append(
+            prepare_cuda_graph_replay=lambda batch, lookup_ids, graph_key: received.append(
                 (batch, lookup_ids.clone())
             ),
         )
@@ -326,7 +445,7 @@ def test_graph_replay_prepare_rolls_back_every_disk_layer(monkeypatch):
             _prepare_embedding_lookup=lambda ids, batch, tokens: (ids, tokens),
         )
 
-        def prepare(batch, lookup_ids):
+        def prepare(batch, lookup_ids, graph_key):
             events.append(("prepare", index))
             if fail:
                 raise OSError("injected layer failure")
@@ -346,7 +465,9 @@ def test_graph_replay_prepare_rolls_back_every_disk_layer(monkeypatch):
     monkeypatch.setattr(
         qwen4_exp_module,
         "_prepare_ple_batch",
-        lambda *args, **kwargs: SimpleNamespace(physical_tokens=1),
+        lambda *args, **kwargs: SimpleNamespace(
+            physical_tokens=1, mode=ForwardMode.DECODE
+        ),
     )
 
     replay = CudaGraphReplayInput(
@@ -689,7 +810,7 @@ def test_graph_validation_recycles_every_consumed_ready_entry():
 
 
 def test_forward_batch_declares_model_batch_hook_state():
-    assert "_model_batch_hook_prepared" in ForwardBatch.__dataclass_fields__
+    assert "_model_batch_hook_prepared" not in ForwardBatch.__dataclass_fields__
 
 
 def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):

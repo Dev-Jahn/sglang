@@ -383,6 +383,7 @@ class CudaGraphReplayInput:
     forward_mode: ForwardMode
     batch_size: int
     runtime_forward_batch: Any
+    runner_graph_key: Any = None
 
 
 @dataclass
@@ -430,9 +431,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the graph runners for backends whose seq-len fill value is ambiguous
     # (QSA's fill is 1, a legal real length); None outside replay.
     num_padding: Optional[int] = None
-
-    # Set after model batch hooks have prepared this forward batch.
-    _model_batch_hook_prepared: bool = False
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
