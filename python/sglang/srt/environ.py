@@ -307,7 +307,7 @@ class Envs:
     # default interval is 8.
     SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL = EnvInt(8)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
-    # path is ported, so setting this fails loudly instead of degrading.
+    # path is ported, so setting this raises instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     # Select the QSA sparse decode backend. Auto uses Triton on SM120 and the
     # flash-attention fallback on other architectures.
