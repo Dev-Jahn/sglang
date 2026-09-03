@@ -302,9 +302,9 @@ class Envs:
     # Compare staged graph lookup rows with the values used by the next replay.
     # Disabled by default.
     SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING = EnvBool(False)
-    # Check the first replay after capture. Positive values also sample later
-    # replays at that interval; zero keeps only the first-replay check. The
-    # default interval is 8.
+    # Check lookup IDs asynchronously after capture and at this replay interval.
+    # The result is reported by the following replay without a host wait. Zero
+    # keeps only the first-replay check. The default interval is 8.
     SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL = EnvInt(8)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this raises instead of degrading.

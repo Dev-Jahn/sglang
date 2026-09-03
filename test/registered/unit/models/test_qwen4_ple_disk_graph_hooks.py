@@ -776,6 +776,108 @@ def test_graph_lookup_validation_defaults_to_every_eighth_replay(monkeypatch):
         layer._graph_lookup_validation_required(key, 257)
 
 
+def test_lookup_validation_replay_hooks_do_not_synchronize_host(monkeypatch):
+    phase = {"name": "setup"}
+    forbidden_calls = []
+    query_phases = []
+
+    def fail_host_access(name):
+        def fail(*args, **kwargs):
+            forbidden_calls.append((name, phase["name"]))
+            pytest.fail(f"{name} reached during {phase['name']}")
+
+        return fail
+
+    class NonblockingEvent:
+        def __init__(self):
+            self.queries = 0
+
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            self.queries += 1
+            query_phases.append(phase["name"])
+            if self.queries != 1:
+                pytest.fail("validation event was polled")
+            return True
+
+        def synchronize(self):
+            fail_host_access("Event.synchronize")()
+
+    for name in ("item", "tolist", "cpu"):
+        monkeypatch.setattr(torch.Tensor, name, fail_host_access(name))
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda,
+        "synchronize",
+        fail_host_access("torch.cuda.synchronize"),
+    )
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", NonblockingEvent)
+    model_stream = SimpleNamespace(wait_stream=lambda stream: None)
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda, "current_stream", lambda: model_stream
+    )
+    monkeypatch.setattr(
+        qwen4_exp_module.torch.cuda, "stream", lambda stream: nullcontext()
+    )
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "_allocate_host_tensor",
+        lambda shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding.stage_graph_step = lambda input_ids, out: 1
+    embedding.wait_for_graph_step = lambda generation: None
+    embedding.reset_graph_step = lambda: None
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(
+        ngram_embedding=embedding,
+        ngram_heads=1,
+    )
+    layer._prefetch_stream = model_stream
+    layer._graph_prefetch_buffer = torch.empty((2, 1, 4))
+    layer._graph_replay_generation = None
+    layer._graph_replay_stage_expected = False
+    layer._graph_replay_capture_expected_key = None
+    layer._graph_replay_lookup_tokens = None
+    layer._graph_replay_prefetch_buffer = None
+    layer._graph_replay_key = None
+    layer._graph_replay_step_index = None
+    layer._validate_graph_staging = False
+    layer._pending_graph_embedding_validation = None
+    layer._completed_graph_embedding_validation = deque()
+    layer._pending_graph_lookup_validation = None
+    layer._completed_graph_lookup_validation = deque()
+    layer._graph_validation_free_slots = deque()
+    layer._graph_lookup_validation_interval = 1
+    layer._graph_lookup_validation_due = set()
+    layer._graph_replay_steps = 0
+    key = (ForwardMode.DECODE, 2)
+    layer._graph_lookup_id_buffers = {key: torch.tensor([[3], [5]], dtype=torch.long)}
+    batch = SimpleNamespace(mode=ForwardMode.DECODE)
+
+    for replay_step in (1, 2):
+        lookup_ids = torch.tensor([[3], [5]], dtype=torch.long)
+        for hook_name, hook in (
+            (
+                "prepare",
+                lambda: layer.prepare_cuda_graph_replay(batch, lookup_ids, key),
+            ),
+            ("wait", layer.wait_cuda_graph_replay),
+            ("finish", layer.finish_cuda_graph_replay),
+            ("release", layer.release_cuda_graph_replay),
+        ):
+            phase["name"] = f"{hook_name}-{replay_step}"
+            hook()
+
+    assert forbidden_calls == []
+    assert query_phases == ["finish-2"]
+
+
 def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
@@ -858,7 +960,7 @@ def test_graph_replay_release_discards_pending_validation(monkeypatch):
     assert layer._pending_graph_embedding_validation is None
 
 
-def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
+def test_graph_lookup_validation_reports_on_the_next_replay_finish(monkeypatch):
     class ReadyEvent:
         def record(self, stream):
             self.stream = stream
@@ -867,7 +969,7 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
             return True
 
         def synchronize(self):
-            pass
+            pytest.fail("lookup validation synchronized its event")
 
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", lambda: object())
@@ -890,6 +992,9 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
     layer._graph_lookup_id_buffers = {
         (ForwardMode.DECODE, 2): torch.tensor([[3], [7]], dtype=torch.long)
     }
+
+    layer.finish_cuda_graph_replay()
+    assert len(layer._completed_graph_lookup_validation) == 1
 
     with pytest.raises(
         RuntimeError,

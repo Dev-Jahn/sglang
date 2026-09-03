@@ -2110,7 +2110,7 @@ class Qwen4ExpPLELayer(nn.Module):
             isinstance(offloaded_embedding, Qwen4ExpDiskEmbedding)
             and not self._is_capturing()
         ):
-            self.validate_cuda_graph_replay()
+            self.validate_cuda_graph_replay(consume_lookup_ids=False)
         capturing_disk = self._is_capturing() and isinstance(
             offloaded_embedding, Qwen4ExpDiskEmbedding
         )
@@ -2238,9 +2238,7 @@ class Qwen4ExpPLELayer(nn.Module):
             raise RuntimeError("PLE graph replay was prepared twice without a wait")
         if getattr(self, "_graph_replay_capture_expected_key", None) is not None:
             raise RuntimeError("PLE graph replay capture state was not released")
-        # Report the preceding replay after the scheduler has formed this batch.
-        # A host read directly after replay changes loaded request interleaving.
-        self.validate_cuda_graph_replay()
+        self.validate_cuda_graph_replay(consume_lookup_ids=False)
         if (
             self._pending_graph_embedding_validation is not None
             or self._pending_graph_lookup_validation is not None
@@ -2287,6 +2285,13 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_replay_key = graph_key
 
     def finish_cuda_graph_replay(self) -> None:
+        # Query the preceding lookup check once before recording this replay's
+        # result. The event stays queued when its host copy is still in flight.
+        self._consume_graph_validation(
+            "_completed_graph_lookup_validation",
+            "PLE graph lookup IDs differ from disk staging",
+            limit=1,
+        )
         if self._pending_graph_embedding_validation is not None:
             graph_key, replay_step, expected_embeddings = (
                 self._pending_graph_embedding_validation
@@ -2330,11 +2335,6 @@ class Qwen4ExpPLELayer(nn.Module):
             "PLE graph staging differs at consumption",
             wait=True,
         )
-        self._consume_graph_validation(
-            "_completed_graph_lookup_validation",
-            "PLE graph lookup IDs differ from disk staging",
-            wait=True,
-        )
 
     def _record_graph_validation(
         self,
@@ -2361,13 +2361,18 @@ class Qwen4ExpPLELayer(nn.Module):
         completed.append((lookup_tokens, replay_step, host_result, ready))
 
     def _consume_graph_validation(
-        self, completed_attr: str, error_message: str, *, wait: bool = False
+        self,
+        completed_attr: str,
+        error_message: str,
+        *,
+        wait: bool = False,
+        limit: Optional[int] = None,
     ) -> None:
         completed = getattr(self, completed_attr, None)
         if not completed:
             return
         consumed = []
-        while completed:
+        while completed and (limit is None or len(consumed) < limit):
             ready = completed[0][3]
             if wait:
                 ready.synchronize()
@@ -2390,15 +2395,16 @@ class Qwen4ExpPLELayer(nn.Module):
                 (host_result, ready) for _, _, host_result, ready in consumed
             )
 
-    def validate_cuda_graph_replay(self) -> None:
+    def validate_cuda_graph_replay(self, *, consume_lookup_ids: bool = True) -> None:
         self._consume_graph_validation(
             "_completed_graph_embedding_validation",
             "PLE graph staging differs at consumption",
         )
-        self._consume_graph_validation(
-            "_completed_graph_lookup_validation",
-            "PLE graph lookup IDs differ from disk staging",
-        )
+        if consume_lookup_ids:
+            self._consume_graph_validation(
+                "_completed_graph_lookup_validation",
+                "PLE graph lookup IDs differ from disk staging",
+            )
 
     def wait_cuda_graph_replay(self) -> None:
         offloaded_embedding = self.ple_embedding.ngram_embedding
