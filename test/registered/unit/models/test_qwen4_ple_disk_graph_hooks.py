@@ -16,6 +16,7 @@ from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpDiskEmbedding,
     Qwen4ExpModel,
+    Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -733,28 +734,33 @@ def test_model_wait_keeps_replay_validation_pending_until_finish():
     assert events == ["wait"]
 
 
-def test_graph_lookup_validation_zero_checks_only_the_first_replay(monkeypatch):
+def test_graph_lookup_validation_defaults_to_every_eighth_replay(monkeypatch):
     from sglang.srt.environ import envs
 
     monkeypatch.delenv(
         "SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL", raising=False
     )
-    assert envs.SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL.get() == 0
+    default_interval = envs.SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL.get()
+    assert default_interval == 8
 
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer._graph_replay_steps = 0
     key = (ForwardMode.DECODE, 4)
     layer._graph_lookup_validation_due = {key}
-    layer._graph_lookup_validation_interval = 0
+    layer._graph_lookup_validation_interval = default_interval
 
     assert layer._graph_lookup_validation_required(key, 1)
     layer._graph_lookup_validation_due.clear()
     assert all(
-        not layer._graph_lookup_validation_required(key, step) for step in range(2, 10)
+        not layer._graph_lookup_validation_required(key, step) for step in range(2, 8)
     )
+    assert layer._graph_lookup_validation_required(key, 8)
     assert layer._graph_replay_steps == 0
     assert layer._graph_lookup_validation_due == set()
+
+    layer._graph_lookup_validation_interval = 0
+    assert not layer._graph_lookup_validation_required(key, 9)
 
     layer._graph_lookup_validation_interval = 256
     layer._graph_lookup_validation_due = {key}
@@ -773,6 +779,9 @@ def test_graph_lookup_validation_zero_checks_only_the_first_replay(monkeypatch):
 def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
     layer._graph_prefetch_buffer = torch.empty((8, 16))
     key = (ForwardMode.DECODE, 4)
     layer._graph_lookup_id_buffers = {key: torch.empty((4, 1), dtype=torch.long)}
@@ -782,6 +791,30 @@ def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):
     assert layer._select_graph_prefetch_buffer(key).shape == (4, 16)
     with pytest.raises(RuntimeError, match="no captured staging buffer"):
         layer._select_graph_prefetch_buffer((ForwardMode.DECODE, 2))
+
+
+def test_pinned_graph_staging_is_allocated_per_captured_shape():
+    pinned = Qwen4ExpPinnedHostEmbedding.__new__(Qwen4ExpPinnedHostEmbedding)
+    torch.nn.Module.__init__(pinned)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=pinned)
+    layer._graph_prefetch_buffers = {}
+    layer._allocate_prefetch_buffer = lambda tokens, device: torch.empty(tokens, 16)
+    small_key = (ForwardMode.DECODE, 2, None, "small")
+    large_key = (ForwardMode.DECODE, 8, None, "large")
+
+    small = layer._select_graph_prefetch_buffer(
+        small_key, device=torch.device("cpu"), allocate=True
+    )
+    large = layer._select_graph_prefetch_buffer(
+        large_key, device=torch.device("cpu"), allocate=True
+    )
+
+    assert small.shape == (2, 16)
+    assert large.shape == (8, 16)
+    assert layer._select_graph_prefetch_buffer(small_key) is small
+    assert len(layer._graph_prefetch_buffers) == 2
 
 
 def test_capture_start_drops_references_from_the_previous_graph():
@@ -833,6 +866,9 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
         def query(self):
             return True
 
+        def synchronize(self):
+            pass
+
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(
@@ -855,13 +891,12 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
         (ForwardMode.DECODE, 2): torch.tensor([[3], [7]], dtype=torch.long)
     }
 
-    layer.finish_cuda_graph_replay()
-    assert len(layer._completed_graph_lookup_validation) == 1
     with pytest.raises(
         RuntimeError,
-        match=r"one step behind.*step 17.*already emitted.*lookup.tokens=2",
+        match=r"lookup IDs differ.*step 17.*lookup.tokens=2",
     ):
-        layer.validate_cuda_graph_replay()
+        layer.finish_cuda_graph_replay()
+    assert not layer._completed_graph_lookup_validation
 
 
 def test_graph_validation_rejects_a_missing_capture_buffer():

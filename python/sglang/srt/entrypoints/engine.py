@@ -135,6 +135,8 @@ def _translate_legacy_ple_storage_kwargs(kwargs: Dict[str, Any]) -> None:
     if "ple_offload_embedding" not in kwargs:
         return
     legacy = kwargs.pop("ple_offload_embedding")
+    if legacy is None:
+        return
     storage = "pinned" if legacy else "gpu"
     explicit = kwargs.get("ple_storage")
     if explicit is not None and explicit != storage:
@@ -779,6 +781,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     server_args.dtype,
                     "--dist-init-method",
                     dist_init_method,
+                    "--ple-storage",
+                    server_args.ple_storage or "gpu",
                 ]
                 if server_args.quantization:
                     cmd += ["--quantization", server_args.quantization]

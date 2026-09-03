@@ -4,20 +4,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
-from sglang.srt.utils.ple_disk import resolve_ple_storage as resolve_ple_storage
-
-PLE_DISK_MAX_PREFILL_BUFFER_TOKENS = 65536
-PLE_DISK_DEFAULTS = {
-    "ple_disk_dir": None,
-    "ple_disk_hot_cache_gb": 8.0,
-    "ple_disk_hot_frequency_file": None,
-    "ple_disk_dynamic_cache_gb": 2.0,
-    "ple_disk_prefill_buffer_tokens": 8192,
-    "ple_disk_prefill_read_pages": 128,
-    "ple_disk_max_read_pages": None,
-    "ple_disk_stats_log_interval": 0,
-    "ple_disk_max_prefill_chunk_tokens": 0,
-}
+from sglang.srt.utils.ple_disk import PLE_DISK_DEFAULTS
 
 _PLE_DISK_LAUNCH_FIELDS = tuple(
     name for name in PLE_DISK_DEFAULTS if name != "ple_disk_max_prefill_chunk_tokens"
@@ -25,7 +12,6 @@ _PLE_DISK_LAUNCH_FIELDS = tuple(
 _QWEN4_EXP_MODEL_TYPES = {"qwen4_exp", "qwen4_exp_text"}
 _QWEN4_EXP_ARCHITECTURES = {
     "Qwen4ExpForConditionalGeneration",
-    "Qwen4ExpForCausalLM",
     "Qwen4ExpForCausalLMMTP",
 }
 
@@ -42,14 +28,17 @@ def apply_ple_runtime_config(config, server_args, *, storage) -> None:
     )
 
 
-def apply_sglang_runtime_config(config, server_args) -> bool:
-    """Apply runtime settings when the loaded config belongs to Qwen4-Exp."""
+def is_qwen4_exp_config(config) -> bool:
     architectures = set(getattr(config, "architectures", None) or ())
     model_type = getattr(config, "model_type", None)
-    if not (
+    return bool(
         architectures.intersection(_QWEN4_EXP_ARCHITECTURES)
         or model_type in _QWEN4_EXP_MODEL_TYPES
-    ):
+    )
+
+
+def _apply_sglang_runtime_config(config, server_args) -> bool:
+    if not is_qwen4_exp_config(config):
         return False
     apply_ple_runtime_config(config, server_args, storage=server_args.ple_storage)
     return True
@@ -92,6 +81,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         ple_disk_prefill_read_pages=PLE_DISK_DEFAULTS["ple_disk_prefill_read_pages"],
         ple_disk_max_read_pages=PLE_DISK_DEFAULTS["ple_disk_max_read_pages"],
         ple_disk_stats_log_interval=PLE_DISK_DEFAULTS["ple_disk_stats_log_interval"],
+        ple_disk_cleanup_generations=PLE_DISK_DEFAULTS["ple_disk_cleanup_generations"],
         ple_disk_max_prefill_chunk_tokens=PLE_DISK_DEFAULTS[
             "ple_disk_max_prefill_chunk_tokens"
         ],
@@ -152,6 +142,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ple_disk_prefill_read_pages = ple_disk_prefill_read_pages
         self.ple_disk_max_read_pages = ple_disk_max_read_pages
         self.ple_disk_stats_log_interval = ple_disk_stats_log_interval
+        self.ple_disk_cleanup_generations = ple_disk_cleanup_generations
         self.ple_disk_max_prefill_chunk_tokens = ple_disk_max_prefill_chunk_tokens
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
@@ -159,6 +150,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         # (GLM-5.2 IndexShare); default on for Qwen4-Exp, checkpoint config
         # or --json-model-override-args can disable it.
         self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
+
+    def apply_sglang_runtime_config(self, server_args) -> bool:
+        return _apply_sglang_runtime_config(self, server_args)
 
     @property
     def layers_block_type(self):
@@ -246,3 +240,6 @@ class Qwen4ExpConfig(PretrainedConfig):
             self.text_config, "rope_parameters", {}
         )
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
+
+    def apply_sglang_runtime_config(self, server_args) -> bool:
+        return _apply_sglang_runtime_config(self, server_args)

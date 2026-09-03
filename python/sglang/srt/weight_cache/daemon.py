@@ -34,6 +34,7 @@ Usage:
         --dist-init-method tcp://127.0.0.1:29500
 """
 
+import copy
 import logging
 import os
 import signal
@@ -76,11 +77,23 @@ CLIENT_CONNECTION_TIMEOUT = 30.0
 def _model_config_for_loading(server_args):
     from sglang.srt.configs.model_config import ModelConfig
 
-    model_config = ModelConfig.from_server_args(server_args)
+    model_config = ModelConfig(
+        model_path=server_args.model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        dtype=server_args.dtype,
+        quantization=server_args.quantization,
+    )
+    daemon_args = copy.copy(server_args)
+    object.__setattr__(daemon_args, "ple_storage", "gpu")
+    hook = getattr(model_config.hf_config, "apply_sglang_runtime_config", None)
+    if callable(hook):
+        hook(daemon_args)
     if server_args.ple_storage not in (None, "gpu"):
-        raise ValueError(
-            "The weight-cache daemon requires --ple-storage gpu for "
-            "Qwen4-Exp because CUDA IPC exports device-resident weights"
+        logger.info(
+            "Weight-cache daemon uses GPU PLE storage while the requesting "
+            "engine uses %s storage; CUDA IPC exports device-resident weights",
+            server_args.ple_storage,
         )
     return model_config
 
@@ -109,6 +122,7 @@ class WeightCacheDaemon:
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         dist_init_method: Optional[str] = None,
+        ple_storage: Optional[str] = None,
     ):
         self.model_path = model_path
         self.gpu_id = gpu_id
@@ -125,6 +139,7 @@ class WeightCacheDaemon:
         self.trust_remote_code = trust_remote_code
         self.revision = revision
         self.dist_init_method = dist_init_method
+        self.ple_storage = ple_storage
 
         self.socket_path = get_socket_path(
             compute_global_rank(tp_size, pp_rank, tp_rank)
@@ -234,7 +249,14 @@ class WeightCacheDaemon:
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
             revision=self.revision,
+            ple_storage="gpu",
         )
+        if self.ple_storage not in (None, "gpu"):
+            logger.info(
+                "Weight-cache daemon received engine PLE storage %s and uses "
+                "GPU storage for its CUDA IPC weight copy",
+                self.ple_storage,
+            )
         publish(server_args, role="weight_cache_daemon")
 
         # Initialize distributed backend for model loading
@@ -558,6 +580,7 @@ def run_weight_cache_daemon(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     dist_init_method: Optional[str] = None,
+    ple_storage: Optional[str] = None,
 ):
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
@@ -589,6 +612,7 @@ def run_weight_cache_daemon(
         trust_remote_code=trust_remote_code,
         revision=revision,
         dist_init_method=dist_init_method,
+        ple_storage=ple_storage,
     )
 
     daemon.load()
@@ -614,6 +638,7 @@ def launch_weight_cache_daemons(
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
     force: bool = False,
+    ple_storage: Optional[str] = None,
 ):
     """Launch weight cache daemon processes for this node's PP×TP ranks.
 
@@ -729,6 +754,8 @@ def launch_weight_cache_daemons(
                 cmd += ["--trust-remote-code"]
             if revision:
                 cmd += ["--revision", revision]
+            if ple_storage:
+                cmd += ["--ple-storage", ple_storage]
 
             proc = subprocess.Popen(cmd)
             procs.append(proc)
@@ -875,6 +902,12 @@ if __name__ == "__main__":
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--revision", default=None, help="Model revision")
     parser.add_argument(
+        "--ple-storage",
+        choices=("gpu", "pinned", "disk"),
+        default=None,
+        help="Resolved PLE storage used by the requesting engine.",
+    )
+    parser.add_argument(
         "--dist-init-method",
         default=None,
         help="Distributed init method (e.g. tcp://node0-ip:29500). "
@@ -925,6 +958,7 @@ if __name__ == "__main__":
             trust_remote_code=args.trust_remote_code,
             revision=args.revision,
             dist_init_method=args.dist_init_method,
+            ple_storage=args.ple_storage,
         )
     else:
         # Multi-rank mode: launch daemons for this node's TP ranks
@@ -947,4 +981,5 @@ if __name__ == "__main__":
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
+            ple_storage=args.ple_storage,
         )

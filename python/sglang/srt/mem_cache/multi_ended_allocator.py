@@ -328,8 +328,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return int(self.virtual_to_physical[virt_page].item()) != -1
 
     def reserves_padding_slot(self) -> bool:
-        """Return whether the initial mapping reserves virtual slot zero."""
-        return self.is_slot_allocated(0)
+        """Return whether the initial virtual-id free list excludes slot zero."""
+        free_virtual_ids = self.free_virtual_ids
+        if free_virtual_ids is None and self.peer is not None:
+            free_virtual_ids = self.peer.free_virtual_ids
+        if free_virtual_ids is None:
+            raise RuntimeError("MultiEndedAllocator virtual-id owner is unavailable")
+        return not bool(torch.any(free_virtual_ids == 0).item())
 
     def allocator_state_str(self) -> str:
         return (

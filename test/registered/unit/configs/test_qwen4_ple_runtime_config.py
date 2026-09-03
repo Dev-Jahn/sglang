@@ -1,11 +1,18 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpForConditionalGeneration,
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPinnedHostEmbedding,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.weight_cache.daemon import _model_config_for_loading
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,6 +29,7 @@ _PLE_RUNTIME_FIELDS = (
     "ple_disk_prefill_read_pages",
     "ple_disk_max_read_pages",
     "ple_disk_stats_log_interval",
+    "ple_disk_cleanup_generations",
 )
 
 
@@ -132,18 +140,99 @@ def test_qwen4_draft_config_is_stamped(tmp_path):
     assert draft_config.hf_text_config.ple_disk_dir == str(tmp_path / "images")
 
 
-def test_weight_cache_daemon_rejects_non_gpu_ple_storage(tmp_path):
+def test_weight_cache_daemon_keeps_bf16_qwen4_loading_on_gpu_storage(tmp_path):
     with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=True), patch(
         "sglang.srt.server_args.is_cuda", return_value=True
     ):
         server_args = ServerArgs(
             model_path=str(_MODEL_PATH),
-            ple_storage="pinned",
+            dtype="bfloat16",
             device="cuda",
         )
 
-    with pytest.raises(ValueError, match="weight-cache daemon.*--ple-storage gpu"):
-        _model_config_for_loading(server_args)
+    assert server_args.ple_storage == "pinned"
+    model_config = _model_config_for_loading(server_args)
+    assert model_config.hf_text_config.ple_storage == "gpu"
+
+
+def test_weight_cache_daemon_command_receives_resolved_storage(monkeypatch):
+    from sglang.srt.entrypoints import engine as engine_module
+    from sglang.srt.weight_cache import protocol
+
+    commands = []
+
+    class Process:
+        pid = 17
+        returncode = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        engine_module.subprocess,
+        "Popen",
+        lambda command: commands.append(command) or Process(),
+    )
+    monkeypatch.setattr(engine_module.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(protocol, "cleanup_stale_daemon_files", lambda rank: None)
+    args = SimpleNamespace(
+        dp_size=1,
+        nnodes=1,
+        dist_init_addr="127.0.0.1:23456",
+        tp_size=1,
+        pp_size=1,
+        node_rank=0,
+        ep_size=1,
+        base_gpu_id=0,
+        gpu_id_step=1,
+        model_path=str(_MODEL_PATH),
+        load_format="auto",
+        dtype="bfloat16",
+        quantization=None,
+        model_loader_extra_config="{}",
+        trust_remote_code=False,
+        revision=None,
+        weight_cache_timeout=1,
+        ple_storage="disk",
+    )
+
+    processes = engine_module.Engine._launch_weight_cache_daemons(args)
+
+    assert len(processes) == 1
+    storage_index = commands[0].index("--ple-storage")
+    assert commands[0][storage_index + 1] == "disk"
+
+
+def test_launcher_skips_runtime_config_stamping_for_instance_connector():
+    model_config = ModelConfig(str(_MODEL_PATH))
+    hook = MagicMock(side_effect=AssertionError("launcher stamped instance config"))
+    model_config.hf_config.apply_sglang_runtime_config = hook
+    with patch.object(ServerArgs, "get_model_config", return_value=model_config), patch(
+        "sglang.srt.arg_groups.overrides.is_cuda", return_value=True
+    ), patch("sglang.srt.server_args.is_cuda", return_value=True):
+        args = ServerArgs(
+            model_path="instance://127.0.0.1:8000/qwen",
+            device="cuda",
+            ple_storage="pinned",
+        )
+
+    assert args.ple_storage == "pinned"
+    hook.assert_not_called()
+
+
+def test_loaded_ple_embedding_must_match_requested_storage():
+    model = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(text_config=SimpleNamespace(ple_storage="disk"))
+    ngram = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(ngram)
+    pinned = Qwen4ExpPinnedHostEmbedding.__new__(Qwen4ExpPinnedHostEmbedding)
+    torch.nn.Module.__init__(pinned)
+    ngram.ngram_embedding = pinned
+    model.ple = ngram
+
+    with pytest.raises(RuntimeError, match="requested disk.*PinnedHostEmbedding"):
+        model._assert_ple_storage_matches_config()
 
 
 if __name__ == "__main__":

@@ -120,6 +120,20 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     goto done;
   }
 
+  ple_fetcher_test_deadline_ms(20);
+  ple_fetcher_test_expire_completion_deadline(1);
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  ple_fetcher_test_deadline_ms(0);
+  if (rc != -ETIMEDOUT) {
+    fprintf(stderr, "completion deadline returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
+    fprintf(stderr, "read after completion deadline failed: %d\n", rc);
+    goto done;
+  }
+
   uint64_t invalid_offset = 3 * PAGE_BYTES;
   rc = ple_fetcher_read(fetcher, &invalid_offset, 1, buffer, 2 * PAGE_BYTES);
   if (rc != -EIO) {
@@ -262,6 +276,7 @@ done:
   ple_fetcher_test_completion_on_last_wake(0);
   ple_fetcher_test_interrupt_submissions(0);
   ple_fetcher_test_deadline_ms(0);
+  ple_fetcher_test_expire_completion_deadline(0);
   if (fetcher) {
     int destroy_rc = ple_fetcher_destroy(fetcher);
     if (destroy_rc && result == 0) {

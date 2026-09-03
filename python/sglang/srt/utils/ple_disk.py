@@ -13,6 +13,19 @@
 # ==============================================================================
 
 IORING_MAX_ENTRIES = 32768
+PLE_DISK_MAX_PREFILL_BUFFER_TOKENS = 65536
+PLE_DISK_DEFAULTS = {
+    "ple_disk_dir": None,
+    "ple_disk_hot_cache_gb": 8.0,
+    "ple_disk_hot_frequency_file": None,
+    "ple_disk_dynamic_cache_gb": 2.0,
+    "ple_disk_prefill_buffer_tokens": 8192,
+    "ple_disk_prefill_read_pages": 128,
+    "ple_disk_max_read_pages": None,
+    "ple_disk_stats_log_interval": 0,
+    "ple_disk_cleanup_generations": True,
+    "ple_disk_max_prefill_chunk_tokens": 0,
+}
 
 
 def resolve_ple_storage(config, default=None):

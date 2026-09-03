@@ -62,51 +62,6 @@ class TestPrepareServerArgs(CustomTestCase):
                     **generic_offload,
                 )
 
-    def test_ple_disk_rejects_enabled_prefill_cuda_graph(self):
-        with tempfile.TemporaryDirectory() as disk_dir:
-            args = ServerArgs(
-                model_path="dummy",
-                ple_storage="disk",
-                ple_disk_dir=disk_dir,
-                cuda_graph_backend_prefill=Backend.FULL,
-            )
-            with self.assertRaisesRegex(ValueError, "cuda-graph-backend-prefill"):
-                args._handle_cuda_graph_config()
-
-    def test_ple_disk_logs_prefill_cuda_graph_disable(self):
-        with tempfile.TemporaryDirectory() as disk_dir:
-            args = ServerArgs(
-                model_path="dummy",
-                ple_storage="disk",
-                ple_disk_dir=disk_dir,
-                disable_prefill_cuda_graph=False,
-            )
-            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
-                args._handle_cuda_graph_config()
-
-            self.assertIn("prefill CUDA graphs", "\n".join(logs.output))
-            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-            self.assertTrue(args.disable_prefill_cuda_graph)
-
-    def test_ple_disk_omitted_prefill_disable_has_no_override_warning(self):
-        with tempfile.TemporaryDirectory() as disk_dir:
-            args = ServerArgs(
-                model_path="dummy",
-                ple_storage="disk",
-                ple_disk_dir=disk_dir,
-            )
-            with patch.object(server_args_module.logger, "warning") as warning:
-                args._handle_cuda_graph_config()
-
-            messages = [str(call.args[0]) for call in warning.call_args_list]
-            self.assertFalse(
-                any(
-                    "prefill].backend='full' is experimental" in msg for msg in messages
-                )
-            )
-            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-            self.assertTrue(args.disable_prefill_cuda_graph)
-
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)

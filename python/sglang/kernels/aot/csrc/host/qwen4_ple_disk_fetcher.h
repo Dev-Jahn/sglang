@@ -43,6 +43,7 @@ void ple_fetcher_test_successful_empty_wakes(unsigned wakes);
 void ple_fetcher_test_completion_on_last_wake(int enabled);
 void ple_fetcher_test_interrupt_submissions(unsigned interrupts);
 void ple_fetcher_test_deadline_ms(unsigned milliseconds);
+void ple_fetcher_test_expire_completion_deadline(unsigned count);
 int ple_fetcher_test_ring_open(void* opaque);
 #endif
 

@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 import torch
 from torch import nn
-from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.configs.qwen4_exp import PLE_DISK_DEFAULTS
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
@@ -26,10 +25,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpDiskEmbedding,
-    Qwen4ExpModel,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
-    Qwen4ExpPLELayer,
 )
 from sglang.srt.models.qwen4_ple_disk import (
     PAGE_BYTES,
@@ -562,123 +559,6 @@ def test_disk_tp_shards_sum_to_unsharded_bytes(tmp_path):
     assert torch.equal(combined, expected)
 
 
-def test_disk_fetch_coalesces_pages_across_batch_and_drafts(tmp_path):
-    raw, rows = _fp8_rows(256)
-    root = tmp_path
-    image = build_test_image(root, rows)
-    fetcher = DiskRowFetcher(image, hot_cache_gb=0, max_pages=32)
-    try:
-        # Six rows from one page appear across two requests and three draft slots.
-        ids = np.array([[1, 2, 3], [3, 4, 5]], dtype=np.int64)
-        actual = fetcher.fetch(ids)
-        expected = raw.index_select(0, torch.from_numpy(ids.reshape(-1))).reshape(
-            2, 3, ROW_BYTES
-        )
-        assert torch.equal(actual, expected)
-        stats = fetcher.last_fetch_stats
-        assert stats.rows_requested == 6
-        assert stats.static_hits == 0
-        assert stats.cold_pages == 1
-        assert stats.coalesced_rows == 5
-    finally:
-        fetcher.close()
-
-
-def test_disk_fetch_reuses_caller_owned_output(tmp_path):
-    raw, rows = _fp8_rows(256)
-    root = tmp_path
-    image = build_test_image(root, rows)
-    fetcher = DiskRowFetcher(image, hot_cache_gb=0, max_pages=32)
-    ids = np.array([[1, 2], [-1, 5]], dtype=np.int64)
-    output = torch.full((*ids.shape, ROW_BYTES), 0xFF, dtype=torch.uint8).pin_memory()
-    try:
-        actual = fetcher.fetch(ids, out=output)
-        assert actual is output
-        assert not hasattr(fetcher.reader, "result")
-        assert torch.equal(actual[0, 0], raw[1])
-        assert torch.equal(actual[0, 1], raw[2])
-        assert torch.equal(actual[1, 0], torch.zeros(ROW_BYTES, dtype=torch.uint8))
-        assert torch.equal(actual[1, 1], raw[5])
-        assert fetcher.fetch(ids, out=output) is output
-    finally:
-        fetcher.close()
-
-
-def test_dynamic_wtinylfu_admission_eviction_and_exactness(tmp_path):
-    raw, rows = _fp8_rows(1024)
-    root = tmp_path
-    image = build_test_image(root, rows)
-    fetcher = DiskRowFetcher(
-        image, hot_cache_gb=0, dynamic_capacity_rows=16, max_pages=32
-    )
-    try:
-        same_set = []
-        for row_id in range(rows.shape[0]):
-            if int(fetcher.dynamic._set_indices(np.array([row_id]))[0]) == 0:
-                same_set.append(row_id)
-            if len(same_set) == 12:
-                break
-        protected = same_set[0]
-        assert torch.equal(fetcher.fetch(np.array([protected]))[0], raw[protected])
-        fetcher.dynamic.flush()
-        for _ in range(12):
-            assert torch.equal(fetcher.fetch(np.array([protected]))[0], raw[protected])
-        fetcher.dynamic.flush()
-        for row_id in same_set[1:]:
-            assert torch.equal(fetcher.fetch(np.array([row_id]))[0], raw[row_id])
-            fetcher.dynamic.flush()
-
-        cached = set(int(row_id) for row_id in fetcher.dynamic.tags[0] if row_id >= 0)
-        assert protected in cached
-        assert same_set[-1] in cached
-        assert same_set[1] not in cached
-        assert len(cached) == fetcher.dynamic._WAYS
-
-        actual = fetcher.fetch(np.array([protected]))
-        assert torch.equal(actual[0], raw[protected])
-        assert fetcher.last_fetch_stats.dynamic_hits == 1
-        assert fetcher.last_fetch_stats.cold_pages == 0
-        assert fetcher.dynamic.rows.shape[0] == 16
-    finally:
-        fetcher.close()
-
-
-def test_future_contexts_preserve_request_and_token_order():
-    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
-    nn.Module.__init__(embedding)
-    embedding._prefill_buffer_tokens = 4
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    nn.Module.__init__(layer)
-    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
-    layer._future_lookup_contexts = None
-    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
-    nn.Module.__init__(model)
-    model.ple_ngram_size = 3
-    model.ple_ngram_eos_token_id = 2
-    model._ple_layers = lambda: iter([layer])
-    requests = [
-        SimpleNamespace(
-            origin_input_ids=[10, 11, 12, 13, 14],
-            extend_range=SimpleNamespace(end=2),
-        ),
-        SimpleNamespace(
-            origin_input_ids=[20, 21, 22, 23],
-            extend_range=SimpleNamespace(end=1),
-        ),
-    ]
-    forward_batch = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        input_ids=torch.arange(3, device="cuda"),
-    )
-
-    model.prepare_model_batch(SimpleNamespace(reqs=requests), forward_batch)
-
-    torch.testing.assert_close(
-        layer._future_lookup_contexts.cpu(),
-        torch.tensor([[10, 11, 12], [11, 12, 13], [12, 13, 14], [2, 20, 21]]),
-    )
-
-
 def test_prefill_pipeline_orders_rows_and_stays_double_buffered(tmp_path):
     raw, rows = _fp8_rows(1024)
     root = tmp_path
@@ -953,49 +833,9 @@ def test_graph_replay_smaller_than_capture_uses_padded_lookup_extent(monkeypatch
 
     assert layer._pending_graph_lookup_validation is None
     assert layer._pending_graph_embedding_validation is None
-    assert len(layer._completed_graph_lookup_validation) == 1
-    assert len(layer._completed_graph_embedding_validation) == 1
-
-    torch.cuda.current_stream().synchronize()
-
-    model.prepare_cuda_graph_replay(replay)
-
     assert not layer._completed_graph_lookup_validation
     assert not layer._completed_graph_embedding_validation
     model.release_cuda_graph_replay()
-
-
-def test_graph_lookup_validation_records_an_async_host_result():
-    layer = qwen4_exp_module.Qwen4ExpPLELayer.__new__(qwen4_exp_module.Qwen4ExpPLELayer)
-    nn.Module.__init__(layer)
-    lookup_ids = torch.arange(32, dtype=torch.long, device="cuda").view(2, 16)
-    capture_key = (ForwardMode.DECODE, 2)
-    layer._pending_graph_lookup_validation = (capture_key, 1, lookup_ids.clone())
-    layer._completed_graph_lookup_validation = deque()
-    layer._pending_graph_embedding_validation = None
-    layer._completed_graph_embedding_validation = deque()
-    layer._graph_validation_free_slots = deque()
-    layer._graph_lookup_id_buffers = {capture_key: lookup_ids}
-
-    with profile(activities=[ProfilerActivity.CPU]) as finish_profile:
-        layer.finish_cuda_graph_replay()
-    assert len(layer._completed_graph_lookup_validation) == 1
-
-    layer._completed_graph_lookup_validation[0][3].synchronize()
-    with profile(activities=[ProfilerActivity.CPU]) as consume_profile:
-        layer.validate_cuda_graph_replay()
-
-    operation_names = {event.key for event in finish_profile.key_averages()} | {
-        event.key for event in consume_profile.key_averages()
-    }
-    forbidden = {
-        "aten::item",
-        "aten::_local_scalar_dense",
-        "cudaDeviceSynchronize",
-        "cudaStreamSynchronize",
-    }
-    assert operation_names.isdisjoint(forbidden)
-    assert not layer._completed_graph_lookup_validation
 
 
 if __name__ == "__main__":

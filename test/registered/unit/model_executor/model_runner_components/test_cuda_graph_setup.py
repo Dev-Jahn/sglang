@@ -175,6 +175,83 @@ def test_qwen_prewarm_allocates_staging_only_for_offloaded_ple(monkeypatch, offl
         layer.prepare_cuda_graph_prefetch_buffer.assert_not_called()
 
 
+def test_pinned_prewarm_uses_prefill_token_bucket_extent(monkeypatch):
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.models import qwen4_exp
+    from sglang.srt.models.qwen4_exp import (
+        Qwen4ExpModel,
+        Qwen4ExpPinnedHostEmbedding,
+        Qwen4ExpPLELayer,
+    )
+
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    embedding = Qwen4ExpPinnedHostEmbedding.__new__(Qwen4ExpPinnedHostEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer.ple_embedding = SimpleNamespace(
+        ngram_embedding=embedding, gather_dp_tokens=False
+    )
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
+    layer.prepare_cuda_graph_prefetch_buffer = MagicMock()
+    model.layer = layer
+    runner = SimpleNamespace(
+        device="cpu",
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.FULL, bs=(13,), max_bs=0),
+                decode=SimpleNamespace(backend=Backend.DISABLED),
+            )
+        ),
+    )
+    monkeypatch.setattr(qwen4_exp, "is_sm120_supported", lambda: False)
+
+    model.prewarm_cuda_graphs(runner, capture_decode_cuda_graph=False)
+
+    layer.prepare_cuda_graph_prefetch_buffer.assert_called_once_with(
+        13, torch.device("cpu")
+    )
+
+
+def test_pinned_prewarm_rejects_zero_capture_extent(monkeypatch):
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.models import qwen4_exp
+    from sglang.srt.models.qwen4_exp import (
+        Qwen4ExpModel,
+        Qwen4ExpPinnedHostEmbedding,
+        Qwen4ExpPLELayer,
+    )
+
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    embedding = Qwen4ExpPinnedHostEmbedding.__new__(Qwen4ExpPinnedHostEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer.ple_embedding = SimpleNamespace(
+        ngram_embedding=embedding, gather_dp_tokens=False
+    )
+    layer.reset_cuda_graph_capture_buffers = MagicMock()
+    model.layer = layer
+    runner = SimpleNamespace(
+        device="cpu",
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.FULL, bs=(), max_bs=0),
+                decode=SimpleNamespace(backend=Backend.DISABLED),
+            )
+        ),
+    )
+    monkeypatch.setattr(qwen4_exp, "is_sm120_supported", lambda: False)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"--ple-storage pinned.*zero-token.*--cuda-graph-backend-prefill",
+    ):
+        model.prewarm_cuda_graphs(runner, capture_decode_cuda_graph=False)
+
+
 @pytest.mark.parametrize("ple_storage", ["pinned", "disk"])
 def test_cuda_graph_prewarm_is_required_for_ple_offload(monkeypatch, ple_storage):
     runner = SimpleNamespace(

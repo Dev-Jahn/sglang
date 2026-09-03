@@ -1360,9 +1360,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     neither that nor --disable-radix-cache holds (the QSA pool then fails
     fast at boot).
     """
-    from sglang.srt.configs.qwen4_exp import (
-        resolve_ple_storage,
-    )
+    from sglang.srt.utils.ple_disk import resolve_ple_storage
 
     overrides: Dict[str, Any] = {}
     ple_storage = resolve_ple_storage(server_args)

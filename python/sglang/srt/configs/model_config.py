@@ -611,9 +611,15 @@ class ModelConfig:
             **kwargs,
         )
         if getattr(server_args, "_declarations_materialized", False):
-            from sglang.srt.configs.qwen4_exp import apply_sglang_runtime_config
-
-            apply_sglang_runtime_config(model_config.hf_config, server_args)
+            hook = getattr(model_config.hf_config, "apply_sglang_runtime_config", None)
+            applied = bool(hook(server_args)) if callable(hook) else False
+            if server_args.ple_storage in ("pinned", "disk") and not applied:
+                architectures = getattr(model_config.hf_config, "architectures", None)
+                architecture = architectures[0] if architectures else "unknown"
+                raise ValueError(
+                    f"--ple-storage {server_args.ple_storage} is unavailable for "
+                    f"model architecture {architecture}"
+                )
         return model_config
 
     def _config_draft_model(self):

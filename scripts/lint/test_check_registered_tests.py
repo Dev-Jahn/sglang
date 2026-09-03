@@ -81,6 +81,19 @@ class CheckRegisteredTestsTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout)
 
+    def test_direct_test_function_call_fails_lint(self):
+        result = self._run_lint(
+            "def test_one():\n"
+            "    pass\n"
+            "def test_two():\n"
+            "    pass\n"
+            "if __name__ == '__main__':\n"
+            "    test_one()\n"
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("does not call unittest.main() or pytest.main()", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

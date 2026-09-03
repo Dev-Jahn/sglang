@@ -46,6 +46,7 @@ import numpy as np
 import torch
 from packaging.version import InvalidVersion, Version
 
+from sglang.srt.utils.pinned_memory import allocate_host_tensor as _allocate_host_tensor
 from sglang.srt.utils.ple_disk import validate_max_read_pages
 
 logger = logging.getLogger(__name__)
@@ -53,10 +54,10 @@ logger = logging.getLogger(__name__)
 PAGE_BYTES = 4096
 ROW_BYTES = 160
 ROWS_PER_PAGE = 25
-IMAGE_MAGIC = b"PLEDISK3"
+IMAGE_MAGIC = b"PLEDISK4"
 CRC_MAGIC = b"PLCRC001"
 HOT_MAGIC = b"PLHOT001"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 HOT_FORMAT_VERSION = 1
 PLE_FETCHER_ABI_VERSION = 1
 MIN_SGL_KERNEL_VERSION_FOR_PLE_DISK = "0.4.6.post2"
@@ -70,6 +71,19 @@ _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 # Intentionally unbounded: releasing any entry could let the kernel write into
 # freed memory after a native reader teardown timed out or stayed busy.
 _RETAINED_POISONED_STAGING = []
+_MANIFEST_SOURCE_FIELDS = {
+    "source_file",
+    "source_file_size",
+    "source_file_mtime_ns",
+}
+_STALE_SCRATCH_AGE_SECONDS = 24 * 60 * 60
+
+
+def _retained_staging_bytes() -> int:
+    return sum(
+        int(allocation.numel()) * int(allocation.element_size())
+        for allocation in _RETAINED_POISONED_STAGING
+    )
 
 
 def resolve_hot_frequency_file(
@@ -104,10 +118,6 @@ def resolve_hot_frequency_file(
             f"{ple_layer_index} is not readable: {resolved}"
         )
     return resolved
-
-
-def _allocate_host_tensor(*size, pin_memory: bool = True, **kwargs) -> torch.Tensor:
-    return torch.empty(*size, device="cpu", pin_memory=pin_memory, **kwargs)
 
 
 def _open_direct_file(path: Path) -> int:
@@ -263,6 +273,7 @@ def _validate_manifest_ranges(manifest: list[dict], vocab_end: int, path: Path) 
             "source_file",
             "source_file_size",
             "source_file_mtime_ns",
+            "content_blake2b",
         }.issubset(item):
             raise ValueError(
                 f"PLE image manifest {path} lacks checkpoint source identity; "
@@ -347,7 +358,7 @@ def checkpoint_fingerprint(
                 {
                     key: value
                     for key, value in dict(item).items()
-                    if key != "source_file_mtime_ns"
+                    if key not in _MANIFEST_SOURCE_FIELDS
                 }
                 for item in manifest
             ),
@@ -357,37 +368,6 @@ def checkpoint_fingerprint(
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-
-
-def _sample_row_payload(loaded_weight: torch.Tensor) -> str:
-    row_count = int(loaded_weight.shape[0])
-    sample_count = min(64, row_count)
-    if sample_count:
-        indices = (
-            torch.linspace(
-                0,
-                row_count - 1,
-                sample_count,
-                dtype=torch.float64,
-                device=loaded_weight.device,
-            )
-            .round()
-            .to(torch.long)
-        )
-        indices = torch.unique_consecutive(indices)
-        sampled = (
-            loaded_weight.detach()
-            .index_select(0, indices)
-            .to(device="cpu")
-            .contiguous()
-            .view(torch.uint8)
-            .numpy()
-        )
-        index_bytes = indices.to(device="cpu").numpy().astype("<i8").tobytes()
-        payload = index_bytes + sampled.tobytes()
-    else:
-        payload = b""
-    return hashlib.sha256(struct.pack("<Q", row_count) + payload).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -518,6 +498,7 @@ class PLEImageBuilder:
         dtype: str = "float8_e4m3fn",
         ple_metadata: Optional[Mapping] = None,
         allow_reuse: bool = True,
+        cleanup_generations: bool = True,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -536,6 +517,8 @@ class PLEImageBuilder:
         self.dtype = str(dtype)
         self.ple_metadata = dict(ple_metadata) if ple_metadata is not None else None
         self.allow_reuse = bool(allow_reuse)
+        self.cleanup_generations = bool(cleanup_generations)
+        self._sweep_stale_scratch()
         if self.image_count <= 0:
             raise ValueError("image_count must be positive")
         if self.padded_vocab_size % self.tp_size:
@@ -548,6 +531,7 @@ class PLEImageBuilder:
         self._raw_fd: Optional[int] = None
         self._raw_path: Optional[Path] = None
         self._reuse = self._find_reuse_candidate() if self.allow_reuse else None
+        self._raw_intervals: list[tuple[int, int]] = []
         self._expected_manifest = None
         if self._reuse is None:
             rows_per_rank = self.padded_vocab_size // self.tp_size
@@ -598,6 +582,42 @@ class PLEImageBuilder:
             and (directory / f"rank{rank}.crc32").is_file()
             for rank in range(self.tp_size)
         )
+
+    @staticmethod
+    def _process_has_open_path(path: Path) -> bool:
+        fd_root = Path("/proc/self/fd")
+        try:
+            descriptors = tuple(fd_root.iterdir())
+        except OSError:
+            return True
+        resolved_path = path.resolve()
+        for descriptor in descriptors:
+            try:
+                target = descriptor.resolve(strict=True)
+            except (FileNotFoundError, OSError):
+                continue
+            if target == resolved_path or target.is_relative_to(resolved_path):
+                return True
+        return False
+
+    def _sweep_stale_scratch(self) -> None:
+        cutoff = time.time() - _STALE_SCRATCH_AGE_SECONDS
+        candidates = list(self.root.glob(".rank*.rows.tmp"))
+        candidates.extend(self.root.glob("*/.rank*.bin.*.tmp"))
+        for path in candidates:
+            try:
+                if (
+                    not path.is_file()
+                    or not path.name.startswith(".")
+                    or path.stat().st_mtime >= cutoff
+                    or self._process_has_open_path(path)
+                ):
+                    continue
+                size = path.stat().st_size
+                path.unlink()
+                logger.info("Removed stale PLE scratch file %s (%d bytes)", path, size)
+            except FileNotFoundError:
+                continue
 
     def _find_reuse_candidate(self) -> Optional[PLEImage]:
         matches = []
@@ -665,13 +685,118 @@ class PLEImageBuilder:
         return {
             key: value
             for key, value in dict(item).items()
-            if key != "source_file_mtime_ns"
+            if key not in _MANIFEST_SOURCE_FIELDS
         }
 
-    def _materialize_reuse_rows(self) -> None:
+    @staticmethod
+    def _manifest_geometry(item: Mapping) -> dict:
+        return {
+            key: value
+            for key, value in dict(item).items()
+            if key not in _MANIFEST_SOURCE_FIELDS | {"content_blake2b", "sample_sha256"}
+        }
+
+    def _stream_shard(
+        self,
+        loaded_weight: torch.Tensor,
+        row_start: int,
+        *,
+        write_overlap: bool,
+    ) -> str:
+        digest = hashlib.blake2b(digest_size=32)
+        fd = self._ensure_raw() if write_overlap else None
+        rows_per_chunk = 64 * 1024
+        row_count = int(loaded_weight.shape[0])
+        for begin in range(0, row_count, rows_per_chunk):
+            end = min(begin + rows_per_chunk, row_count)
+            raw = (
+                loaded_weight[begin:end]
+                .detach()
+                .to(device="cpu")
+                .contiguous()
+                .view(torch.uint8)
+                .numpy()
+            )
+            view = memoryview(raw).cast("B")
+            digest.update(view)
+            if fd is None:
+                continue
+            global_start = int(row_start) + begin
+            global_end = int(row_start) + end
+            write_start = max(global_start, self.vocab_start)
+            write_end = min(global_end, self.vocab_end)
+            if write_start >= write_end:
+                continue
+            local_begin = write_start - global_start
+            local_end = write_end - global_start
+            payload = memoryview(raw[local_begin:local_end]).cast("B")
+            offset = (write_start - self.vocab_start) * ROW_BYTES
+            written = 0
+            while written < len(payload):
+                count = os.pwrite(fd, payload[written:], offset + written)
+                if count <= 0:
+                    raise IOError("short write while materializing PLE row image")
+                written += count
+        if write_overlap:
+            overlap_start = max(int(row_start), self.vocab_start)
+            overlap_end = min(int(row_start) + row_count, self.vocab_end)
+            if overlap_start < overlap_end:
+                self._raw_intervals.append(
+                    (
+                        overlap_start - self.vocab_start,
+                        overlap_end - self.vocab_start,
+                    )
+                )
+        return digest.hexdigest()
+
+    def _write_shard_overlap(
+        self, loaded_weight: torch.Tensor, row_start: int, row_end: int
+    ) -> None:
+        ov_start = max(int(row_start), self.vocab_start)
+        ov_end = min(int(row_end), self.vocab_end)
+        if ov_start >= ov_end:
+            return
+        rows_per_chunk = 64 * 1024
+        fd = self._ensure_raw()
+        for begin in range(ov_start, ov_end, rows_per_chunk):
+            end = min(begin + rows_per_chunk, ov_end)
+            src_start = begin - int(row_start)
+            src_end = end - int(row_start)
+            raw = (
+                loaded_weight[src_start:src_end]
+                .detach()
+                .to(device="cpu")
+                .contiguous()
+                .view(torch.uint8)
+                .numpy()
+            )
+            payload = memoryview(raw).cast("B")
+            offset = (begin - self.vocab_start) * ROW_BYTES
+            written = 0
+            while written < len(payload):
+                count = os.pwrite(fd, payload[written:], offset + written)
+                if count <= 0:
+                    raise IOError("short write while materializing PLE row image")
+                written += count
+
+    def _copy_reuse_rows(self) -> None:
         image = self._reuse
         if image is None:
             return
+        covered = []
+        for start, end in sorted(self._raw_intervals):
+            if not covered or start > covered[-1][1]:
+                covered.append([start, end])
+            else:
+                covered[-1][1] = max(covered[-1][1], end)
+        copy_ranges = []
+        cursor = 0
+        for start, end in covered:
+            if cursor < start:
+                copy_ranges.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < self.num_rows:
+            copy_ranges.append((cursor, self.num_rows))
         raw_fd = self._ensure_raw()
         image_fd = os.open(image.path, os.O_RDONLY)
         try:
@@ -690,18 +815,30 @@ class PLEImageBuilder:
                 rows = pages[:, : ROWS_PER_PAGE * ROW_BYTES].reshape(-1, ROW_BYTES)
                 row_start = first_page * ROWS_PER_PAGE
                 row_count = min(rows.shape[0], self.num_rows - row_start)
-                payload = memoryview(rows[:row_count].copy()).cast("B")
-                written = 0
-                offset = row_start * ROW_BYTES
-                while written < len(payload):
-                    count = os.pwrite(raw_fd, payload[written:], offset + written)
-                    if count <= 0:
-                        raise IOError(
-                            "short write while unpacking a reusable PLE image"
-                        )
-                    written += count
+                chunk_end = row_start + row_count
+                for copy_start, copy_end in copy_ranges:
+                    start = max(row_start, copy_start)
+                    end = min(chunk_end, copy_end)
+                    if start >= end:
+                        continue
+                    payload = memoryview(
+                        rows[start - row_start : end - row_start].copy()
+                    ).cast("B")
+                    written = 0
+                    offset = start * ROW_BYTES
+                    while written < len(payload):
+                        count = os.pwrite(raw_fd, payload[written:], offset + written)
+                        if count <= 0:
+                            raise IOError(
+                                "short write while unpacking a reusable PLE image"
+                            )
+                        written += count
         finally:
             os.close(image_fd)
+        self._raw_intervals = [(0, self.num_rows)]
+
+    def _materialize_reuse_rows(self) -> None:
+        self._copy_reuse_rows()
         self._reuse = None
 
     def add_shard(
@@ -710,7 +847,7 @@ class PLEImageBuilder:
         """Append one checkpoint shard to the image build.
 
         Every tensor-parallel rank must call this method for every checkpoint
-        shard before rank-overlap filtering. The sampled digest must cover the
+        shard before rank-overlap filtering. The content digest must cover the
         complete unsharded tensor. These rules keep the shared manifest payload
         equal across ranks.
         """
@@ -750,16 +887,40 @@ class PLEImageBuilder:
             "bytes": int(loaded_weight.numel() * loaded_weight.element_size()),
             "row_start": int(row_start),
             "row_end": int(row_end),
-            "sample_sha256": _sample_row_payload(loaded_weight),
             "source_file": str(source["file"]),
             "source_file_size": int(source["size"]),
             "source_file_mtime_ns": int(source["mtime_ns"]),
         }
+        expected = None
         if self._reuse is not None:
             expected = self._expected_by_name.get(name)
-            content_changed = expected is None or self._comparable_manifest_item(
+            geometry_changed = expected is None or self._manifest_geometry(
                 expected
-            ) != self._comparable_manifest_item(item)
+            ) != self._manifest_geometry(item)
+            source_unchanged = expected is not None and all(
+                expected.get(field) == item[field]
+                for field in ("source_file_size", "source_file_mtime_ns")
+            )
+            expected_digest = (
+                expected.get("content_blake2b") if expected is not None else None
+            )
+            if not geometry_changed and source_unchanged and expected_digest:
+                item["content_blake2b"] = expected_digest
+                logger.info(
+                    "PLE image reuse fast path for %s: source size and mtime " "match",
+                    name,
+                )
+            else:
+                item["content_blake2b"] = self._stream_shard(
+                    loaded_weight, row_start, write_overlap=True
+                )
+                logger.info(
+                    "PLE image reuse verified the full content digest for %s",
+                    name,
+                )
+            content_changed = (
+                geometry_changed or expected_digest != item["content_blake2b"]
+            )
             if content_changed:
                 logger.warning(
                     "PLE checkpoint identity changed for %s; rebuilding %s",
@@ -767,13 +928,10 @@ class PLEImageBuilder:
                     self.module_prefix,
                 )
                 self._materialize_reuse_rows()
-            elif expected is not None and int(
-                expected.get("source_file_mtime_ns", 0)
-            ) != int(item["source_file_mtime_ns"]):
-                logger.debug(
-                    "PLE checkpoint mtime changed for %s; sampled content matches",
-                    name,
-                )
+        else:
+            item["content_blake2b"] = self._stream_shard(
+                loaded_weight, row_start, write_overlap=True
+            )
         self.manifest.append(item)
         ov_start = max(int(row_start), self.vocab_start)
         ov_end = min(int(row_end), self.vocab_end)
@@ -782,25 +940,6 @@ class PLEImageBuilder:
         self.intervals.append((ov_start - self.vocab_start, ov_end - self.vocab_start))
         if self._reuse is not None:
             return
-        src_start = ov_start - int(row_start)
-        src_end = src_start + ov_end - ov_start
-        raw = (
-            loaded_weight[src_start:src_end]
-            .detach()
-            .to(device="cpu")
-            .contiguous()
-            .view(torch.uint8)
-            .numpy()
-        )
-        view = memoryview(raw).cast("B")
-        offset = (ov_start - self.vocab_start) * ROW_BYTES
-        written = 0
-        fd = self._ensure_raw()
-        while written < len(view):
-            count = os.pwrite(fd, view[written:], offset + written)
-            if count <= 0:
-                raise IOError("short write while materializing PLE row image")
-            written += count
 
     def _validate_coverage(self) -> None:
         merged = []
@@ -1042,7 +1181,9 @@ class PLEImageBuilder:
                 ple_metadata_tmp.unlink(missing_ok=True)
 
     def _remove_superseded_generations(self, current_dir: Path) -> None:
-        if not self._generation_is_complete(current_dir):
+        if not self.cleanup_generations or not self._generation_is_complete(
+            current_dir
+        ):
             return
         for path in self.root.glob("*/rank0.bin"):
             directory = path.parent
@@ -1059,7 +1200,27 @@ class PLEImageBuilder:
                 and int(header.get("padded_vocab_size", -1)) == self.padded_vocab_size
                 and int(header.get("valid_vocab_size", -1)) == self.valid_vocab_size
             ):
-                shutil.rmtree(directory)
+                if self._process_has_open_path(directory):
+                    logger.info(
+                        "Keeping superseded PLE generation %s because this "
+                        "process still has an open file in it",
+                        directory,
+                    )
+                    continue
+                try:
+                    size = sum(
+                        entry.stat().st_size
+                        for entry in directory.rglob("*")
+                        if entry.is_file()
+                    )
+                    shutil.rmtree(directory)
+                    logger.info(
+                        "Removed superseded PLE generation %s (%d bytes)",
+                        directory,
+                        size,
+                    )
+                except FileNotFoundError:
+                    continue
 
     def close(self) -> None:
         if self._raw_fd is not None:
@@ -1431,6 +1592,16 @@ class WTinyLFURowCache:
             )
         )
 
+    def _frequency_many(self, row_ids: np.ndarray) -> np.ndarray:
+        values = np.asarray(row_ids, dtype=np.uint64).reshape(-1)
+        frequencies = np.empty((self._SKETCH_DEPTH, values.size), dtype=np.uint8)
+        for depth, multiplier in enumerate(self._HASH_MIX):
+            mixed = values * multiplier
+            mixed ^= mixed >> np.uint64(29)
+            columns = (mixed & np.uint64(self.sketch_width - 1)).astype(np.int64)
+            frequencies[depth] = self.sketch[depth, columns]
+        return frequencies.min(axis=0)
+
     def _increment(self, row_id: int) -> None:
         self._increment_many(np.asarray([row_id], dtype=np.int64))
 
@@ -1508,6 +1679,10 @@ class WTinyLFURowCache:
             )
 
     def _insert(self, row_id: int, exact_row: np.ndarray) -> None:
+        with self._lock:
+            self._insert_locked(row_id, exact_row)
+
+    def _insert_locked(self, row_id: int, exact_row: np.ndarray) -> None:
         set_index = int(self._set_indices(np.array([row_id]))[0])
         tags = self.tags[set_index]
         existing = np.flatnonzero(tags == row_id)
@@ -1537,14 +1712,12 @@ class WTinyLFURowCache:
         if empty.size:
             victim_way = int(empty[0]) + 1
         else:
-            frequencies = np.array(
-                [self._frequency(int(tag)) for tag in main_tags], dtype=np.int32
-            )
+            frequencies = self._frequency_many(main_tags)
             minimum = frequencies.min()
             tied = np.flatnonzero(frequencies == minimum) + 1
             victim_way = int(tied[np.argmin(self.recency[set_index, tied])])
-            victim_id = int(tags[victim_way])
-            if self._frequency(candidate_id) < self._frequency(victim_id):
+            victim_frequency = int(frequencies[victim_way - 1])
+            if self._frequency(candidate_id) < victim_frequency:
                 return
         tags[victim_way] = candidate_id
         self.rows[set_index * self._WAYS + victim_way].copy_(
@@ -1559,15 +1732,12 @@ class WTinyLFURowCache:
                 if item is None:
                     return
                 ids, rows = item
-                for begin in range(0, ids.size, 64):
-                    end = min(begin + 64, ids.size)
+                for index in range(ids.size):
                     with self._lock:
-                        for index in range(begin, end):
-                            row_id = ids[index]
-                            value = int(row_id)
-                            self._increment(value)
-                            if rows is not None:
-                                self._insert(value, rows[index])
+                        value = int(ids[index])
+                        self._increment(value)
+                        if rows is not None:
+                            self._insert_locked(value, rows[index])
             except BaseException as exc:
                 with self._lock:
                     if self._worker_error is None:
@@ -1808,11 +1978,18 @@ class DirectPageReader:
             if error == errno.ENOMEM and (
                 failure_stage.value == FETCHER_FAILURE_REGISTER_BUFFER
             ):
+                retained = _retained_staging_bytes()
+                retained_note = (
+                    f"; {retained} bytes remain in retained staging allocations"
+                    if retained
+                    else ""
+                )
                 raise OSError(
                     error,
                     "PLE io_uring buffer registration exceeded RLIMIT_MEMLOCK "
                     f"while registering {self.staging.numel()} bytes; raise the "
-                    "memlock ulimit or lower --ple-disk-max-read-pages",
+                    "memlock ulimit or lower --ple-disk-max-read-pages"
+                    f"{retained_note}",
                 )
             if error in (errno.EPERM, errno.EACCES, errno.ENOSYS) and (
                 failure_stage.value == FETCHER_FAILURE_SETUP
@@ -1847,17 +2024,19 @@ class DirectPageReader:
         if page_ids.size <= self.max_pages:
             with self.locked_pages(page_ids) as pages:
                 return pages.copy()
-        self._acquire_read_lock()
+        chunks = (page_ids.size + self.max_pages - 1) // self.max_pages
+        self._acquire_read_lock(chunks)
         try:
             return self._read_locked(page_ids, return_staging=False)
         finally:
             self._read_lock.release()
 
-    def _acquire_read_lock(self) -> None:
-        if not self._read_lock.acquire(timeout=self._read_lock_timeout_seconds):
+    def _acquire_read_lock(self, chunks: int = 1) -> None:
+        budget = max(1, int(chunks)) * self._read_lock_timeout_seconds
+        if not self._read_lock.acquire(timeout=budget):
             raise TimeoutError(
                 "PLE direct page reader timed out waiting "
-                f"{self._read_lock_timeout_seconds:.1f}s for another caller"
+                f"{budget:.1f}s for another caller ({max(1, int(chunks))} chunks)"
             )
 
     @contextmanager
@@ -1973,10 +2152,11 @@ class DirectPageReader:
                             _RETAINED_POISONED_STAGING.append(self._staging_allocation)
                             self._staging_retained = True
                         logger.error(
-                            "PLE disk fetcher retained %d staging bytes for the "
+                            "PLE disk fetcher retained %d staging bytes "
+                            "cumulatively for the "
                             "process lifetime after shutdown could not drain "
                             "pending reads",
-                            self._staging_allocation.numel(),
+                            _retained_staging_bytes(),
                         )
                     if rc:
                         destroy_error = OSError(
@@ -1997,9 +2177,10 @@ class DirectPageReader:
                 _RETAINED_POISONED_STAGING.append(self._staging_allocation)
                 self._staging_retained = True
                 logger.error(
-                    "PLE disk fetcher retained %d staging bytes during garbage "
+                    "PLE disk fetcher retained %d staging bytes cumulatively "
+                    "during garbage "
                     "collection because native shutdown stayed busy",
-                    self._staging_allocation.numel(),
+                    _retained_staging_bytes(),
                 )
         except Exception:
             pass

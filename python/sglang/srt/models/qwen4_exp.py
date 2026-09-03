@@ -20,7 +20,6 @@ from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
-    resolve_ple_storage,
 )
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -81,10 +80,11 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.qwen4_ple_disk import _allocate_host_tensor
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm120_supported, is_sm121, logger
 from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
+from sglang.srt.utils.pinned_memory import allocate_host_tensor as _allocate_host_tensor
+from sglang.srt.utils.ple_disk import resolve_ple_storage
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -1059,6 +1059,7 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
             "valid_vocab_size": int(valid_vocab_size),
             "dtype": "float8_e4m3fn",
             "ple_metadata": ple_metadata,
+            "cleanup_generations": bool(config.ple_disk_cleanup_generations),
         }
         self._image_builder = PLEImageBuilder(**self._builder_args)
         self._rank = rank
@@ -1437,10 +1438,20 @@ class Qwen4ExpDiskEmbedding(VocabParallelEmbedding):
         return len(bounds)
 
     def stats_snapshot(self) -> dict:
-        return {
+        snapshot = {
             key: list(value) if isinstance(value, list) else value
             for key, value in self._stats.items()
         }
+        fetcher = self._fetcher
+        dynamic = getattr(fetcher, "dynamic", None) if fetcher is not None else None
+        if dynamic is None:
+            snapshot["dynamic_admission_dropped"] = 0
+            snapshot["dynamic_admission_queue_depth"] = 0
+        else:
+            with dynamic._lock:
+                snapshot["dynamic_admission_dropped"] = dynamic._dropped_batches
+            snapshot["dynamic_admission_queue_depth"] = dynamic._queue.qsize()
+        return snapshot
 
     def wait_for_prefetch(self) -> None:
         future = self._future
@@ -1707,6 +1718,7 @@ class Qwen4ExpPLELayer(nn.Module):
             torch.cuda.Stream() if ple_storage in ("pinned", "disk") else None
         )
         self._graph_prefetch_buffer = None
+        self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
         self._graph_replay_generation = None
@@ -1879,8 +1891,10 @@ class Qwen4ExpPLELayer(nn.Module):
     def prepare_cuda_graph_prefetch_buffer(
         self, lookup_tokens: int, device: torch.device
     ) -> None:
-        """Allocate the shared graph output before any capture begins."""
+        """Allocate the fixed disk graph output before capture begins."""
         if self._prefetch_stream is None or lookup_tokens <= 0:
+            return
+        if not isinstance(self.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
             return
         buffer = self._graph_prefetch_buffer
         if buffer is not None:
@@ -1898,6 +1912,11 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffer = buffer
 
     def reset_cuda_graph_capture_buffers(self) -> None:
+        buffers = getattr(self, "_graph_prefetch_buffers", None)
+        if buffers is None:
+            self._graph_prefetch_buffers = {}
+        else:
+            buffers.clear()
         self._graph_lookup_id_buffers.clear()
         self._graph_lookup_id_buffer_owners.clear()
         self._graph_embedding_snapshot_buffers.clear()
@@ -1931,7 +1950,9 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._is_capturing():
             if graph_key is None:
                 graph_key = (ForwardMode.DECODE, lookup_tokens, None, None)
-            return self._select_graph_prefetch_buffer(graph_key, allocate=True)
+            return self._select_graph_prefetch_buffer(
+                graph_key, device=lookup_ids.device, allocate=True
+            )
 
         buffer = self._eager_prefetch_buffer
         if buffer is None or buffer.shape[0] < lookup_tokens:
@@ -1943,10 +1964,16 @@ class Qwen4ExpPLELayer(nn.Module):
         self,
         graph_key: Tuple[ForwardMode, int, Optional[str], Optional[str]],
         *,
+        device: Optional[torch.device] = None,
         allocate: bool = False,
     ) -> torch.Tensor:
         _, lookup_tokens, *_ = graph_key
-        if self._graph_prefetch_buffer is not None:
+        if isinstance(self.ple_embedding.ngram_embedding, Qwen4ExpDiskEmbedding):
+            if self._graph_prefetch_buffer is None:
+                raise RuntimeError(
+                    "PLE disk graph staging must be preallocated and zeroed "
+                    "before capture"
+                )
             if not allocate and graph_key not in self._graph_lookup_id_buffers:
                 raise RuntimeError(
                     "PLE graph replay has no captured staging buffer for "
@@ -1960,14 +1987,21 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
             return buffer[:lookup_tokens]
 
-        if allocate:
+        buffers = getattr(self, "_graph_prefetch_buffers", None)
+        if buffers is None:
+            buffers = self._graph_prefetch_buffers = {}
+        buffer = buffers.get(graph_key)
+        if buffer is None and allocate:
+            if device is None:
+                raise ValueError("a device is required for graph buffer allocation")
+            buffer = self._allocate_prefetch_buffer(lookup_tokens, device)
+            buffers[graph_key] = buffer
+        if buffer is None:
             raise RuntimeError(
-                "PLE graph staging must be preallocated and zeroed before capture"
+                "PLE graph replay has no captured staging buffer for "
+                f"{lookup_tokens} lookup tokens"
             )
-        raise RuntimeError(
-            "PLE graph replay has no captured staging buffer for "
-            f"{lookup_tokens} lookup tokens"
-        )
+        return buffer
 
     def start_prefetch(
         self,
@@ -2207,6 +2241,16 @@ class Qwen4ExpPLELayer(nn.Module):
                     actual_ids.ne(expected_ids),
                 )
             self._pending_graph_lookup_validation = None
+        self._consume_graph_validation(
+            "_completed_graph_embedding_validation",
+            "PLE graph staging differs at consumption",
+            wait=True,
+        )
+        self._consume_graph_validation(
+            "_completed_graph_lookup_validation",
+            "PLE graph lookup IDs differ from disk staging",
+            wait=True,
+        )
 
     def _record_graph_validation(
         self,
@@ -2233,13 +2277,18 @@ class Qwen4ExpPLELayer(nn.Module):
         completed.append((lookup_tokens, replay_step, host_result, ready))
 
     def _consume_graph_validation(
-        self, completed_attr: str, error_message: str
+        self, completed_attr: str, error_message: str, *, wait: bool = False
     ) -> None:
         completed = getattr(self, completed_attr, None)
         if not completed:
             return
         consumed = []
-        while completed and completed[0][3].query():
+        while completed:
+            ready = completed[0][3]
+            if wait:
+                ready.synchronize()
+            elif not ready.query():
+                break
             consumed.append(completed.popleft())
         free_slots = getattr(self, "_graph_validation_free_slots", None)
         if free_slots is None:
@@ -2249,8 +2298,7 @@ class Qwen4ExpPLELayer(nn.Module):
             for lookup_tokens, replay_step, host_result, _ in consumed:
                 if bool(host_result.numpy()[0]):
                     raise RuntimeError(
-                        f"{error_message}; check is one step behind: output for "
-                        f"replay step {replay_step} was already emitted "
+                        f"{error_message} on replay step {replay_step} "
                         f"(lookup tokens={lookup_tokens})"
                     )
         finally:
@@ -3086,6 +3134,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         graph_config = model_runner.server_args.cuda_graph_config
         max_tokens = 0
         if graph_config.prefill.backend != Backend.DISABLED:
+            # Prefill graph buckets are aggregate token counts, unlike decode
+            # buckets whose size is converted by max_decode_logits_rows().
             max_tokens = max(
                 max_tokens,
                 max(graph_config.prefill.bs or (graph_config.prefill.max_bs or 0,)),
@@ -3095,6 +3145,19 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             and graph_config.decode.backend != Backend.DISABLED
         ):
             max_tokens = max(max_tokens, model_runner.max_decode_logits_rows())
+
+        if max_tokens <= 0 and any(
+            isinstance(
+                module.ple_embedding.ngram_embedding,
+                Qwen4ExpPinnedHostEmbedding,
+            )
+            for module in ple_layers
+        ):
+            raise RuntimeError(
+                "--ple-storage pinned cannot capture a zero-token PLE staging "
+                "extent; enable a nonzero --cuda-graph-backend-prefill bucket "
+                "or decode CUDA graph batch size"
+            )
 
         for module in ple_layers:
             lookup_tokens = max_tokens
@@ -3335,6 +3398,29 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
         loaded_buffers.add(name)
         return True
+
+    def _assert_ple_storage_matches_config(self) -> None:
+        text_config = getattr(self.config, "text_config", self.config)
+        requested = resolve_ple_storage(text_config, default="gpu")
+        expected_type = {
+            "gpu": VocabParallelEmbedding,
+            "pinned": Qwen4ExpPinnedHostEmbedding,
+            "disk": Qwen4ExpDiskEmbedding,
+        }[requested]
+        for name, module in self.named_modules():
+            if not isinstance(module, Qwen4ExpNGramEmbedding):
+                continue
+            embedding = module.ngram_embedding
+            matches = (
+                type(embedding) is VocabParallelEmbedding
+                if requested == "gpu"
+                else isinstance(embedding, expected_type)
+            )
+            if not matches:
+                raise RuntimeError(
+                    f"Qwen4 PLE storage mismatch for {name}: requested "
+                    f"{requested}, constructed {type(embedding).__name__}"
+                )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -3686,6 +3772,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 module.finalize_fused_in_proj()
             elif isinstance(module, Qwen4ExpDiskEmbedding):
                 module.finalize_image()
+
+        self._assert_ple_storage_matches_config()
 
         return loaded_params
 

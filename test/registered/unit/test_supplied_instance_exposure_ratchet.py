@@ -481,6 +481,9 @@ _EXPOSED = {
     ("utils/cuda_vmm_transport_utils.py", "mm_feature_transport"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
     ("utils/offloader.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "model_path"),
+    ("weight_cache/daemon.py", "quantization"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
@@ -579,6 +582,10 @@ _OVERRIDDEN_AND_READ = {
     ("utils/common.py", "speculative_num_steps"),
     ("utils/cuda_vmm_transport_utils.py", "dp_size"),
     ("utils/offloader.py", "dp_size"),
+    # The daemon copies these into ModelConfig during startup, before it can
+    # receive a runtime model-path or dtype override.
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "model_path"),
 }
 
 

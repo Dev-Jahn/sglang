@@ -420,9 +420,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             accepted.max_prefill_tokens,
         )
 
-    def test_shared_runner_modules_do_not_import_qwen4_config(self):
+    def test_generic_runtime_modules_do_not_import_qwen4_config(self):
         root = Path(__file__).resolve().parents[3]
         for relative in (
+            "python/sglang/srt/configs/model_config.py",
+            "python/sglang/srt/server_args.py",
             "python/sglang/srt/model_executor/model_runner.py",
             "python/sglang/srt/model_executor/model_runner_components/load_model_utils.py",
         ):

@@ -1,3 +1,4 @@
+import ast
 import ctypes
 import errno
 import gc
@@ -8,6 +9,7 @@ import os
 import queue
 import runpy
 import threading
+import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +21,7 @@ import pytest
 import torch
 from packaging.version import Version
 
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models import qwen4_ple_disk as disk
@@ -252,6 +255,8 @@ def test_disk_padding_slot_uses_each_real_allocator_contract():
     multi.page_size = 2
     multi.num_pages = 4
     multi.virtual_to_physical = torch.tensor([0, -1, -1, -1])
+    multi.free_virtual_ids = torch.tensor([1, 2, 3])
+    multi._peer = None
 
     swa = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
     swa.full_attn_allocator = token
@@ -285,6 +290,25 @@ def test_disk_padding_slot_uses_each_real_allocator_contract():
     token.free_pages = torch.tensor([0, 1])
     assert not allocator_reserves_padding_slot(token)
     assert multi.is_slot_allocated(0)
+    multi.free_virtual_ids = None
+    multi._peer = SimpleNamespace(free_virtual_ids=torch.tensor([1, 2, 3]))
+    assert allocator_reserves_padding_slot(multi)
+    multi._peer.free_virtual_ids = torch.tensor([0, 1, 2, 3])
+    assert not allocator_reserves_padding_slot(multi)
+    multi._peer = None
+    multi.free_virtual_ids = torch.tensor([0, 1, 2, 3])
+    assert not allocator_reserves_padding_slot(multi)
+
+
+def test_missing_padding_slot_contract_names_the_allocator_and_disk_flag():
+    class MissingAllocator:
+        pass
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"MissingAllocator\.reserves_padding_slot.*--ple-storage disk",
+    ):
+        BaseTokenToKVPoolAllocator.reserves_padding_slot(MissingAllocator())
 
 
 def test_layer_multipliers_follow_the_default_device_context():
@@ -339,6 +363,26 @@ def test_engine_legacy_ple_keyword_rejects_explicit_conflict():
     kwargs = {"ple_offload_embedding": True, "ple_storage": "gpu"}
     with pytest.raises(ValueError, match="ple_offload_embedding.*ple_storage"):
         _translate_legacy_ple_storage_kwargs(kwargs)
+
+
+def test_engine_none_legacy_ple_keyword_leaves_resolution_unset():
+    from sglang.srt.entrypoints.engine import _translate_legacy_ple_storage_kwargs
+
+    kwargs = {"ple_offload_embedding": None}
+    _translate_legacy_ple_storage_kwargs(kwargs)
+    assert kwargs == {}
+
+
+def test_qwen4_model_has_no_top_level_disk_engine_import():
+    model_path = Path(disk.__file__).with_name("qwen4_exp.py")
+    tree = ast.parse(model_path.read_text())
+    imported_modules = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+
+    assert "sglang.srt.models.qwen4_ple_disk" not in imported_modules
 
 
 def test_checkpoint_config_uses_server_disk_defaults():
@@ -860,6 +904,9 @@ def test_memlock_error_names_limit_bytes_and_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(
         disk, "pageable_memory_access_uses_host_page_tables", lambda: False
     )
+    monkeypatch.setattr(
+        disk, "_RETAINED_POISONED_STAGING", [torch.empty(13, dtype=torch.uint8)]
+    )
     torch_empty = torch.empty
     monkeypatch.setattr(
         disk.torch,
@@ -872,6 +919,7 @@ def test_memlock_error_names_limit_bytes_and_flag(tmp_path, monkeypatch):
     assert "RLIMIT_MEMLOCK" in message
     assert str(19 * disk.PAGE_BYTES) in message
     assert "--ple-disk-max-read-pages" in message
+    assert "13 bytes remain in retained staging" in message
 
 
 @pytest.mark.parametrize("blocked_errno", [errno.EPERM, errno.EACCES, errno.ENOSYS])
@@ -1950,6 +1998,24 @@ def test_dynamic_cache_reports_a_full_admission_queue(caplog):
         cache.close()
 
 
+def test_disk_stats_export_admission_drops_and_queue_depth():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    dynamic = SimpleNamespace(
+        _lock=threading.Lock(),
+        _dropped_batches=7,
+        _queue=queue.Queue(),
+    )
+    dynamic._queue.put(object())
+    embedding._fetcher = SimpleNamespace(dynamic=dynamic)
+    embedding._stats = {"steps": 3}
+
+    snapshot = embedding.stats_snapshot()
+
+    assert snapshot["dynamic_admission_dropped"] == 7
+    assert snapshot["dynamic_admission_queue_depth"] == 1
+
+
 def test_dynamic_cache_hits_do_not_displace_an_admission(monkeypatch):
     worker_entered = threading.Event()
     release_worker = threading.Event()
@@ -2061,7 +2127,31 @@ def test_dynamic_cache_admission_bounds_each_lock_acquisition():
     cache._increment = lambda row_id: setattr(lock, "current", lock.current + 1)
     cache._admission_loop()
     assert len(lock.work) > 1
-    assert max(lock.work) <= 64
+    assert max(lock.work) <= 1
+
+
+def test_large_reader_request_scales_lock_wait_by_chunk_count():
+    reader = disk.DirectPageReader.__new__(disk.DirectPageReader)
+    reader.max_pages = 2
+    reader._read_lock_timeout_seconds = 1.5
+    waits = []
+
+    class Lock:
+        def acquire(self, *, timeout):
+            waits.append(timeout)
+            return True
+
+        def release(self):
+            pass
+
+    reader._read_lock = Lock()
+    reader._read_locked = lambda page_ids, return_staging: np.empty(
+        (page_ids.size, disk.PAGE_BYTES), dtype=np.uint8
+    )
+
+    reader.read(np.arange(5))
+
+    assert waits == [4.5]
 
 
 def test_dynamic_cache_record_checks_closed_under_the_condition():
@@ -2116,7 +2206,7 @@ def test_dynamic_cache_worker_failure_is_reported_and_close_is_bounded(
     cache = disk.WTinyLFURowCache(capacity_rows=8)
     monkeypatch.setattr(
         cache,
-        "_insert",
+        "_insert_locked",
         lambda row_id, exact_row: (_ for _ in ()).throw(RuntimeError("injected")),
     )
     cache.record(np.array([1]), np.zeros((1, disk.ROW_BYTES), dtype=np.uint8))
@@ -2393,11 +2483,10 @@ def test_real_builder_weight_reload_replaces_the_reusable_image(tmp_path):
 
     changed = rows.clone().view(torch.uint8)
     changed[0, 0] = (changed[0, 0] + 1) % 0x7F
-    changed = changed.view(torch.float8_e4m3fn)
+    changed = attach_checkpoint_source(changed.view(torch.float8_e4m3fn))
+    changed._sglang_checkpoint_source["mtime_ns"] = 2
     embedding.prepare_weight_reload()
-    embedding.add_checkpoint_shard(
-        "shard_0.weight", attach_checkpoint_source(changed), 0, 25
-    )
+    embedding.add_checkpoint_shard("shard_0.weight", changed, 0, 25)
     embedding.finalize_image()
 
     assert embedding._image.path != old_image.path
@@ -2408,6 +2497,86 @@ def test_real_builder_weight_reload_replaces_the_reusable_image(tmp_path):
         assert startup._reuse.path == embedding._image.path
     finally:
         startup.close()
+
+
+def test_generation_cleanup_logs_removed_path_and_size(tmp_path, caplog):
+    rows = _fp8_rows(25)
+    first = disk.PLEImageBuilder(tmp_path, "cleanup-log", 0, 1, 0, 25)
+    first.add_shard("shard", rows, 0, 25)
+    old_image, _, _ = first.finalize(0.5)
+    changed = rows.clone().view(torch.uint8)
+    changed[0, 0] = (changed[0, 0] + 1) % 0x7F
+    changed = attach_checkpoint_source(changed.view(torch.float8_e4m3fn))
+    changed._sglang_checkpoint_source["mtime_ns"] = 2
+
+    with caplog.at_level("INFO"):
+        replacement = disk.PLEImageBuilder(tmp_path, "cleanup-log", 0, 1, 0, 25)
+        replacement.add_shard("shard", changed, 0, 25)
+        replacement.finalize(0.5)
+
+    assert not old_image.path.parent.exists()
+    assert str(old_image.path.parent) in caplog.text
+    assert "bytes" in caplog.text
+
+
+def test_generation_cleanup_can_be_disabled(tmp_path):
+    rows = _fp8_rows(25)
+    first = disk.PLEImageBuilder(tmp_path, "cleanup-disabled", 0, 1, 0, 25)
+    first.add_shard("shard", rows, 0, 25)
+    first.finalize(0.5)
+    changed = rows.clone().view(torch.uint8)
+    changed[0, 0] = (changed[0, 0] + 1) % 0x7F
+    changed = attach_checkpoint_source(changed.view(torch.float8_e4m3fn))
+    changed._sglang_checkpoint_source["mtime_ns"] = 2
+    replacement = disk.PLEImageBuilder(
+        tmp_path, "cleanup-disabled", 0, 1, 0, 25, cleanup_generations=False
+    )
+    replacement.add_shard("shard", changed, 0, 25)
+    replacement.finalize(0.5)
+
+    assert len(list(tmp_path.glob("*/rank0.bin"))) == 2
+
+
+def test_generation_cleanup_skips_a_directory_with_an_open_file(tmp_path):
+    rows = _fp8_rows(25)
+    first = disk.PLEImageBuilder(tmp_path, "cleanup-open", 0, 1, 0, 25)
+    first.add_shard("shard", rows, 0, 25)
+    old_image, _, _ = first.finalize(0.5)
+    changed = rows.clone().view(torch.uint8)
+    changed[0, 0] = (changed[0, 0] + 1) % 0x7F
+    changed = attach_checkpoint_source(changed.view(torch.float8_e4m3fn))
+    changed._sglang_checkpoint_source["mtime_ns"] = 2
+
+    with old_image.path.open("rb"):
+        replacement = disk.PLEImageBuilder(tmp_path, "cleanup-open", 0, 1, 0, 25)
+        replacement.add_shard("shard", changed, 0, 25)
+        replacement.finalize(0.5)
+
+    assert old_image.path.exists()
+
+
+def test_builder_sweeps_only_old_dot_prefixed_scratch_files(tmp_path):
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    stale_raw = tmp_path / ".rank0.abc.rows.tmp"
+    stale_image = generation / ".rank0.bin.abc.tmp"
+    recent = tmp_path / ".rank1.recent.rows.tmp"
+    visible = tmp_path / "rank0.visible.rows.tmp"
+    for path in (stale_raw, stale_image, recent, visible):
+        path.write_bytes(b"scratch")
+    old = time.time() - disk._STALE_SCRATCH_AGE_SECONDS - 1
+    os.utime(stale_raw, (old, old))
+    os.utime(stale_image, (old, old))
+
+    builder = disk.PLEImageBuilder(
+        tmp_path, "scratch-sweep", 0, 1, 0, 25, allow_reuse=False
+    )
+    builder.close()
+
+    assert not stale_raw.exists()
+    assert not stale_image.exists()
+    assert recent.exists()
+    assert visible.exists()
 
 
 def test_failed_weight_reload_keeps_the_previous_image_serving(monkeypatch):
@@ -2627,22 +2796,57 @@ def test_weight_scale_change_rebuilds_the_image(tmp_path, caplog):
     assert "scale changed" in caplog.text
 
 
-def test_sampled_payload_change_rebuilds_same_shape_image(tmp_path, caplog):
-    rows = _fp8_rows(25)
+def test_unsampled_payload_change_rebuilds_same_shape_image(tmp_path, caplog):
+    rows = _fp8_rows(20_000)
     build_test_image(tmp_path, rows, config_sha256="payload", weight_scale=0.5)
     changed = rows.view(torch.uint8).clone()
-    changed[12, 7] ^= 1
-    builder = disk.PLEImageBuilder(tmp_path, "payload", 0, 1, 0, 25)
+    changed[1, 7] ^= 1
+    changed = attach_checkpoint_source(changed.view(torch.float8_e4m3fn))
+    changed._sglang_checkpoint_source["mtime_ns"] = 2
+    builder = disk.PLEImageBuilder(tmp_path, "payload", 0, 1, 0, 20_000)
     builder.add_shard(
         "test.shard_0.weight",
-        attach_checkpoint_source(changed.view(torch.float8_e4m3fn)),
+        changed,
         0,
-        25,
+        20_000,
     )
     with caplog.at_level("WARNING"):
         _, reused, _ = builder.finalize(0.5)
     assert not reused
     assert "identity changed" in caplog.text
+
+
+def test_unchanged_source_metadata_uses_digest_fast_path(tmp_path, monkeypatch, caplog):
+    rows = _fp8_rows(25)
+    build_test_image(tmp_path, rows, config_sha256="fast-path", weight_scale=0.5)
+    builder = disk.PLEImageBuilder(tmp_path, "fast-path", 0, 1, 0, 25)
+    monkeypatch.setattr(
+        builder,
+        "_stream_shard",
+        lambda *args, **kwargs: pytest.fail("fast path streamed checkpoint rows"),
+    )
+
+    with caplog.at_level("INFO"):
+        builder.add_shard("test.shard_0.weight", rows, 0, 25)
+        _, reused, _ = builder.finalize(0.5)
+
+    assert reused
+    assert "reuse fast path" in caplog.text
+
+
+def test_changed_mtime_with_the_same_full_digest_reuses_image(tmp_path, caplog):
+    rows = _fp8_rows(25)
+    build_test_image(tmp_path, rows, config_sha256="digest-match", weight_scale=0.5)
+    changed_metadata = attach_checkpoint_source(rows.clone())
+    changed_metadata._sglang_checkpoint_source["mtime_ns"] = 2
+    builder = disk.PLEImageBuilder(tmp_path, "digest-match", 0, 1, 0, 25)
+
+    with caplog.at_level("INFO"):
+        builder.add_shard("test.shard_0.weight", changed_metadata, 0, 25)
+        _, reused, _ = builder.finalize(0.5)
+
+    assert reused
+    assert "verified the full content digest" in caplog.text
 
 
 def test_unregistered_staging_reads_with_the_same_pointer(tmp_path, monkeypatch):
@@ -2711,6 +2915,130 @@ def test_disk_gather_uses_the_driver_capture_predicate(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires a preallocated output"):
         embedding.gather(torch.tensor([0], dtype=torch.long))
+
+
+def test_disk_fetch_coalesces_pages_across_batch_and_drafts(tmp_path, monkeypatch):
+    rows = _fp8_rows(256)
+    raw = rows.view(torch.uint8)
+    image = build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    fetcher = disk.DiskRowFetcher(image, hot_cache_gb=0, max_pages=32)
+    try:
+        ids = np.array([[1, 2, 3], [3, 4, 5]], dtype=np.int64)
+        actual = fetcher.fetch(ids)
+        expected = raw.index_select(0, torch.from_numpy(ids.reshape(-1))).reshape(
+            2, 3, disk.ROW_BYTES
+        )
+        assert torch.equal(actual, expected)
+        stats = fetcher.last_fetch_stats
+        assert stats.rows_requested == 6
+        assert stats.cold_pages == 1
+        assert stats.coalesced_rows == 5
+    finally:
+        fetcher.close()
+
+
+def test_disk_fetch_reuses_caller_owned_output(tmp_path, monkeypatch):
+    rows = _fp8_rows(256)
+    raw = rows.view(torch.uint8)
+    image = build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    fetcher = disk.DiskRowFetcher(image, hot_cache_gb=0, max_pages=32)
+    ids = np.array([[1, 2], [-1, 5]], dtype=np.int64)
+    output = torch.full((*ids.shape, disk.ROW_BYTES), 0xFF, dtype=torch.uint8)
+    try:
+        actual = fetcher.fetch(ids, out=output)
+        assert actual is output
+        assert torch.equal(actual[0, 0], raw[1])
+        assert torch.equal(actual[0, 1], raw[2])
+        assert torch.equal(actual[1, 0], torch.zeros(disk.ROW_BYTES, dtype=torch.uint8))
+        assert torch.equal(actual[1, 1], raw[5])
+        assert fetcher.fetch(ids, out=output) is output
+    finally:
+        fetcher.close()
+
+
+def test_dynamic_wtinylfu_admission_eviction_and_exactness(tmp_path, monkeypatch):
+    rows = _fp8_rows(1024)
+    raw = rows.view(torch.uint8)
+    image = build_test_image(tmp_path, rows)
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    fetcher = disk.DiskRowFetcher(
+        image, hot_cache_gb=0, dynamic_capacity_rows=16, max_pages=32
+    )
+    try:
+        same_set = []
+        for row_id in range(rows.shape[0]):
+            if int(fetcher.dynamic._set_indices(np.array([row_id]))[0]) == 0:
+                same_set.append(row_id)
+            if len(same_set) == 12:
+                break
+        protected = same_set[0]
+        assert torch.equal(fetcher.fetch(np.array([protected]))[0], raw[protected])
+        fetcher.dynamic.flush()
+        for _ in range(12):
+            assert torch.equal(fetcher.fetch(np.array([protected]))[0], raw[protected])
+        fetcher.dynamic.flush()
+        for row_id in same_set[1:]:
+            assert torch.equal(fetcher.fetch(np.array([row_id]))[0], raw[row_id])
+            fetcher.dynamic.flush()
+
+        cached = set(int(row_id) for row_id in fetcher.dynamic.tags[0] if row_id >= 0)
+        assert protected in cached
+        assert same_set[-1] in cached
+        assert same_set[1] not in cached
+        assert len(cached) == fetcher.dynamic._WAYS
+        actual = fetcher.fetch(np.array([protected]))
+        assert torch.equal(actual[0], raw[protected])
+        assert fetcher.last_fetch_stats.dynamic_hits == 1
+        assert fetcher.last_fetch_stats.cold_pages == 0
+    finally:
+        fetcher.close()
+
+
+def test_future_contexts_preserve_request_and_token_order():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    embedding._prefill_buffer_tokens = 4
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+    layer._future_lookup_contexts = None
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.ple_ngram_size = 3
+    model.ple_ngram_eos_token_id = 2
+    model._ple_layers = lambda: iter([layer])
+    requests = [
+        SimpleNamespace(
+            origin_input_ids=[10, 11, 12, 13, 14],
+            extend_range=SimpleNamespace(end=2),
+        ),
+        SimpleNamespace(
+            origin_input_ids=[20, 21, 22, 23],
+            extend_range=SimpleNamespace(end=1),
+        ),
+    ]
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.arange(3),
+    )
+
+    model.prepare_model_batch(SimpleNamespace(reqs=requests), forward_batch)
+
+    torch.testing.assert_close(
+        layer._future_lookup_contexts,
+        torch.tensor([[10, 11, 12], [11, 12, 13], [12, 13, 14], [2, 20, 21]]),
+    )
 
 
 if __name__ == "__main__":

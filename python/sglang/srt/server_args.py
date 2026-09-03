@@ -51,11 +51,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
-from sglang.srt.configs.qwen4_exp import (
-    PLE_DISK_DEFAULTS,
-    PLE_DISK_MAX_PREFILL_BUFFER_TOKENS,
-    apply_sglang_runtime_config,
-)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -111,6 +106,10 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.ple_disk import (
+    PLE_DISK_DEFAULTS,
+    PLE_DISK_MAX_PREFILL_BUFFER_TOKENS,
+)
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
@@ -2682,6 +2681,15 @@ class ServerArgs:
         "Log cumulative PLE disk per-step counters every N steps; zero disables it.",
         NS("exec.offload"),
     ] = PLE_DISK_DEFAULTS["ple_disk_stats_log_interval"]
+    ple_disk_cleanup_generations: A[
+        bool,
+        Arg(
+            help="Remove superseded complete PLE image generations after an "
+            "image install. Use --no-ple-disk-cleanup-generations to retain them.",
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("exec.offload"),
+    ] = PLE_DISK_DEFAULTS["ple_disk_cleanup_generations"]
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
@@ -3846,7 +3854,17 @@ class ServerArgs:
 
         materialize_declarations(self)
         self._handle_offload_compatibility(resolved=True)
-        apply_sglang_runtime_config(self.get_model_config().hf_config, self)
+        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            hf_config = self.get_model_config().hf_config
+            hook = getattr(hf_config, "apply_sglang_runtime_config", None)
+            applied = bool(hook(self)) if callable(hook) else False
+            if self.ple_storage in ("pinned", "disk") and not applied:
+                architectures = getattr(hf_config, "architectures", None)
+                architecture = architectures[0] if architectures else "unknown"
+                raise ValueError(
+                    f"--ple-storage {self.ple_storage} is unavailable for model "
+                    f"architecture {architecture}"
+                )
 
     def _validate_ple_disk_args(self):
         from sglang.srt.utils.ple_disk import (
@@ -3883,15 +3901,47 @@ class ServerArgs:
         self._validate_ple_disk_args()
         storage = self.ple_storage
         changed_disk_options = []
-        if resolved and storage not in (None, "gpu") and hasattr(self, "model_path"):
-            architectures = self.get_model_config().hf_config.architectures or []
-            if "Qwen4ExpForConditionalGeneration" not in architectures:
+        connector_type = parse_connector_type(getattr(self, "model_path", ""))
+        if (
+            resolved
+            and storage not in (None, "gpu")
+            and hasattr(self, "model_path")
+            and connector_type != ConnectorType.INSTANCE
+        ):
+            hf_config = self.get_model_config().hf_config
+            hook = getattr(hf_config, "apply_sglang_runtime_config", None)
+            if not callable(hook):
+                architectures = getattr(hf_config, "architectures", None)
+                architecture = architectures[0] if architectures else "unknown"
                 raise ValueError(
                     f"--ple-storage {storage} is unavailable for the selected "
-                    "model architecture"
+                    f"model architecture {architecture}"
                 )
         if storage == "disk":
             if resolved:
+                from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+                prefill_backend = self.cuda_graph_config.prefill.backend
+                if (Phase.PREFILL, "backend") in getattr(
+                    self, "_cuda_graph_config_locked", set()
+                ) and prefill_backend != Backend.DISABLED:
+                    raise ValueError(
+                        "--ple-storage disk is incompatible with an enabled "
+                        "--cuda-graph-backend-prefill; set the resolved prefill "
+                        "backend to disabled"
+                    )
+                logger.info(
+                    "Qwen4 PLE disk mode keeps decode CUDA graphs and disables "
+                    "prefill CUDA graphs by setting --cuda-graph-backend-prefill "
+                    "disabled and --disable-prefill-cuda-graph"
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                declare_late_resolution(
+                    self,
+                    "qwen4 PLE disk prefill graph",
+                    cuda_graph_backend_prefill=Backend.DISABLED,
+                    disable_prefill_cuda_graph=True,
+                )
                 if self.pp_size > 1:
                     raise ValueError(
                         "--ple-storage disk does not support pipeline parallelism "
@@ -3969,6 +4019,11 @@ class ServerArgs:
                 != defaults["ple_disk_stats_log_interval"]
             ):
                 changed_disk_options.append("--ple-disk-stats-log-interval")
+            if (
+                self.ple_disk_cleanup_generations
+                != defaults["ple_disk_cleanup_generations"]
+            ):
+                changed_disk_options.append("--no-ple-disk-cleanup-generations")
         if resolved and storage != "disk" and changed_disk_options:
             logger.warning(
                 "%s are unused with --ple-storage %s",
@@ -4650,24 +4705,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
         self._parse_cuda_graph_config()
-        if self.ple_storage == "disk":
-            prefill_backend = self.cuda_graph_config.prefill.backend
-            if (Phase.PREFILL, "backend") in getattr(
-                self, "_cuda_graph_config_locked", set()
-            ) and prefill_backend != Backend.DISABLED:
-                raise ValueError(
-                    "--ple-storage disk is incompatible with an enabled "
-                    "--cuda-graph-backend-prefill; set the resolved prefill "
-                    "backend to disabled"
-                )
-            logger.info(
-                "Qwen4 PLE disk mode keeps decode CUDA graphs and disables "
-                "prefill CUDA graphs by setting --cuda-graph-backend-prefill "
-                "disabled and --disable-prefill-cuda-graph"
-            )
-            self.cuda_graph_backend_prefill = Backend.DISABLED
-            self.disable_prefill_cuda_graph = True
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
         # Reads the resolved per-phase backends; must precede the compat rules
         # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
         disable_kimi_k3_symm_mem(self)

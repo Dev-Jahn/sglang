@@ -17,7 +17,9 @@ Pre-commit hook: validate CI registry calls under test/registered/.
    The modern form resolves to the identical suite (CIRegistry.effective_suite
    is f"{stage}-test-{runner_config}") and is /rerun-test-able.
 3. Every enabled registered file must have an executable `__main__` test entry
-   because the CI runner invokes files directly.
+   because the CI runner invokes files directly. The block must call pytest or
+   unittest, except for registered benchmarks, the named multi-process runners,
+   and the explicit direct-runner file lists below.
 
 Reuses ut_parse_one_file() from ci_register.py (AST-based parsing)
 to match the same logic used by run_suite.py's collect_tests().
@@ -48,6 +50,13 @@ _ALTERNATE_TEST_RUNNERS = {
 _DIRECT_MAIN_RUNNER_FILES = {
     "test/registered/kernels/ops/communication/test_amd_deterministic_custom_allreduce.py",
     "test/registered/kernels/ops/communication/test_amd_nccl_allreduce_determinism.py",
+}
+# These files predate the entry-point rule and invoke their complete, small
+# function set directly. Convert them to pytest.main() when they are edited.
+_DIRECT_TEST_FUNCTION_RUNNER_FILES = {
+    "test/registered/kernels/ops/moe/test_fp4_moe.py",
+    "test/registered/unit/distributed/test_parallel_state.py",
+    "test/registered/utils/test_bench_typebaseddispatcher.py",
 }
 
 
@@ -87,7 +96,10 @@ def _main_entrypoint_status(tree: ast.Module, filename: str) -> tuple[bool, bool
                 continue
             if isinstance(child.func, ast.Name) and (
                 child.func.id in _ALTERNATE_TEST_RUNNERS
-                or child.func.id.startswith("test_")
+                or (
+                    child.func.id.startswith("test_")
+                    and filename in _DIRECT_TEST_FUNCTION_RUNNER_FILES
+                )
                 or (child.func.id == "main" and filename in _DIRECT_MAIN_RUNNER_FILES)
             ):
                 runs_alternate = True
@@ -197,8 +209,9 @@ def main() -> int:
             "the registered file is executed as `python3 file.py`, but its "
             '`if __name__ == "__main__"` block is missing or does not call '
             "unittest.main() or pytest.main(), and does not use a registered "
-            "benchmark or multi-process test runner. The tests are skipped while "
-            "the file reports success. Make __main__ run the tests (put any CLI "
+            "benchmark, named multi-process runner, or allowlisted direct runner. "
+            "The tests are skipped while the file reports success. Make __main__ "
+            "run the tests (put any CLI "
             "entry point behind an explicit flag):\n"
         )
         for f in dead_tests:

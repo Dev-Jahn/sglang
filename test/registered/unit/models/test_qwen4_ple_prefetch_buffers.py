@@ -43,11 +43,15 @@ class _Stub(Qwen4ExpPLELayer):
     buffer-selection code under test is inherited unchanged.
     """
 
-    def __init__(self):
+    def __init__(self, *, disk=False):
         torch.nn.Module.__init__(self)
         self._prefetch_stream = object()
-        self.ple_embedding = SimpleNamespace(ngram_embedding=object())
+        embedding = (
+            Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding) if disk else object()
+        )
+        self.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
         self._graph_prefetch_buffer = None
+        self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
 
     def _allocate_prefetch_buffer(self, lookup_tokens, device):
@@ -76,7 +80,7 @@ def _offloaded_prewarm_layer():
 
 def test_graph_capture_does_not_bind_the_shared_eager_buffer():
     _require_cuda()
-    stub = _Stub()
+    stub = _Stub(disk=True)
     ids = torch.zeros(4, dtype=torch.long, device="cuda")
     graph = torch.cuda.CUDAGraph()
     side = torch.cuda.Stream()
@@ -100,7 +104,7 @@ def test_graph_capture_does_not_bind_the_shared_eager_buffer():
 
 def test_recapture_reuses_the_preallocated_graph_prefetch_buffer(monkeypatch):
     _require_cuda()
-    stub = _Stub()
+    stub = _Stub(disk=True)
     ids = torch.zeros(8, dtype=torch.long, device="cuda")
 
     stub.prepare_cuda_graph_prefetch_buffer(4, ids.device)
@@ -121,7 +125,7 @@ def test_recapture_reuses_the_preallocated_graph_prefetch_buffer(monkeypatch):
 
 def test_capture_rejects_an_unprepared_prefetch_size(monkeypatch):
     _require_cuda()
-    stub = _Stub()
+    stub = _Stub(disk=True)
     ids = torch.zeros(8, dtype=torch.long, device="cuda")
     stub.prepare_cuda_graph_prefetch_buffer(4, ids.device)
     monkeypatch.setattr(stub, "_is_capturing", lambda: True)
@@ -131,7 +135,7 @@ def test_capture_rejects_an_unprepared_prefetch_size(monkeypatch):
 
 
 def test_capture_rejects_a_missing_graph_prefetch_allocation(monkeypatch):
-    stub = _Stub()
+    stub = _Stub(disk=True)
     ids = torch.zeros(8, dtype=torch.long)
     monkeypatch.setattr(stub, "_is_capturing", lambda: True)
     monkeypatch.setattr("sglang.srt.models.qwen4_exp.is_sm120_supported", lambda: True)

@@ -80,7 +80,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         This is a construction-time contract.  It does not report whether an
         ordinary slot is occupied by a live request.
         """
-        raise NotImplementedError()
+        raise NotImplementedError(
+            f"{type(self).__name__}.reserves_padding_slot() is required by "
+            "--ple-storage disk"
+        )
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
