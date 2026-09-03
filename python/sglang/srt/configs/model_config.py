@@ -578,7 +578,7 @@ class ModelConfig:
             if is_draft_model
             else server_args.decrypted_config_file
         )
-        return ModelConfig(
+        model_config = ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
@@ -610,6 +610,12 @@ class ModelConfig:
             speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
+        runtime_config_hook = getattr(
+            model_config.hf_config, "apply_sglang_runtime_config", None
+        )
+        if runtime_config_hook is not None:
+            runtime_config_hook(server_args, is_draft_model=is_draft_model)
+        return model_config
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

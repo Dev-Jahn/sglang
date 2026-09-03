@@ -170,6 +170,11 @@ class Qwen4ExpConfig(PretrainedConfig):
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    def apply_sglang_runtime_config(self, server_args, *, is_draft_model=False):
+        if is_draft_model:
+            return
+        apply_ple_runtime_config(self, server_args, storage=server_args.ple_storage)
+
     def __init__(
         self,
         text_config=None,
