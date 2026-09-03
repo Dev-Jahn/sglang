@@ -105,6 +105,102 @@ def test_cuda_graph_prewarm_is_required_for_ple_offload(monkeypatch, ple_storage
         )
 
 
+def test_disk_cuda_graph_requires_replay_hook_on_resolved_model():
+    runner = SimpleNamespace(
+        device="cuda",
+        model=object(),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(ple_storage="disk")
+        ),
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled"),
+                decode=SimpleNamespace(backend="full"),
+            )
+        ),
+        _decode_cuda_graph_runner_cls=lambda: type(
+            "HookedRunner", (), {"supports_ple_disk_replay_hook": True}
+        ),
+    )
+    with pytest.raises(RuntimeError, match="supports_cuda_graph_replay_hook"):
+        cuda_graph_setup._validate_ple_disk_cuda_graph_replay(
+            runner,
+            SimpleNamespace(prewarm_cuda_graphs=lambda *args, **kwargs: None),
+        )
+
+
+def test_disk_cuda_graph_rejects_unlisted_replay_runner():
+    runner = SimpleNamespace(
+        device="cuda",
+        model=object(),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(ple_storage="disk")
+        ),
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled"),
+                decode=SimpleNamespace(backend="full"),
+            )
+        ),
+        _decode_cuda_graph_runner_cls=lambda: type("UnlistedRunner", (), {}),
+    )
+    with pytest.raises(RuntimeError, match="UnlistedRunner"):
+        cuda_graph_setup._validate_ple_disk_cuda_graph_replay(
+            runner,
+            SimpleNamespace(
+                prewarm_cuda_graphs=lambda *args, **kwargs: None,
+                supports_cuda_graph_replay_hook=True,
+            ),
+        )
+
+
+def test_capture_decode_graph_uses_resolved_hook_model(monkeypatch):
+    language_model = SimpleNamespace(supports_cuda_graph_replay_hook=True)
+
+    class HookedRunner:
+        supports_ple_disk_replay_hook = True
+
+        def __init__(self, model_runner):
+            self.model_runner = model_runner
+
+    runner = SimpleNamespace(
+        device="cuda",
+        gpu_id=0,
+        is_generation=True,
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        model=object(),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(ple_storage="disk")
+        ),
+        server_args=SimpleNamespace(
+            model_impl="auto",
+            disaggregation_mode="none",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled"),
+                decode=SimpleNamespace(backend="full"),
+            ),
+        ),
+        _decode_cuda_graph_runner_cls=lambda: HookedRunner,
+        decode_num_tokens_per_req=lambda: 1,
+    )
+    resolve = MagicMock(return_value=language_model)
+    monkeypatch.setattr(cuda_graph_setup, "resolve_language_model", resolve)
+    monkeypatch.setattr(cuda_graph_setup, "check_cuda_graph_backend", lambda *_: False)
+    monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 10.0)
+    monkeypatch.setattr(
+        cuda_graph_setup, "get_batch_sizes_to_capture", lambda *_: ([1], None)
+    )
+    monkeypatch.setattr(
+        cuda_graph_setup.current_platform, "is_out_of_tree", lambda: False
+    )
+
+    capture = cuda_graph_setup.capture_decode_graph(model_runner=runner)
+
+    resolve.assert_called_once_with(runner.model)
+    assert isinstance(capture.runner, HookedRunner)
+
+
 def test_cuda_graph_prewarm_reaches_non_sm120_models(monkeypatch):
     prewarm = MagicMock(name="prewarm_cuda_graphs")
     runner = SimpleNamespace(

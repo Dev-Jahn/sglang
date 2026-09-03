@@ -99,6 +99,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
@@ -206,6 +207,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    supports_ple_disk_replay_hook = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -215,6 +218,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+
+        hf_text_config = getattr(model_runner.model_config, "hf_text_config", None)
+        if getattr(hf_text_config, "ple_storage", None) == "disk":
+            replay_model = resolve_language_model(model_runner.model)
+            self._cuda_graph_replay_hook = cast("CudaGraphReplayHook", replay_model)
+        else:
+            self._cuda_graph_replay_hook = None
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -1395,12 +1405,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            replay_hook = None
+            replay_hook = getattr(self, "_cuda_graph_replay_hook", None)
             try:
-                if getattr(
-                    self.model_runner.model, "supports_cuda_graph_replay_hook", False
-                ):
-                    replay_hook = cast("CudaGraphReplayHook", self.model_runner.model)
+                if replay_hook is not None:
                     padded_num_tokens = (
                         self._replay_graph_key.size
                         if self.ragged_verify_mode

@@ -22,7 +22,7 @@ Before launching the server, provide:
 - `ple_embedding_dtype: float8_e4m3fn` in the model configuration and FP8 E4M3 checkpoint rows
 - Free space for the raw row file and packed image during the first build
 
-Disk storage does not support pipeline parallelism with `--pp-size > 1`, dLLM with `--dllm-algorithm`, or prefill CUDA graphs. An enabled `--cuda-graph-backend-prefill` is rejected; the automatic setting disables prefill graphs while keeping decode graphs enabled.
+Disk storage does not support pipeline parallelism with `--pp-size > 1`, dLLM with `--dllm-algorithm`, DP attention with `--enable-dp-attention`, multi-layer EAGLE with `--enable-multi-layer-eagle`, or prefill CUDA graphs. DP attention is rejected because its token gathering can make an idle rank's captured PLE lookup consume staging from an earlier step. Multi-layer EAGLE uses graph runners that do not invoke the PLE replay hook. An enabled `--cuda-graph-backend-prefill` is rejected; the automatic setting disables prefill graphs while keeping decode graphs enabled.
 
 The packed image stores 25 160-byte rows in each 4 KiB page. Its 96-byte page tail makes it about 2.4% larger than the row payload. The first build holds the full raw row file and packed image at the same time, so reserve slightly more than twice the row payload. After a successful install, SGLang removes the raw file.
 
@@ -49,7 +49,7 @@ This example starts with an empty static hot cache because it does not pass `--p
 
 SGLang checks each 4 KiB image page against its stored CRC before using the rows. An incomplete install, older image format, or incompatible manifest produces an error that names the directory to delete before rebuilding.
 
-Disk mode keeps decode CUDA graphs enabled. It disables prefill CUDA graphs and sets both `--cuda-graph-backend-prefill disabled` and `--disable-prefill-cuda-graph`. An explicitly enabled prefill graph backend is rejected.
+Disk mode keeps decode CUDA graphs enabled. It disables prefill CUDA graphs and sets both `--cuda-graph-backend-prefill disabled` and `--disable-prefill-cuda-graph`. An explicitly enabled prefill graph backend is rejected after JSON, convenience, and legacy graph options have been resolved.
 
 Set `--ple-disk-stats-log-interval N` to log cumulative storage and cache counters every `N` model steps. The default `0` disables these logs.
 
@@ -100,7 +100,11 @@ Without a frequency file the resident cache cost is the dynamic tier alone, 2 Gi
 
 ## Replay validation
 
-The first CUDA graph replay after each capture compares the recomputed lookup IDs with the IDs captured by that graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. The check is one replay step behind, so the reported step's output has already been emitted when an error is raised. The error names the replay step and lookup-token count. Treat output since the last successful check as suspect. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL=0`, the default, runs only the first-replay check. A positive value also checks every Nth replay: `1` checks every replay, `64` checks every 64th replay, and larger values reduce the diagnostic work proportionally. Set `SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` to also compare staged disk rows with the values consumed by the next replay. Row comparison is disabled by default.
+Every staged decode replay carries a host-side generation number through prepare and wait. This check confirms that the hook staged work for the current replay and waited for the same generation. It does not inspect lookup IDs or row contents. Capture also verifies that the resolved language model and graph runner expose the supported replay-hook path. A captured graph key that reaches wait without same-step staging is an error.
+
+The first CUDA graph replay after each capture compares the recomputed lookup IDs with the IDs captured by that graph. The device comparison copies one Boolean result to pinned host memory and the next host visit reads it after an event query. The check is one replay step behind, so the reported step's output has already been emitted when an error is raised. The error names the replay step and lookup-token count. Treat output since the last successful check as suspect. `SGLANG_PLE_DISK_GRAPH_LOOKUP_VALIDATION_INTERVAL=0`, the default, runs only the first-replay check. A positive value also checks every Nth replay: `1` checks every replay, `64` checks every 64th replay, and larger values reduce the diagnostic work proportionally.
+
+`SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING=1` compares staged disk rows with the values consumed by the next replay. Row comparison is disabled by default. Both content comparisons depend on the replay hook; the capture-time runner check prevents disk mode from using a runner that skips it. Missing capture buffers are treated as programming errors.
 
 ## Run in a container
 

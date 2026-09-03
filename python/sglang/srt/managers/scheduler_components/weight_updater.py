@@ -86,6 +86,30 @@ class SchedulerWeightUpdaterManager:
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
 
+    def _run_tp_storage_operation(
+        self, operation: Callable[[], None], operation_name: str
+    ) -> None:
+        local_error = None
+        try:
+            operation()
+        except BaseException as exc:
+            local_error = exc
+
+        failed = torch.tensor([local_error is not None], dtype=torch.uint8)
+        torch.distributed.all_reduce(
+            failed,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.tp_cpu_group,
+        )
+        torch.distributed.barrier(group=self.tp_cpu_group)
+
+        if local_error is not None:
+            raise local_error
+        if bool(failed.item()):
+            raise RuntimeError(
+                f"{operation_name} failed on another tensor-parallel rank"
+            )
+
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
@@ -234,10 +258,13 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
             model = self.tp_worker.model_runner.model
-            if getattr(model, "supports_storage_lifecycle_hook", False):
-                cast(StorageLifecycleHook, model).close()
-            self.stashed_model_static_state = _export_static_state(model)
-            torch.distributed.barrier(self.tp_cpu_group)
+
+            def release_weights() -> None:
+                if getattr(model, "supports_storage_lifecycle_hook", False):
+                    cast(StorageLifecycleHook, model).close()
+                self.stashed_model_static_state = _export_static_state(model)
+
+            self._run_tp_storage_operation(release_weights, "weight storage release")
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
@@ -262,15 +289,15 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
-            _import_static_state(
-                self.tp_worker.model_runner.model,
-                self.stashed_model_static_state,
-            )
-            del self.stashed_model_static_state
             model = self.tp_worker.model_runner.model
-            if getattr(model, "supports_storage_lifecycle_hook", False):
-                cast(StorageLifecycleHook, model).resume_storage()
+
+            def resume_weights() -> None:
+                _import_static_state(model, self.stashed_model_static_state)
+                if getattr(model, "supports_storage_lifecycle_hook", False):
+                    cast(StorageLifecycleHook, model).resume_storage()
+
+            self._run_tp_storage_operation(resume_weights, "weight storage resume")
+            del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)

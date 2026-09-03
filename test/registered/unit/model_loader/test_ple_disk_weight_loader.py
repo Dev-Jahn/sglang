@@ -118,3 +118,7 @@ def test_safetensors_loader_attaches_source_identity(tmp_path, disable_mmap):
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

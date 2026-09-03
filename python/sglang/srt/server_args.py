@@ -3885,6 +3885,16 @@ class ServerArgs:
                 raise ValueError(
                     "--ple-storage disk does not support dLLM (--dllm-algorithm)"
                 )
+            if self.enable_multi_layer_eagle:
+                raise ValueError(
+                    "--ple-storage disk does not support multi-layer speculative "
+                    "decoding (--enable-multi-layer-eagle)"
+                )
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "--ple-storage disk does not support DP-attention token "
+                    "gathering (--enable-dp-attention)"
+                )
             if not self.ple_disk_dir:
                 raise ValueError("--ple-storage disk requires --ple-disk-dir")
             image_root = Path(self.ple_disk_dir)
@@ -4609,11 +4619,16 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
+        self._parse_cuda_graph_config()
         if self.ple_storage == "disk":
-            if self.cuda_graph_backend_prefill not in (None, Backend.DISABLED):
+            prefill_backend = self.cuda_graph_config.prefill.backend
+            if (Phase.PREFILL, "backend") in getattr(
+                self, "_cuda_graph_config_locked", set()
+            ) and prefill_backend != Backend.DISABLED:
                 raise ValueError(
                     "--ple-storage disk is incompatible with an enabled "
-                    "--cuda-graph-backend-prefill; set it to disabled"
+                    "--cuda-graph-backend-prefill; set the resolved prefill "
+                    "backend to disabled"
                 )
             logger.info(
                 "Qwen4 PLE disk mode keeps decode CUDA graphs and disables "
@@ -4622,7 +4637,7 @@ class ServerArgs:
             )
             self.cuda_graph_backend_prefill = Backend.DISABLED
             self.disable_prefill_cuda_graph = True
-        self._parse_cuda_graph_config()
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
         # Reads the resolved per-phase backends; must precede the compat rules
         # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
         disable_kimi_k3_symm_mem(self)

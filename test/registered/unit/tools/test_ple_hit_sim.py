@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
@@ -292,3 +293,7 @@ def test_hit_sim_selection_matches_the_previous_ordering():
     actual_ids, actual_frequencies = hit_sim.select_rows(counts, metadata, 5)
     assert np.array_equal(actual_ids, expected_ids)
     assert np.array_equal(actual_frequencies, expected_frequencies)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

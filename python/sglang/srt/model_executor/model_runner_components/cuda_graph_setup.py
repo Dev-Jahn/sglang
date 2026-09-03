@@ -54,6 +54,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _decode_graph_runner_cls(model_runner: ModelRunner):
+    if current_platform.is_out_of_tree():
+        return current_platform.get_graph_runner_cls()
+    graph_runners = defaultdict(
+        model_runner._decode_cuda_graph_runner_cls,
+        {
+            "cpu": CPUGraphRunner,
+            "npu": NPUGraphRunner,
+            "xpu": XPUGraphRunner,
+        },
+    )
+    return graph_runners[model_runner.device]
+
+
+def _validate_ple_disk_cuda_graph_replay(
+    model_runner: ModelRunner, language_model
+) -> None:
+    graph_config = model_runner.server_args.cuda_graph_config
+    if graph_config.decode.backend == Backend.DISABLED:
+        return
+    if getattr(language_model, "supports_cuda_graph_replay_hook", False) is not True:
+        raise RuntimeError(
+            "PLE disk decode graph capture requires the resolved language model "
+            "to expose supports_cuda_graph_replay_hook=True"
+        )
+    runner_cls = _decode_graph_runner_cls(model_runner)
+    if runner_cls.__dict__.get("supports_ple_disk_replay_hook", False) is not True:
+        raise RuntimeError(
+            f"{runner_cls.__name__} is not approved for PLE disk CUDA graph replay; "
+            "the runner must route replay through the PLE hook"
+        )
+
+
 def _prewarm_model_cuda_graphs(
     model_runner: ModelRunner, *, capture_decode_cuda_graph: bool
 ) -> None:
@@ -474,6 +507,13 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
         return no_capture
 
+    hf_text_config = getattr(
+        getattr(model_runner, "model_config", None), "hf_text_config", None
+    )
+    if getattr(hf_text_config, "ple_storage", None) == "disk":
+        language_model = resolve_language_model(model_runner.model)
+        _validate_ple_disk_cuda_graph_replay(model_runner, language_model)
+
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     graph_backend = defaultdict(
@@ -501,19 +541,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    if current_platform.is_out_of_tree():
-        GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner)
-    else:
-        graph_runners = defaultdict(
-            model_runner._decode_cuda_graph_runner_cls,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-                "xpu": XPUGraphRunner,
-            },
-        )
-        runner = graph_runners[model_runner.device](model_runner)
+    runner = _decode_graph_runner_cls(model_runner)(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem

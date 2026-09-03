@@ -1,8 +1,11 @@
 """PLE disk server argument validation."""
 
+import sys
+
 import pytest
 
 from sglang.srt import server_args as server_args_module
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.ple_disk import IORING_MAX_ENTRIES
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -24,6 +27,8 @@ def _server_args(**overrides):
         "offload_group_size": 0,
         "pp_size": 1,
         "dllm_algorithm": None,
+        "enable_dp_attention": False,
+        "enable_multi_layer_eagle": False,
     }
     values.update(overrides)
     args = object.__new__(server_args_module.ServerArgs)
@@ -142,3 +147,80 @@ def test_max_read_pages_rejects_io_uring_entry_overflow():
     args = _server_args(ple_disk_max_read_pages=32769)
     with pytest.raises(ValueError, match="32768"):
         args._handle_offload_compatibility()
+
+
+def test_disk_storage_rejects_json_prefill_cuda_graph(tmp_path):
+    args = server_args_module.ServerArgs(
+        model_path="dummy",
+        ple_storage="disk",
+        ple_disk_dir=str(tmp_path),
+        cuda_graph_config={"prefill": {"backend": Backend.FULL}},
+    )
+
+    with pytest.raises(ValueError, match="cuda-graph-backend-prefill"):
+        args._handle_cuda_graph_config()
+
+
+def test_disk_storage_rejects_prefill_cuda_graph_convenience_flag(tmp_path):
+    args = server_args_module.ServerArgs(
+        model_path="dummy",
+        ple_storage="disk",
+        ple_disk_dir=str(tmp_path),
+        cuda_graph_backend_prefill=Backend.FULL,
+    )
+
+    with pytest.raises(ValueError, match="cuda-graph-backend-prefill"):
+        args._handle_cuda_graph_config()
+
+
+def test_disk_storage_disables_default_prefill_cuda_graph(tmp_path):
+    args = server_args_module.ServerArgs(
+        model_path="dummy",
+        ple_storage="disk",
+        ple_disk_dir=str(tmp_path),
+    )
+
+    args._handle_cuda_graph_config()
+
+    assert args.cuda_graph_config.prefill.backend == Backend.DISABLED
+
+
+def test_disk_storage_rejects_legacy_prefill_cuda_graph_flag(tmp_path):
+    parser = server_args_module.argparse.ArgumentParser()
+    server_args_module.ServerArgs.add_cli_args(parser)
+    namespace = parser.parse_args(
+        [
+            "--model-path",
+            "dummy",
+            "--ple-storage",
+            "disk",
+            "--ple-disk-dir",
+            str(tmp_path),
+            "--enable-breakable-cuda-graph",
+        ]
+    )
+    args = server_args_module.ServerArgs.from_cli_args(namespace)
+
+    with pytest.raises(ValueError, match="cuda-graph-backend-prefill"):
+        args._handle_cuda_graph_config()
+
+
+@pytest.mark.parametrize(
+    ("option", "message"),
+    [
+        ("enable_dp_attention", "--enable-dp-attention"),
+        ("enable_multi_layer_eagle", "--enable-multi-layer-eagle"),
+    ],
+)
+def test_disk_storage_rejects_graph_hook_bypass_modes(tmp_path, option, message):
+    args = _server_args(
+        ple_storage="disk",
+        ple_disk_dir=str(tmp_path),
+        **{option: True},
+    )
+    with pytest.raises(ValueError, match=message):
+        args._handle_offload_compatibility()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

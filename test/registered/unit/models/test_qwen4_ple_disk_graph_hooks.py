@@ -1,5 +1,6 @@
 """Qwen4 PLE disk CUDA graph hook tests."""
 
+import sys
 from collections import defaultdict, deque
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -81,6 +82,28 @@ def test_disk_graph_replay_wait_is_a_noop_without_staged_work():
     layer.wait_cuda_graph_replay()
 
     assert waits == []
+
+
+def test_disk_graph_replay_rejects_captured_buffer_without_same_step_staging():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+    layer._graph_replay_generation = None
+    layer._graph_replay_stage_expected = False
+    layer._graph_replay_capture_expected_key = None
+    layer._pending_graph_embedding_validation = None
+    layer._pending_graph_lookup_validation = None
+    layer._completed_graph_embedding_validation = deque()
+    layer._completed_graph_lookup_validation = deque()
+    key = (ForwardMode.IDLE, 4)
+    layer._graph_lookup_id_buffers = {key: torch.zeros((4, 1), dtype=torch.long)}
+
+    layer.prepare_cuda_graph_replay(None, None, key)
+
+    with pytest.raises(RuntimeError, match="did not stage its captured buffer"):
+        layer.wait_cuda_graph_replay()
 
 
 def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
@@ -178,6 +201,59 @@ def test_disk_capture_keys_equal_token_counts_by_forward_mode(monkeypatch):
         (ForwardMode.DECODE, 4),
         (ForwardMode.TARGET_VERIFY, 4),
     }
+
+
+def test_disk_capture_uses_one_key_when_batch_and_runtime_modes_differ(monkeypatch):
+    offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(offloaded)
+    offloaded.gather = lambda input_ids, out: out
+    offloaded.reduce = lambda embeddings: embeddings
+    offloaded.weight_scale = 1
+
+    ngram_embedding = SimpleNamespace(
+        ngram_embedding=offloaded,
+        ngram_heads=1,
+        gather_dp_tokens=False,
+        compute_ngram_ids=lambda batch: torch.arange(4).view(4, 1),
+        _prepare_embedding_lookup=lambda ids, forward_batch, physical_tokens: (
+            ids,
+            physical_tokens,
+        ),
+        _finish_embedding_lookup=lambda embeddings, *args: embeddings,
+    )
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = ngram_embedding
+    layer._prefetch_stream = object()
+    layer._prefetch_state = None
+    layer._future_lookup_contexts = None
+    layer._graph_lookup_id_buffers = {}
+    layer._graph_embedding_snapshot_buffers = {}
+    layer._graph_lookup_validation_due = set()
+    layer._validate_graph_staging = True
+    layer._is_capturing = lambda: True
+    layer._get_prefetch_buffer = lambda tokens, ids, graph_key: torch.empty(
+        (tokens, 1, 4), dtype=torch.bfloat16
+    )
+
+    batch = SimpleNamespace(
+        mode=ForwardMode.TARGET_VERIFY,
+        physical_tokens=4,
+        processed_tokens=4,
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.arange(4),
+        global_dp_buffer_len=None,
+        forward_mode=ForwardMode.DECODE,
+        _original_forward_mode=None,
+    )
+
+    layer.start_prefetch(batch, forward_batch)
+    layer._consume_prefetched_embeddings(forward_batch)
+
+    expected = {(ForwardMode.TARGET_VERIFY, 4)}
+    assert set(layer._graph_lookup_id_buffers) == expected
+    assert set(layer._graph_embedding_snapshot_buffers) == expected
 
 
 def test_graph_replay_prepares_shared_batch_once(monkeypatch):
@@ -536,6 +612,11 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
 
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
     monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "_allocate_host_tensor",
+        lambda shape, dtype: torch.empty(shape, dtype=dtype),
+    )
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer._pending_graph_embedding_validation = None
@@ -560,7 +641,7 @@ def test_graph_lookup_validation_checks_the_current_replay(monkeypatch):
         layer.validate_cuda_graph_replay()
 
 
-def test_graph_validation_drops_a_missing_capture_with_one_warning(caplog):
+def test_graph_validation_rejects_a_missing_capture_buffer():
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer._pending_graph_embedding_validation = None
@@ -574,12 +655,11 @@ def test_graph_validation_drops_a_missing_capture_with_one_warning(caplog):
     layer._graph_validation_free_slots = deque()
     layer._graph_lookup_id_buffers = {}
 
-    with caplog.at_level("WARNING"):
+    with pytest.raises(RuntimeError, match="capture buffer is missing"):
         layer.finish_cuda_graph_replay()
 
     assert layer._pending_graph_lookup_validation is None
     assert not layer._completed_graph_lookup_validation
-    assert caplog.text.count("capture buffer is missing") == 1
 
 
 def test_graph_validation_recycles_every_consumed_ready_entry():
@@ -662,3 +742,7 @@ def test_graph_replay_uses_the_explicit_padded_token_extent(monkeypatch):
     assert batch.physical_tokens == 2
     assert batch.processed_tokens == 2
     assert batch.lengths.tolist() == [1, 1]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
