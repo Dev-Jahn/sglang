@@ -8,6 +8,8 @@ import json
 import os
 import queue
 import runpy
+import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -444,6 +446,9 @@ class _FakeFetcherLibrary:
             else abi_version
         )
         self.create_args = None
+        self.created_buffer = None
+        self.created_buffer_bytes = 0
+        self.max_pages = 0
         self.read_buffer = None
         self.read_buffer_bytes = None
         self.ple_fetcher_create = _FakeFunction(self._create)
@@ -472,14 +477,37 @@ class _FakeFetcherLibrary:
             register_buffer,
         )
         failure_stage._obj.value = self.failure_stage
+        if (
+            file_fd < 0
+            or not buffer
+            or int(buffer) & (disk.PAGE_BYTES - 1)
+            or max_pages <= 0
+            or buffer_bytes < max_pages * disk.PAGE_BYTES
+        ):
+            ctypes.set_errno(errno.EINVAL)
+            return None
         if self.create_errno:
             ctypes.set_errno(self.create_errno)
             return None
+        self.created_buffer = int(buffer)
+        self.created_buffer_bytes = int(buffer_bytes)
+        self.max_pages = int(max_pages)
         return 1
 
     def _read(self, handle, offsets, count, buffer, buffer_bytes):
         self.read_buffer = buffer
         self.read_buffer_bytes = buffer_bytes
+        if (
+            handle != 1
+            or not buffer
+            or int(buffer) & (disk.PAGE_BYTES - 1)
+            or count > self.max_pages
+            or (count and not offsets)
+        ):
+            return -errno.EINVAL
+        for index in range(count):
+            if offsets[index] & (disk.PAGE_BYTES - 1):
+                return -errno.EINVAL
         if count * disk.PAGE_BYTES > buffer_bytes:
             return -errno.EFAULT
         result = next(self.read_results, 0)
@@ -892,6 +920,54 @@ def test_fake_fetcher_constants_come_from_the_native_header():
         disk.FETCHER_FAILURE_REGISTER_FILE
         == _FETCHER_HEADER_CONSTANTS["PLE_FETCHER_FAILURE_REGISTER_FILE"]
     )
+
+
+def test_fake_fetcher_rejects_real_abi_contract_violations():
+    allocation = ctypes.create_string_buffer(3 * disk.PAGE_BYTES)
+    base = ctypes.addressof(allocation)
+    aligned = (base + disk.PAGE_BYTES - 1) & ~(disk.PAGE_BYTES - 1)
+    failure_stage = ctypes.c_int(-1)
+    library = _FakeFetcherLibrary(bytes(3 * disk.PAGE_BYTES))
+
+    assert not library.ple_fetcher_create(
+        -1, aligned, 2 * disk.PAGE_BYTES, 2, 1, ctypes.byref(failure_stage)
+    )
+    assert ctypes.get_errno() == errno.EINVAL
+    handle = library.ple_fetcher_create(
+        3, aligned, 2 * disk.PAGE_BYTES, 2, 1, ctypes.byref(failure_stage)
+    )
+    assert handle
+    offsets = (ctypes.c_uint64 * 3)(
+        disk.PAGE_BYTES, 2 * disk.PAGE_BYTES, disk.PAGE_BYTES + 1
+    )
+    assert (
+        library.ple_fetcher_read(handle, offsets, 3, aligned, 2 * disk.PAGE_BYTES)
+        == -errno.EINVAL
+    )
+    assert (
+        library.ple_fetcher_read(
+            handle,
+            ctypes.cast(offsets, ctypes.POINTER(ctypes.c_uint64)),
+            1,
+            aligned + 1,
+            2 * disk.PAGE_BYTES,
+        )
+        == -errno.EINVAL
+    )
+    assert (
+        library.ple_fetcher_read(
+            handle,
+            ctypes.pointer(ctypes.c_uint64(disk.PAGE_BYTES + 1)),
+            1,
+            aligned,
+            2 * disk.PAGE_BYTES,
+        )
+        == -errno.EINVAL
+    )
+
+
+def test_capability_filter_does_not_skip_native_einval():
+    assert native_reader_unavailable_reason(OSError(errno.EINVAL, "bad buffer")) is None
 
 
 def test_memlock_error_names_limit_bytes_and_flag(tmp_path, monkeypatch):
@@ -1347,6 +1423,30 @@ def test_hot_cache_deduplicates_before_applying_capacity(tmp_path, monkeypatch):
     )
 
 
+def test_static_hot_cache_checks_direct_reader_page_crc(tmp_path, monkeypatch):
+    image = build_test_image(tmp_path, _fp8_rows(25))
+    with image.path.open("r+b") as handle:
+        handle.seek(disk.PAGE_BYTES + 7)
+        value = handle.read(1)
+        handle.seek(disk.PAGE_BYTES + 7)
+        handle.write(bytes([value[0] ^ 1]))
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    reader = disk.DirectPageReader(image, max_pages=1)
+    try:
+        with pytest.raises(IOError, match="checksum mismatch"):
+            disk.RankSelectHotCache(
+                image,
+                np.array([0], dtype=np.int64),
+                (disk.ROW_BYTES + 1) / (1 << 30),
+                reader=reader,
+            )
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("seed", range(5))
 def test_hot_file_frequency_order_round_trips_through_rank_select_cache(tmp_path, seed):
     rng = np.random.default_rng(seed)
@@ -1545,6 +1645,39 @@ def test_direct_reader_retries_native_destroy_after_busy(tmp_path, monkeypatch, 
     assert reader.handle is None
 
 
+def test_closed_direct_reader_raises_before_native_call():
+    reader = disk.DirectPageReader.__new__(disk.DirectPageReader)
+    reader.handle = None
+    reader.image = SimpleNamespace(num_pages=1)
+
+    with pytest.raises(RuntimeError, match="reader is closed"):
+        reader._read_locked(np.array([0], dtype=np.int64))
+
+
+def test_direct_reader_close_has_a_lock_wait_bound():
+    class BusyLock:
+        def acquire(self, *, timeout):
+            assert timeout == 0.25
+            return False
+
+        def release(self):
+            pytest.fail("busy lock was released")
+
+    reader = disk.DirectPageReader.__new__(disk.DirectPageReader)
+    reader._read_lock = BusyLock()
+    reader._read_lock_timeout_seconds = 0.25
+
+    with pytest.raises(TimeoutError, match="shutdown.*reader lock"):
+        reader.close()
+
+
+def test_partial_reader_destructor_swallows_busy_cleanup_error():
+    reader = disk.DirectPageReader.__new__(disk.DirectPageReader)
+    reader.close = lambda: (_ for _ in ()).throw(OSError(errno.EBUSY, "busy"))
+
+    disk.DirectPageReader.__del__(reader)
+
+
 def test_busy_reader_gc_retains_registered_staging(tmp_path, monkeypatch, caplog):
     image = build_test_image(tmp_path, _fp8_rows(25))
     _patch_fetcher_library(monkeypatch, image)
@@ -1578,6 +1711,73 @@ def test_disk_fetcher_calls_raise_after_close():
         fetcher.submit_prefill(np.array([0], dtype=np.int64))
     with pytest.raises(RuntimeError, match="PLE disk fetcher is closed"):
         fetcher.wait_prefill()
+
+
+def test_disk_fetcher_close_waits_for_an_inflight_fetch():
+    entered = threading.Event()
+    release = threading.Event()
+    fetch_done = threading.Event()
+    close_done = threading.Event()
+    errors = []
+
+    class BlockingHot:
+        rows = torch.zeros((1, disk.ROW_BYTES), dtype=torch.uint8)
+
+        def lookup(self, local):
+            entered.set()
+            release.wait(5.0)
+            return np.ones(local.size, dtype=np.bool_), np.zeros(
+                local.size, dtype=np.int64
+            )
+
+    class Closeable:
+        def close(self):
+            pass
+
+    fetcher = disk.DiskRowFetcher.__new__(disk.DiskRowFetcher)
+    fetcher._closed = False
+    fetcher._fetch_lock = threading.Lock()
+    fetcher._prefill_executor = None
+    fetcher._prefill_slots = []
+    fetcher._prefill_lock = threading.Lock()
+    fetcher._thread_stats = threading.local()
+    fetcher.image = SimpleNamespace(vocab_start=0, vocab_end=1)
+    fetcher.hot = BlockingHot()
+    fetcher.dynamic = Closeable()
+    fetcher.prefill_reader = None
+    fetcher.reader = Closeable()
+
+    def run_fetch():
+        try:
+            fetcher.fetch(np.array([0], dtype=np.int64))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            fetch_done.set()
+
+    def run_close():
+        try:
+            fetcher.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_done.set()
+
+    fetch_thread = threading.Thread(target=run_fetch, daemon=True)
+    close_thread = threading.Thread(target=run_close, daemon=True)
+    try:
+        fetch_thread.start()
+        assert entered.wait(5.0)
+        close_thread.start()
+        assert not close_done.wait(0.05)
+        release.set()
+        assert fetch_done.wait(5.0)
+        assert close_done.wait(5.0)
+        assert errors == []
+    finally:
+        release.set()
+        fetch_thread.join(5.0)
+        close_thread.join(5.0)
 
 
 def test_fetcher_constructor_closes_decode_reader_when_prefill_reader_fails(
@@ -2556,6 +2756,42 @@ def test_generation_cleanup_skips_a_directory_with_an_open_file(tmp_path):
     assert old_image.path.exists()
 
 
+def test_generation_cleanup_skips_a_directory_locked_by_another_process(tmp_path):
+    rows = _fp8_rows(25)
+    first = disk.PLEImageBuilder(tmp_path, "cleanup-process", 0, 1, 0, 25)
+    first.add_shard("shard", rows, 0, 25)
+    old_image, _, _ = first.finalize(0.5)
+    lock_path = old_image.path.parent / ".reader.lock"
+    holder_code = """
+import fcntl
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_SH)
+print("ready", flush=True)
+sys.stdin.read()
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-u", "-c", holder_code, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "ready"
+    changed = rows.clone().view(torch.uint8)
+    changed[0, 0] = (changed[0, 0] + 1) % 0x7F
+    changed = attach_checkpoint_source(changed.view(torch.float8_e4m3fn))
+    changed._sglang_checkpoint_source["mtime_ns"] = 2
+    try:
+        replacement = disk.PLEImageBuilder(tmp_path, "cleanup-process", 0, 1, 0, 25)
+        replacement.add_shard("shard", changed, 0, 25)
+        replacement.finalize(0.5)
+        assert old_image.path.exists()
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=5.0)
+
+
 def test_builder_sweeps_only_old_dot_prefixed_scratch_files(tmp_path):
     generation = tmp_path / "generation"
     generation.mkdir()
@@ -2909,7 +3145,7 @@ def test_disk_gather_uses_the_driver_capture_predicate(monkeypatch):
     embedding._launch_fetch = lambda *args, **kwargs: pytest.fail(
         "capture launched a disk fetch"
     )
-    monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(qwen4_exp_module, "get_is_model_capture_mode", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(qwen4_exp_module, "_is_stream_capturing", lambda stream: True)
@@ -3135,7 +3371,8 @@ def test_row_trace_writes_step_hashes_and_tier_counts(tmp_path):
     diagnostics.submit(17, ids, rows, tiers)
     diagnostics.close()
 
-    records = [json.loads(line) for line in path.read_text().splitlines()]
+    rank_path = tmp_path / "row-trace.rank2.jsonl"
+    records = [json.loads(line) for line in rank_path.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["rank"] == 2
     assert records[0]["module"] == "model.layers.1.ple"
@@ -3149,6 +3386,32 @@ def test_row_trace_writes_step_hashes_and_tier_counts(tmp_path):
         "dynamic": 0,
         "cold": 1,
     }
+
+
+def test_row_diagnostic_shutdown_waits_are_bounded():
+    validator = disk._PLERowContentValidator.__new__(disk._PLERowContentValidator)
+    validator._closed = False
+    validator.max_inflight = 1
+    validator.reader = SimpleNamespace(_read_lock_timeout_seconds=0.01)
+    validator.wait = lambda timeout=None: False
+
+    with pytest.raises(TimeoutError, match="row validation.*shutdown"):
+        validator.close()
+
+    class Worker:
+        def join(self, timeout=None):
+            assert timeout is not None
+
+        def is_alive(self):
+            return True
+
+    trace = disk._PLERowTraceWriter.__new__(disk._PLERowTraceWriter)
+    trace._closed = False
+    trace._condition = threading.Condition()
+    trace._worker = Worker()
+
+    with pytest.raises(TimeoutError, match="row trace.*shutdown"):
+        trace.close()
 
 
 def test_row_diagnostics_environment_is_opt_in(tmp_path, monkeypatch):
@@ -3177,6 +3440,47 @@ def test_row_diagnostics_environment_is_opt_in(tmp_path, monkeypatch):
         assert snapshot["row_trace_enabled"]
     finally:
         diagnostics.close()
+
+
+def test_row_diagnostic_environment_uses_the_registry(monkeypatch):
+    from sglang.srt.environ import envs
+
+    monkeypatch.setenv("SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT", "1")
+    monkeypatch.setenv("SGLANG_PLE_DISK_ROW_TRACE", "/tmp/trace-{rank}.jsonl")
+
+    assert envs.SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT.get() is True
+    assert envs.SGLANG_PLE_DISK_ROW_TRACE.get() == "/tmp/trace-{rank}.jsonl"
+
+
+def test_registered_image_failures_cover_crc_fingerprint_and_short_file(
+    tmp_path, monkeypatch
+):
+    rows = _fp8_rows(50)
+    image = build_test_image(tmp_path, rows)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        disk.open_ple_image(image.path, expected_fingerprint="wrong")
+
+    with image.path.open("r+b") as handle:
+        handle.seek(disk.PAGE_BYTES + 7)
+        original = handle.read(1)
+        handle.seek(disk.PAGE_BYTES + 7)
+        handle.write(bytes([original[0] ^ 0xFF]))
+    _patch_fetcher_library(monkeypatch, image)
+    monkeypatch.setattr(
+        disk, "pageable_memory_access_uses_host_page_tables", lambda: True
+    )
+    reader = disk.DirectPageReader(image, max_pages=1)
+    try:
+        with pytest.raises(IOError, match="checksum mismatch"):
+            reader.read(np.array([0], dtype=np.int64))
+    finally:
+        reader.close()
+
+    short_image = build_test_image(tmp_path / "short", rows)
+    with short_image.path.open("r+b") as handle:
+        handle.truncate(short_image.path.stat().st_size - 1)
+    with pytest.raises(IOError, match="short image|size mismatch"):
+        disk.open_ple_image(short_image.path)
 
 
 def test_disk_transfer_submits_the_staged_payload_to_diagnostics(monkeypatch):

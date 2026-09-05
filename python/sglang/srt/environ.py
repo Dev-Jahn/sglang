@@ -302,6 +302,8 @@ class Envs:
     # Compare staged graph lookup rows with the values used by the next replay.
     # Disabled by default.
     SGLANG_PLE_DISK_VALIDATE_GRAPH_STAGING = EnvBool(False)
+    SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT = EnvBool(False)
+    SGLANG_PLE_DISK_ROW_TRACE = EnvStr("")
     # Check lookup IDs asynchronously after capture and at this replay interval.
     # The result is reported by the following replay without a host wait. Zero
     # keeps only the first-replay check. The default interval is 8.

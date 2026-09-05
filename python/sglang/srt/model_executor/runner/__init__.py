@@ -53,6 +53,7 @@ from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     get_capture_runner_graph_key,
     get_global_graph_memory_pool,
     get_is_capture_mode,
+    get_is_model_capture_mode,
     model_capture_mode,
     set_global_graph_memory_pool,
 )

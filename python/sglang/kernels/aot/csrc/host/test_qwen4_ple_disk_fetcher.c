@@ -48,6 +48,12 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     fprintf(stderr, "invalid create returned %p errno=%d stage=%d\n", invalid_fetcher, errno, failure_stage);
     goto done;
   }
+  errno = 0;
+  invalid_fetcher = ple_fetcher_create(-1, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
+  if (invalid_fetcher || errno != EINVAL || failure_stage != PLE_FETCHER_FAILURE_NONE) {
+    fprintf(stderr, "invalid file descriptor returned %p errno=%d stage=%d\n", invalid_fetcher, errno, failure_stage);
+    goto done;
+  }
   fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
   if (!fetcher) {
     int error = errno;
@@ -88,13 +94,18 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   ple_fetcher_test_deadline_ms(0);
   int64_t deadline_elapsed_ns = (int64_t)(deadline_end.tv_sec - deadline_start.tv_sec) * 1000000000LL +
                                 (int64_t)(deadline_end.tv_nsec - deadline_start.tv_nsec);
-  if (deadline_rc != -EUCLEAN || deadline_elapsed_ns < 0 || deadline_elapsed_ns > 500000000LL) {
+  if (deadline_rc != -ETIMEDOUT || deadline_elapsed_ns < 0 || deadline_elapsed_ns > 500000000LL) {
     fprintf(
         stderr,
         "EINTR deadline returned %d after %llu ns\n",
         deadline_rc,
         (unsigned long long)(deadline_elapsed_ns < 0 ? 0 : deadline_elapsed_ns));
     ple_fetcher_destroy(deadline_fetcher);
+    goto done;
+  }
+  deadline_rc = ple_fetcher_read(deadline_fetcher, &deadline_offset, 1, buffer, 2 * PAGE_BYTES);
+  if (deadline_rc != 0 || memcmp(buffer, page, PAGE_BYTES) != 0) {
+    fprintf(stderr, "read after interrupted submission burst failed: %d\n", deadline_rc);
     goto done;
   }
   if (ple_fetcher_destroy(deadline_fetcher) != 0) {
@@ -219,6 +230,23 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
     goto done;
   }
 
+  void* accounting_fetcher = ple_fetcher_create(file_fd, buffer, 2 * PAGE_BYTES, 2, register_buffer, &failure_stage);
+  if (!accounting_fetcher) {
+    fprintf(stderr, "accounting test fetcher creation failed: %s\n", strerror(errno));
+    goto done;
+  }
+  ple_fetcher_test_corrupt_accounting_once();
+  rc = ple_fetcher_read(accounting_fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
+  if (rc != -EUCLEAN) {
+    fprintf(stderr, "ring accounting corruption returned %d instead of %d\n", rc, -EUCLEAN);
+    ple_fetcher_destroy(accounting_fetcher);
+    goto done;
+  }
+  if (ple_fetcher_destroy(accounting_fetcher) != 0) {
+    fprintf(stderr, "accounting test fetcher destroy failed\n");
+    goto done;
+  }
+
   ple_fetcher_test_stall_completions(1);
   rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
   if (rc != -EUCLEAN) {
@@ -242,9 +270,21 @@ static int run_scenarios(int file_fd, const unsigned char* page, int register_bu
   }
 
   ple_fetcher_test_stall_completions(1);
+  ple_fetcher_test_deadline_ms(20);
+  ple_fetcher_test_interrupt_waits(UINT_MAX);
+  clock_gettime(CLOCK_MONOTONIC, &deadline_start);
   rc = ple_fetcher_destroy(fetcher);
+  clock_gettime(CLOCK_MONOTONIC, &deadline_end);
+  ple_fetcher_test_interrupt_waits(0);
+  ple_fetcher_test_deadline_ms(0);
+  deadline_elapsed_ns = (int64_t)(deadline_end.tv_sec - deadline_start.tv_sec) * 1000000000LL +
+                        (int64_t)(deadline_end.tv_nsec - deadline_start.tv_nsec);
   if (rc != -ETIMEDOUT) {
     fprintf(stderr, "destroy timeout returned %d instead of %d\n", rc, -ETIMEDOUT);
+    goto done;
+  }
+  if (deadline_elapsed_ns < 0 || deadline_elapsed_ns > 500000000LL) {
+    fprintf(stderr, "destroy EINTR bound took %llu ns\n", (unsigned long long)deadline_elapsed_ns);
     goto done;
   }
   rc = ple_fetcher_read(fetcher, offsets, 1, buffer, 2 * PAGE_BYTES);
@@ -275,6 +315,7 @@ done:
   ple_fetcher_test_successful_empty_wakes(0);
   ple_fetcher_test_completion_on_last_wake(0);
   ple_fetcher_test_interrupt_submissions(0);
+  ple_fetcher_test_interrupt_waits(0);
   ple_fetcher_test_deadline_ms(0);
   ple_fetcher_test_expire_completion_deadline(0);
   if (fetcher) {

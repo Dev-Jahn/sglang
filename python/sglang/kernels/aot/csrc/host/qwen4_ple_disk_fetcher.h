@@ -15,7 +15,6 @@
 #define PLE_FETCHER_FAILURE_SETUP 1U
 #define PLE_FETCHER_FAILURE_REGISTER_BUFFER 2U
 #define PLE_FETCHER_FAILURE_REGISTER_FILE 3U
-#define PLE_FETCHER_DESTROY_BUSY_WAITS 5000U
 /* The destroy drain waits at most 50 times for 100 ms, about five seconds. */
 #define PLE_FETCHER_DESTROY_DRAIN_WAITS 50U
 
@@ -42,8 +41,10 @@ void ple_fetcher_test_stall_wakes(unsigned wakes);
 void ple_fetcher_test_successful_empty_wakes(unsigned wakes);
 void ple_fetcher_test_completion_on_last_wake(int enabled);
 void ple_fetcher_test_interrupt_submissions(unsigned interrupts);
+void ple_fetcher_test_interrupt_waits(unsigned interrupts);
 void ple_fetcher_test_deadline_ms(unsigned milliseconds);
 void ple_fetcher_test_expire_completion_deadline(unsigned count);
+void ple_fetcher_test_corrupt_accounting_once(void);
 int ple_fetcher_test_ring_open(void* opaque);
 #endif
 

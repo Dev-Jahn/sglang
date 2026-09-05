@@ -1,7 +1,7 @@
 """CUDA disk PLE tests.
 
-CI registration for this suite waits for a GPU runner that permits io_uring.
-Run this file directly on a compatible host.
+No automated workflow runs this manual suite. Run it directly on a CUDA host
+that permits io_uring.
 """
 
 import os

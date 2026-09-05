@@ -13,16 +13,19 @@
 # ==============================================================================
 """Exact disk backing for Qwen4 PLE embeddings with 160-byte FP8 rows.
 
-Format 3 stores one 4 KiB metadata block followed by records containing 25
+Format 4 stores one 4 KiB metadata block followed by records containing 25
 160-byte FP8 rows and 96 bytes of zero padding. The manifest records each
 checkpoint shard's global row range. The CRC sidecar contains one CRC32 per
-data record.
+data record. The optional row-content validator compares the fetched host
+buffer with the image. It does not inspect the host-to-device transfer or the
+rows read by a CUDA graph.
 """
 
 from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -38,7 +41,7 @@ import time
 import zlib
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
@@ -47,6 +50,7 @@ import numpy as np
 import torch
 from packaging.version import InvalidVersion, Version
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.pinned_memory import allocate_host_tensor as _allocate_host_tensor
 from sglang.srt.utils.ple_disk import validate_max_read_pages
 
@@ -63,6 +67,7 @@ PLE_ROW_TIER_COLD = 4
 PLE_ROW_TIER_NAMES = ("unowned", "static", "prefill", "dynamic", "cold")
 PLE_ROW_VALIDATION_MAX_INFLIGHT = 4
 PLE_ROW_TRACE_RING_SIZE = 65536
+PLE_ROW_TRACE_SHUTDOWN_SECONDS = 5.0
 IMAGE_MAGIC = b"PLEDISK4"
 CRC_MAGIC = b"PLCRC001"
 HOT_MAGIC = b"PLHOT001"
@@ -80,6 +85,7 @@ _METADATA_HEADER_BYTES = _METADATA_HEADER.size
 # Intentionally unbounded: releasing any entry could let the kernel write into
 # freed memory after a native reader teardown timed out or stayed busy.
 _RETAINED_POISONED_STAGING = []
+_RETAINED_GENERATION_LOCKS = []
 _MANIFEST_SOURCE_FIELDS = {
     "source_file",
     "source_file_size",
@@ -129,8 +135,17 @@ def resolve_hot_frequency_file(
     return resolved
 
 
+class DirectIOUnavailableError(OSError):
+    pass
+
+
 def _open_direct_file(path: Path) -> int:
-    return os.open(path, os.O_RDONLY | os.O_DIRECT)
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:
+            raise DirectIOUnavailableError(exc.errno, exc.strerror, path) from exc
+        raise
 
 
 def _current_cuda_device() -> int:
@@ -1216,6 +1231,21 @@ class PLEImageBuilder:
                         directory,
                     )
                     continue
+                lock_fd = None
+                try:
+                    lock_fd = os.open(
+                        directory / ".reader.lock", os.O_RDWR | os.O_CREAT, 0o644
+                    )
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, FileNotFoundError):
+                    if lock_fd is not None:
+                        os.close(lock_fd)
+                    logger.info(
+                        "Keeping superseded PLE generation %s because this "
+                        "generation is in use",
+                        directory,
+                    )
+                    continue
                 try:
                     size = sum(
                         entry.stat().st_size
@@ -1230,6 +1260,10 @@ class PLEImageBuilder:
                     )
                 except FileNotFoundError:
                     continue
+                finally:
+                    if lock_fd is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        os.close(lock_fd)
 
     def close(self) -> None:
         if self._raw_fd is not None:
@@ -1939,6 +1973,7 @@ class DirectPageReader:
         self._read_lock = threading.Lock()
         self._poisoned = False
         self._staging_retained = False
+        self._generation_lock_fd = None
         if self.staging.data_ptr() & (self.alignment - 1):
             raise RuntimeError("PLE registered staging buffer is not O_DIRECT aligned")
         self.lib = _load_helper_library()
@@ -1970,7 +2005,15 @@ class DirectPageReader:
         self.lib.ple_fetcher_destroy.restype = ctypes.c_int
         self.fd = None
         self.handle = None
-        self.fd = _open_direct_file(image.path)
+        self._generation_lock_fd = os.open(
+            image.path.parent / ".reader.lock", os.O_RDWR | os.O_CREAT, 0o644
+        )
+        fcntl.flock(self._generation_lock_fd, fcntl.LOCK_SH)
+        try:
+            self.fd = _open_direct_file(image.path)
+        except BaseException:
+            self._release_generation_lock()
+            raise
         failure_stage = ctypes.c_int()
         self.handle = self.lib.ple_fetcher_create(
             self.fd,
@@ -1984,6 +2027,7 @@ class DirectPageReader:
             error = ctypes.get_errno()
             os.close(self.fd)
             self.fd = None
+            self._release_generation_lock()
             if error == errno.ENOMEM and (
                 failure_stage.value == FETCHER_FAILURE_REGISTER_BUFFER
             ):
@@ -2064,6 +2108,8 @@ class DirectPageReader:
     def _read_locked(
         self, page_ids: np.ndarray, *, return_staging: bool = False
     ) -> np.ndarray:
+        if not getattr(self, "handle", None):
+            raise RuntimeError("PLE direct page reader is closed")
         page_ids = np.asarray(page_ids, dtype=np.int64)
         if np.any((page_ids < 0) | (page_ids >= self.image.num_pages)):
             raise IndexError("PLE page id outside image")
@@ -2138,8 +2184,23 @@ class DirectPageReader:
                 result[begin : begin + offsets.size] = pages
         return pages if return_staging else result
 
+    def _release_generation_lock(self) -> None:
+        lock_fd = getattr(self, "_generation_lock_fd", None)
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            self._generation_lock_fd = None
+
     def close(self) -> None:
-        with self._read_lock:
+        read_lock = getattr(self, "_read_lock", None)
+        if read_lock is None:
+            return
+        timeout = getattr(self, "_read_lock_timeout_seconds", 0.0)
+        if not read_lock.acquire(timeout=timeout):
+            raise TimeoutError(
+                "PLE disk fetcher shutdown timed out waiting for the reader lock"
+            )
+        try:
             destroy_error = None
             if getattr(self, "handle", None):
                 handle = self.handle
@@ -2157,9 +2218,13 @@ class DirectPageReader:
                 else:
                     self.handle = None
                     if -rc == errno.ETIMEDOUT:
-                        if not self._staging_retained:
+                        if not getattr(self, "_staging_retained", False):
                             _RETAINED_POISONED_STAGING.append(self._staging_allocation)
                             self._staging_retained = True
+                        generation_lock_fd = getattr(self, "_generation_lock_fd", None)
+                        if generation_lock_fd is not None:
+                            _RETAINED_GENERATION_LOCKS.append(generation_lock_fd)
+                            self._generation_lock_fd = None
                         logger.error(
                             "PLE disk fetcher retained %d staging bytes "
                             "cumulatively for the "
@@ -2175,16 +2240,29 @@ class DirectPageReader:
             if self.handle is None and getattr(self, "fd", None) is not None:
                 os.close(self.fd)
                 self.fd = None
+            if self.handle is None and not getattr(self, "_staging_retained", False):
+                self._release_generation_lock()
             if destroy_error is not None:
                 raise destroy_error
+        finally:
+            read_lock.release()
 
     def __del__(self) -> None:
         try:
             self.close()
         except OSError as exc:
-            if exc.errno == errno.EBUSY and not self._staging_retained:
-                _RETAINED_POISONED_STAGING.append(self._staging_allocation)
+            if exc.errno == errno.EBUSY and not getattr(
+                self, "_staging_retained", False
+            ):
+                staging = getattr(self, "_staging_allocation", None)
+                if staging is None:
+                    return
+                _RETAINED_POISONED_STAGING.append(staging)
                 self._staging_retained = True
+                generation_lock_fd = getattr(self, "_generation_lock_fd", None)
+                if generation_lock_fd is not None:
+                    _RETAINED_GENERATION_LOCKS.append(generation_lock_fd)
+                    self._generation_lock_fd = None
                 logger.error(
                     "PLE disk fetcher retained %d staging bytes cumulatively "
                     "during garbage "
@@ -2204,6 +2282,8 @@ class _PLEValidationBatch:
 
 
 class _PLERowContentValidator:
+    """Compare copied host rows with a separate CRC-checked image reader."""
+
     def __init__(
         self,
         image: PLEImage,
@@ -2389,13 +2469,30 @@ class _PLERowContentValidator:
         return snapshot
 
     def close(self) -> None:
-        if self._closed:
+        if getattr(self, "_shutdown_complete", False):
             return
         self._closed = True
-        self.wait()
-        self._queue.put(None)
-        self._worker.join()
+        reader_budget = getattr(
+            getattr(self, "reader", None), "_read_lock_timeout_seconds", 1.0
+        )
+        timeout = max(0.1, float(self.max_inflight) * float(reader_budget))
+        deadline = time.monotonic() + timeout
+        if not self.wait(timeout):
+            raise TimeoutError(
+                f"PLE row validation did not drain during {timeout:.1f}s shutdown"
+            )
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            self._queue.put(None, timeout=remaining)
+        except queue.Full as exc:
+            raise TimeoutError("PLE row validation shutdown queue is full") from exc
+        self._worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._worker.is_alive():
+            raise TimeoutError(
+                f"PLE row validation worker did not stop during {timeout:.1f}s shutdown"
+            )
         self.reader.close()
+        self._shutdown_complete = True
 
 
 class _PLERowTraceWriter:
@@ -2409,8 +2506,15 @@ class _PLERowTraceWriter:
     ) -> None:
         if ring_size <= 0:
             raise ValueError("PLE row trace ring size must be positive")
-        self.path = Path(path)
         self.rank = int(rank)
+        path_text = str(path)
+        if "{rank}" in path_text:
+            self.path = Path(path_text.replace("{rank}", str(self.rank)))
+        else:
+            source = Path(path_text)
+            self.path = source.with_name(
+                f"{source.stem}.rank{self.rank}{source.suffix}"
+            )
         self.module_prefix = str(module_prefix)
         self.ring_size = int(ring_size)
         self._fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -2515,25 +2619,18 @@ class _PLERowTraceWriter:
             }
 
     def close(self) -> None:
+        if getattr(self, "_shutdown_complete", False):
+            return
         with self._condition:
-            if self._closed:
-                return
             self._closed = True
             self._condition.notify_all()
-        self._worker.join()
+        self._worker.join(timeout=PLE_ROW_TRACE_SHUTDOWN_SECONDS)
+        if self._worker.is_alive():
+            raise TimeoutError(
+                "PLE row trace worker did not stop during bounded shutdown"
+            )
         os.close(self._fd)
-
-
-def _read_env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = value.lower()
-    if normalized in ("true", "1", "yes", "y"):
-        return True
-    if normalized in ("false", "0", "no", "n"):
-        return False
-    raise ValueError(f'"{value}" is not a valid boolean value for {name}')
+        self._shutdown_complete = True
 
 
 class PLEFetchDiagnostics:
@@ -2580,8 +2677,8 @@ class PLEFetchDiagnostics:
         module_prefix: str,
         max_pages: int,
     ) -> Optional[PLEFetchDiagnostics]:
-        validate = _read_env_bool("SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT")
-        trace_path = os.environ.get("SGLANG_PLE_DISK_ROW_TRACE") or None
+        validate = envs.SGLANG_PLE_DISK_VALIDATE_ROW_CONTENT.get()
+        trace_path = envs.SGLANG_PLE_DISK_ROW_TRACE.get() or None
         if not validate and trace_path is None:
             return None
         return cls(
@@ -2641,19 +2738,21 @@ class PLEFetchDiagnostics:
     def close(self) -> None:
         first_error = None
         validator = self._validator
-        self._validator = None
         if validator is not None:
             try:
                 validator.close()
             except BaseException as exc:
                 first_error = exc
+            else:
+                self._validator = None
         trace = self._trace
-        self._trace = None
         if trace is not None:
             try:
                 trace.close()
             except BaseException as exc:
                 first_error = first_error or exc
+            else:
+                self._trace = None
         if first_error is not None:
             raise first_error
 
@@ -2673,6 +2772,8 @@ class DiskRowFetcher:
         ngram_heads: int = 16,
     ) -> None:
         self.image = image
+        self._fetch_lock = threading.RLock()
+        self._closing = False
         ids = (
             read_hot_frequency_file(
                 hot_frequency_file,
@@ -2780,6 +2881,14 @@ class DiskRowFetcher:
         return hit
 
     def submit_prefill(self, global_ids: np.ndarray) -> bool:
+        fetch_lock = getattr(self, "_fetch_lock", None)
+        lock_context = fetch_lock if fetch_lock is not None else nullcontext()
+        with lock_context:
+            if getattr(self, "_closing", False):
+                raise RuntimeError("PLE disk fetcher is closed")
+            return self._submit_prefill_locked(global_ids)
+
+    def _submit_prefill_locked(self, global_ids: np.ndarray) -> bool:
         if getattr(self, "_closed", False):
             raise RuntimeError("PLE disk fetcher is closed")
         if not self._prefill_slots or self._prefill_disabled:
@@ -2882,7 +2991,7 @@ class DiskRowFetcher:
     def _fill_prefill_slot(self, slot: dict, sequence: int, ids: np.ndarray) -> None:
         try:
             count = ids.size
-            rows = self.fetch(
+            rows = self._fetch_locked(
                 ids,
                 out=slot["rows"][:count],
                 priority="prefill",
@@ -2921,6 +3030,40 @@ class DiskRowFetcher:
                 self._prefill_futures.difference_update(futures)
 
     def fetch(
+        self,
+        global_ids: np.ndarray,
+        out: Optional[torch.Tensor] = None,
+        *,
+        priority: str = "decode",
+        use_prefill: bool = True,
+        admit_dynamic: bool = True,
+        tier_out: Optional[np.ndarray] = None,
+    ) -> torch.Tensor:
+        fetch_lock = getattr(self, "_fetch_lock", None)
+        if fetch_lock is None:
+            if getattr(self, "_closed", False):
+                raise RuntimeError("PLE disk fetcher is closed")
+            return self._fetch_locked(
+                global_ids,
+                out,
+                priority=priority,
+                use_prefill=use_prefill,
+                admit_dynamic=admit_dynamic,
+                tier_out=tier_out,
+            )
+        with fetch_lock:
+            if getattr(self, "_closing", False):
+                raise RuntimeError("PLE disk fetcher is closed")
+            return self._fetch_locked(
+                global_ids,
+                out,
+                priority=priority,
+                use_prefill=use_prefill,
+                admit_dynamic=admit_dynamic,
+                tier_out=tier_out,
+            )
+
+    def _fetch_locked(
         self,
         global_ids: np.ndarray,
         out: Optional[torch.Tensor] = None,
@@ -3055,8 +3198,12 @@ class DiskRowFetcher:
         return output
 
     def close(self) -> None:
-        if getattr(self, "_closed", False):
-            return
+        fetch_lock = getattr(self, "_fetch_lock", None)
+        lock_context = fetch_lock if fetch_lock is not None else nullcontext()
+        with lock_context:
+            if getattr(self, "_closed", False):
+                return
+            self._closing = True
         first_error = None
         if getattr(self, "_prefill_executor", None) is not None:
             try:
@@ -3070,7 +3217,8 @@ class DiskRowFetcher:
                 executor.shutdown(wait=True)
             except BaseException as exc:
                 first_error = first_error or exc
-        self._closed = True
+        with lock_context:
+            self._closed = True
         self.hot = None
         dynamic = getattr(self, "dynamic", None)
         if dynamic is not None:

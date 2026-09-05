@@ -50,6 +50,11 @@ def get_is_capture_mode() -> bool:
     return is_capture_mode or is_in_breakable_cuda_graph()
 
 
+def get_is_model_capture_mode() -> bool:
+    """Return whether model execution is currently being captured."""
+    return is_capture_mode
+
+
 def compile_in_capture_mode(func):
     """Decorator: wrap func with torch.compile only when defined
     inside model capture mode; passthrough otherwise.

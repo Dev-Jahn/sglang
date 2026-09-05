@@ -112,11 +112,17 @@ static long enter_ring_bounded(struct fetcher* f, const struct timespec* deadlin
     }
   }
 #ifdef PLE_FETCHER_TESTING
+  extern unsigned ple_test_wait_interrupts;
   extern int ple_test_stall_completion;
   extern unsigned ple_test_stall_wakes;
   extern unsigned ple_test_successful_empty_wakes;
   extern unsigned ple_test_expire_completion_deadlines;
   extern int ple_test_completion_on_last_wake;
+  if (ple_test_wait_interrupts) {
+    --ple_test_wait_interrupts;
+    errno = EINTR;
+    return -1;
+  }
   if (ple_test_stall_completion) {
     errno = ETIME;
     return -1;
@@ -157,7 +163,7 @@ static long register_ring(int fd, unsigned op, const void* arg, unsigned nr) {
 void* ple_fetcher_create(
     int file_fd, void* buffer, size_t buffer_bytes, unsigned max_pages, int register_buffer, int* failure_stage) {
   if (failure_stage) *failure_stage = PLE_FETCHER_FAILURE_NONE;
-  if (!buffer || !max_pages || buffer_bytes < (size_t)max_pages * 4096 || ((uintptr_t)buffer & 4095)) {
+  if (file_fd < 0 || !buffer || !max_pages || buffer_bytes < (size_t)max_pages * 4096 || ((uintptr_t)buffer & 4095)) {
     errno = EINVAL;
     return NULL;
   }
@@ -258,10 +264,18 @@ static unsigned reap_available(struct fetcher* f, unsigned limit, int* result, i
     ++completed;
   }
   if (completed) __atomic_store_n(f->cq_head, head, __ATOMIC_RELEASE);
-  if (completed >= f->outstanding)
+#ifdef PLE_FETCHER_TESTING
+  extern int ple_test_corrupt_accounting;
+  if (completed && ple_test_corrupt_accounting) {
+    ple_test_corrupt_accounting = 0;
     f->outstanding = 0;
-  else
+  }
+#endif
+  if (completed > f->outstanding) {
+    __atomic_store_n(&f->poisoned, 1, __ATOMIC_RELEASE);
+  } else {
     f->outstanding -= completed;
+  }
   return completed;
 }
 
@@ -276,6 +290,7 @@ static int reap_bounded(
   while (completed < count) {
     unsigned reaped = reap_available(f, count - completed, result, 0);
     completed += reaped;
+    if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return -EUCLEAN;
     if (completed == count) return 0;
     if (reaped) continue;
     long rc;
@@ -286,6 +301,7 @@ static int reap_bounded(
     if (rc < 0 && errno != ETIME) return -errno;
     reaped = reap_available(f, count - completed, result, 0);
     completed += reaped;
+    if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return -EUCLEAN;
     if (completed == count) return 0;
     if (reaped) continue;
     if (++*waits >= max_waits) return -ETIMEDOUT;
@@ -298,35 +314,17 @@ static int poison_fetcher(struct fetcher* f) {
   return -EUCLEAN;
 }
 
-static int quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned count, unsigned completed) {
-  struct timespec deadline;
-  if (make_read_deadline(&deadline) < 0) return poison_fetcher(f);
-  unsigned attempts = 0;
-  while (submitted < count && attempts++ < PLE_FETCHER_QUIESCE_WAITS) {
-    long rc;
-    do {
-      if (deadline_reached(&deadline)) {
-        rc = -1;
-        errno = ETIMEDOUT;
-        break;
-      }
-      rc = submit_ring(f, count - submitted);
-    } while (rc < 0 && errno == EINTR);
-    if (rc <= 0) break;
-    submitted += (unsigned)rc;
-    f->outstanding += (unsigned)rc;
-  }
-
+static int
+quiesce_after_error(struct fetcher* f, unsigned submitted, unsigned completed, const struct timespec* deadline) {
   int ignored_result = 0;
   unsigned quiesce_waits = 0;
   if (submitted > completed &&
-      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_QUIESCE_WAITS, &deadline) <
+      reap_bounded(f, submitted - completed, &ignored_result, &quiesce_waits, PLE_FETCHER_QUIESCE_WAITS, deadline) <
           0) {
     return poison_fetcher(f);
   }
-  if (submitted != count) {
-    return poison_fetcher(f);
-  }
+  unsigned head = __atomic_load_n(f->sq_head, __ATOMIC_ACQUIRE);
+  __atomic_store_n(f->sq_tail, head, __ATOMIC_RELEASE);
   return 0;
 }
 
@@ -390,7 +388,7 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
     } while (rc < 0 && errno == EINTR);
     if (rc < 0 || rc == 0) {
       int error = rc < 0 ? -errno : -EIO;
-      if (quiesce_after_error(f, submitted, count, 0) < 0) return finish_read(f, -EUCLEAN);
+      if (quiesce_after_error(f, submitted, 0, &deadline) < 0) return finish_read(f, -EUCLEAN);
       return finish_read(f, error);
     }
     submitted += (unsigned)rc;
@@ -401,6 +399,7 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
   while (completed < count) {
     unsigned reaped = reap_available(f, count - completed, &result, 1);
     completed += reaped;
+    if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return finish_read(f, -EUCLEAN);
     if (completed == count) break;
     if (!reaped) {
       do {
@@ -408,15 +407,16 @@ int ple_fetcher_read(void* opaque, const uint64_t* offsets, unsigned count, void
       } while (rc < 0 && errno == EINTR);
       if (rc < 0 && errno != ETIME) {
         int error = -errno;
-        if (quiesce_after_error(f, count, count, completed) < 0) return finish_read(f, -EUCLEAN);
+        if (quiesce_after_error(f, count, completed, &deadline) < 0) return finish_read(f, -EUCLEAN);
         return finish_read(f, error);
       }
       reaped = reap_available(f, count - completed, &result, 1);
       completed += reaped;
+      if (__atomic_load_n(&f->poisoned, __ATOMIC_ACQUIRE)) return finish_read(f, -EUCLEAN);
       if (completed == count) break;
       if (reaped) continue;
       if (!ple_fetcher_retry_after_timeout(&waits)) {
-        if (quiesce_after_error(f, count, count, completed) < 0) return finish_read(f, -EUCLEAN);
+        if (quiesce_after_error(f, count, completed, &deadline) < 0) return finish_read(f, -EUCLEAN);
         return finish_read(f, -ETIMEDOUT);
       }
       continue;
@@ -446,21 +446,17 @@ int ple_fetcher_destroy(void* opaque) {
   if (!f) return 0;
   if (__atomic_load_n(&f->terminal_leaked, __ATOMIC_ACQUIRE)) return -ETIMEDOUT;
   int expected_state = 0;
-  unsigned waits = 0;
-  while (!__atomic_compare_exchange_n(&f->state, &expected_state, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-    /* Concurrent destroy violates the public contract; keep this result for
-     * diagnostics if a caller bypasses the wrapper serialization. */
-    if (expected_state == 2) return -EBUSY;
-    if (++waits >= PLE_FETCHER_DESTROY_BUSY_WAITS) return -EBUSY;
-    expected_state = 0;
-    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
-    nanosleep(&pause, NULL);
-  }
+  if (!__atomic_compare_exchange_n(&f->state, &expected_state, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return -EBUSY;
   if (f->outstanding) {
+    struct timespec deadline;
+    if (make_read_deadline(&deadline) < 0) {
+      __atomic_store_n(&f->terminal_leaked, 1, __ATOMIC_RELEASE);
+      return -ETIMEDOUT;
+    }
     unsigned drain_count = f->outstanding;
     unsigned drain_waits = 0;
     int ignored_result = 0;
-    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_DRAIN_WAITS, NULL) < 0) {
+    if (reap_bounded(f, drain_count, &ignored_result, &drain_waits, PLE_FETCHER_DESTROY_DRAIN_WAITS, &deadline) < 0) {
       /* The ring and all mappings stay allocated because the kernel may still
        * complete a request into the registered staging buffer. */
       __atomic_store_n(&f->terminal_leaked, 1, __ATOMIC_RELEASE);
@@ -489,8 +485,10 @@ unsigned ple_test_stall_wakes = 0;
 unsigned ple_test_successful_empty_wakes = 0;
 int ple_test_completion_on_last_wake = 0;
 unsigned ple_test_submission_interrupts = 0;
+unsigned ple_test_wait_interrupts = 0;
 unsigned ple_test_deadline_override_ms = 0;
 unsigned ple_test_expire_completion_deadlines = 0;
+int ple_test_corrupt_accounting = 0;
 
 void ple_fetcher_test_limit_submissions(unsigned pages) {
   ple_test_submit_limit = pages;
@@ -521,12 +519,20 @@ void ple_fetcher_test_interrupt_submissions(unsigned interrupts) {
   ple_test_submission_interrupts = interrupts;
 }
 
+void ple_fetcher_test_interrupt_waits(unsigned interrupts) {
+  ple_test_wait_interrupts = interrupts;
+}
+
 void ple_fetcher_test_deadline_ms(unsigned milliseconds) {
   ple_test_deadline_override_ms = milliseconds;
 }
 
 void ple_fetcher_test_expire_completion_deadline(unsigned count) {
   ple_test_expire_completion_deadlines = count;
+}
+
+void ple_fetcher_test_corrupt_accounting_once(void) {
+  ple_test_corrupt_accounting = 1;
 }
 
 int ple_fetcher_test_ring_open(void* opaque) {

@@ -53,6 +53,26 @@ _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
 
 
 class TestModelReplayHooks(CustomTestCase):
+    def test_capture_rejects_draft_model_with_disk_ple_and_no_replay_hook(self):
+        from sglang.srt.models.qwen4_exp import Qwen4ExpDiskEmbedding
+
+        disk_embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+        torch.nn.Module.__init__(disk_embedding)
+        language_model = torch.nn.Module()
+        language_model.add_module("disk_ple", disk_embedding)
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            model=language_model,
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(ple_storage="disk")
+            ),
+        )
+        runner._cuda_graph_replay_hook = None
+        runner.warmup = lambda: self.fail("draft capture reached warmup")
+
+        with self.assertRaisesRegex(RuntimeError, "draft.*disk-backed PLE"):
+            runner.capture()
+
     def test_disabled_model_batch_hook_does_not_reach_body(self):
         hook = mock.Mock()
         runner = ModelRunner.__new__(ModelRunner)

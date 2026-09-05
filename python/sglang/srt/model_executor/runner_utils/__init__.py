@@ -20,6 +20,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (  # noqa: F401
     get_capture_lora_variant,
     get_capture_runner_graph_key,
     get_is_capture_mode,
+    get_is_model_capture_mode,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (  # noqa: F401

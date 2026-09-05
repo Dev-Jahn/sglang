@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.model_executor.runner_utils.capture_mode import capture_runner_graph
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
@@ -27,6 +28,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def test_transfer_records_completion_on_the_prefetch_stream(monkeypatch):
     events = []
 
+    class ViewedRows:
+        def to(self, *args, **kwargs):
+            pytest.fail("disk transfer allocated a conversion tensor")
+
+    viewed_rows = ViewedRows()
+
     class DeviceBuffer:
         def record_stream(self, stream):
             events.append(("record_stream", stream))
@@ -35,7 +42,11 @@ def test_transfer_records_completion_on_the_prefetch_stream(monkeypatch):
             events.append(("copy", source, non_blocking))
 
         def view(self, dtype):
-            return torch.zeros((1, 4), dtype=torch.uint8).view(dtype)
+            return viewed_rows
+
+    class OutputBuffer:
+        def copy_(self, source, non_blocking=False):
+            events.append(("convert", source, non_blocking))
 
     class Completion:
         def record(self, stream):
@@ -59,7 +70,7 @@ def test_transfer_records_completion_on_the_prefetch_stream(monkeypatch):
         SimpleNamespace(synchronize=lambda: None),
         raw_host,
         DeviceBuffer(),
-        torch.empty((1, 4), dtype=torch.bfloat16),
+        OutputBuffer(),
         stream,
         True,
     )
@@ -67,6 +78,7 @@ def test_transfer_records_completion_on_the_prefetch_stream(monkeypatch):
     assert events[1:] == [
         ("record_stream", stream),
         ("copy", raw_host, True),
+        ("convert", viewed_rows, False),
         ("completion", stream),
     ]
 
@@ -103,10 +115,32 @@ def test_disk_graph_replay_rejects_captured_buffer_without_same_step_staging():
     key = (ForwardMode.IDLE, 4)
     layer._graph_lookup_id_buffers = {key: torch.zeros((4, 1), dtype=torch.long)}
 
-    layer.prepare_cuda_graph_replay(None, None, key)
-
     with pytest.raises(RuntimeError, match="did not stage its captured buffer"):
-        layer.wait_cuda_graph_replay()
+        layer.prepare_cuda_graph_replay(None, None, key)
+
+
+def test_disk_graph_replay_rejects_zero_lookup_extent():
+    embedding = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
+    torch.nn.Module.__init__(embedding)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+    layer._graph_replay_generation = None
+    layer._graph_replay_stage_expected = False
+    layer._graph_replay_capture_expected_key = None
+    layer._pending_graph_embedding_validation = None
+    layer._pending_graph_lookup_validation = None
+    layer._completed_graph_embedding_validation = deque()
+    layer._completed_graph_lookup_validation = deque()
+    key = (ForwardMode.DECODE, 0, None, None)
+    layer._graph_lookup_id_buffers = {key: torch.empty((0, 1), dtype=torch.long)}
+
+    with pytest.raises(RuntimeError, match="zero lookup rows"):
+        layer.prepare_cuda_graph_replay(
+            SimpleNamespace(mode=ForwardMode.DECODE),
+            torch.empty((0, 1), dtype=torch.long),
+            key,
+        )
 
 
 def test_disk_capture_retains_the_graph_updated_lookup_buffer(monkeypatch):
@@ -273,6 +307,13 @@ def test_disk_capture_key_keeps_runner_variants_separate():
 
 
 def test_disk_capture_reregisters_one_runner_key_before_replay(monkeypatch):
+    class ReadyEvent:
+        def record(self, stream):
+            pass
+
+        def query(self):
+            return True
+
     offloaded = Qwen4ExpDiskEmbedding.__new__(Qwen4ExpDiskEmbedding)
     torch.nn.Module.__init__(offloaded)
     offloaded.gather = lambda input_ids, out: out.fill_(input_ids[0, 0])
@@ -329,7 +370,13 @@ def test_disk_capture_reregisters_one_runner_key_before_replay(monkeypatch):
     monkeypatch.setattr(
         qwen4_exp_module.torch.cuda, "stream", lambda stream: nullcontext()
     )
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "_allocate_host_tensor",
+        lambda shape, dtype: torch.empty(shape, dtype=dtype),
+    )
     batch = SimpleNamespace(
         mode=ForwardMode.DECODE, physical_tokens=4, processed_tokens=4
     )
@@ -340,11 +387,19 @@ def test_disk_capture_reregisters_one_runner_key_before_replay(monkeypatch):
         _original_forward_mode=None,
     )
 
-    with capture_runner_graph(runner_key):
+    # DecodeCudaGraphRunner.warmup runs under model capture mode before a
+    # runner graph key exists. The recorded pass then supplies its ShapeKey.
+    capture_mode._set_capture_lora_variant("lora")
+    capture_mode._set_capture_dsa_variant("dense")
+    try:
         layer.start_prefetch(batch, forward_batch)
         layer._consume_prefetched_embeddings(forward_batch)
-        layer.start_prefetch(batch, forward_batch)
-        layer._consume_prefetched_embeddings(forward_batch)
+        with capture_runner_graph(runner_key):
+            layer.start_prefetch(batch, forward_batch)
+            layer._consume_prefetched_embeddings(forward_batch)
+    finally:
+        capture_mode._set_capture_lora_variant(None)
+        capture_mode._set_capture_dsa_variant(None)
 
     capturing = False
     graph_key = (ForwardMode.DECODE, 4, "lora", "dense")
@@ -358,6 +413,14 @@ def test_disk_capture_reregisters_one_runner_key_before_replay(monkeypatch):
 
     assert layer._graph_replay_generation is None
     assert layer._graph_replay_capture_expected_key is None
+
+
+def test_breakable_replay_session_is_not_capture(monkeypatch):
+    monkeypatch.setattr(capture_mode, "is_capture_mode", False)
+    monkeypatch.setattr(capture_mode, "is_in_breakable_cuda_graph", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert not qwen4_exp_module._is_ple_cuda_graph_capturing()
 
 
 def test_disk_ple_forward_rejects_a_missing_prefetch():
@@ -776,6 +839,57 @@ def test_graph_lookup_validation_defaults_to_every_eighth_replay(monkeypatch):
         layer._graph_lookup_validation_required(key, 257)
 
 
+def test_graph_lookup_validation_interval_is_per_graph_key():
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    first = (ForwardMode.DECODE, 2, None, None)
+    second = (ForwardMode.DECODE, 4, None, None)
+    layer._graph_replay_steps = defaultdict(int)
+
+    assert layer._next_graph_replay_step(first) == 1
+    assert layer._next_graph_replay_step(second) == 1
+    assert layer._next_graph_replay_step(first) == 2
+    assert layer._next_graph_replay_step(second) == 2
+
+
+def test_default_staging_digest_reports_later_without_host_wait(monkeypatch):
+    class ReadyEvent:
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return True
+
+        def synchronize(self):
+            pytest.fail("default staging validation synchronized its event")
+
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "Event", ReadyEvent)
+    monkeypatch.setattr(qwen4_exp_module.torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "_allocate_host_tensor",
+        lambda shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+    key = (ForwardMode.DECODE, 2, None, None)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    torch.nn.Module.__init__(layer)
+    layer._pending_graph_embedding_validation = None
+    layer._completed_graph_embedding_validation = deque()
+    layer._pending_graph_lookup_validation = None
+    layer._completed_graph_lookup_validation = deque()
+    layer._pending_graph_staging_validation = (key, 11)
+    layer._completed_graph_staging_validation = deque()
+    layer._graph_validation_free_slots = deque()
+    layer._graph_staging_digest_buffers = {key: torch.tensor([1.0, 7.0])}
+    layer._graph_staging_expected_buffers = {key: torch.tensor([1.0, 5.0])}
+
+    layer.finish_cuda_graph_replay()
+    assert len(layer._completed_graph_staging_validation) == 1
+
+    with pytest.raises(RuntimeError, match=r"staged rows differ.*step 11"):
+        layer.finish_cuda_graph_replay()
+
+
 def test_lookup_validation_replay_hooks_do_not_synchronize_host(monkeypatch):
     phase = {"name": "setup"}
     forbidden_calls = []
@@ -839,7 +953,7 @@ def test_lookup_validation_replay_hooks_do_not_synchronize_host(monkeypatch):
         ngram_heads=1,
     )
     layer._prefetch_stream = model_stream
-    layer._graph_prefetch_buffer = torch.empty((2, 1, 4))
+    layer._graph_prefetch_buffer = torch.zeros((2, 1, 4))
     layer._graph_replay_generation = None
     layer._graph_replay_stage_expected = False
     layer._graph_replay_capture_expected_key = None
@@ -858,6 +972,7 @@ def test_lookup_validation_replay_hooks_do_not_synchronize_host(monkeypatch):
     layer._graph_replay_steps = 0
     key = (ForwardMode.DECODE, 2)
     layer._graph_lookup_id_buffers = {key: torch.tensor([[3], [5]], dtype=torch.long)}
+    layer._graph_staging_digest_buffers = {key: torch.zeros(2)}
     batch = SimpleNamespace(mode=ForwardMode.DECODE)
 
     for replay_step in (1, 2):
@@ -875,7 +990,7 @@ def test_lookup_validation_replay_hooks_do_not_synchronize_host(monkeypatch):
             hook()
 
     assert forbidden_calls == []
-    assert query_phases == ["finish-2"]
+    assert query_phases == ["prepare-2", "finish-2"]
 
 
 def test_graph_replay_shared_buffer_requires_a_captured_size(monkeypatch):

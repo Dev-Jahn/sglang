@@ -211,6 +211,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     routes_model_replay_hook = True
 
+    def _validate_disk_ple_replay_hook(self) -> None:
+        if (
+            getattr(self, "_cuda_graph_replay_hook", None) is not None
+            or resolve_model_runner_ple_storage(self.model_runner, "gpu") != "disk"
+        ):
+            return
+        from sglang.srt.models.qwen4_exp import Qwen4ExpDiskEmbedding
+
+        language_model = self.model_runner.model
+        if isinstance(language_model, torch.nn.Module) and any(
+            isinstance(module, Qwen4ExpDiskEmbedding)
+            for module in language_model.modules()
+        ):
+            raise RuntimeError(
+                "speculative draft CUDA graph runner has a disk-backed PLE "
+                "embedding but does not route the replay hook"
+            )
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1005,6 +1023,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        self._validate_disk_ple_replay_hook()
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()

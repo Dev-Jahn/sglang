@@ -53,6 +53,8 @@ def build_test_image(
 
 
 def native_reader_unavailable_reason(exc: BaseException) -> str | None:
+    from sglang.srt.models.qwen4_ple_disk import DirectIOUnavailableError
+
     if isinstance(exc, RuntimeError):
         messages = (
             "sgl_kernel is not importable",
@@ -64,12 +66,13 @@ def native_reader_unavailable_reason(exc: BaseException) -> str | None:
         )
         if any(message in str(exc) for message in messages):
             return f"PLE disk helper or direct-I/O storage is unavailable: {exc}"
+    if isinstance(exc, DirectIOUnavailableError):
+        return f"PLE io_uring or O_DIRECT is unavailable: {exc}"
     if isinstance(exc, OSError) and exc.errno in {
         errno.EPERM,
         errno.EACCES,
         errno.ENOSYS,
         errno.EOPNOTSUPP,
-        errno.EINVAL,
     }:
         return f"PLE io_uring or O_DIRECT is unavailable: {exc}"
     return None
