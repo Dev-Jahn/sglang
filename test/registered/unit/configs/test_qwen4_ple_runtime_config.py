@@ -6,15 +6,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from transformers import LlamaConfig
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.weight_cache.daemon import _model_config_for_loading
+from sglang.srt.weight_cache.daemon import WeightCacheDaemon, _model_config_for_loading
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -140,7 +142,76 @@ def test_qwen4_draft_config_is_stamped(tmp_path):
     assert draft_config.hf_text_config.ple_disk_dir == str(tmp_path / "images")
 
 
-def test_weight_cache_daemon_keeps_bf16_qwen4_loading_on_gpu_storage(tmp_path):
+def test_non_qwen_draft_config_ignores_target_ple_storage(tmp_path):
+    draft_path = tmp_path / "eagle3-draft"
+    draft_config = LlamaConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        num_key_value_heads=4,
+    )
+    draft_config.architectures = ["LlamaForCausalLMEagle3"]
+    draft_config.save_pretrained(draft_path)
+
+    with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=True), patch(
+        "sglang.srt.server_args.is_cuda", return_value=True
+    ):
+        server_args = ServerArgs(
+            model_path=str(_MODEL_PATH),
+            ple_storage="pinned",
+            device="cuda",
+        )
+        resolved_draft = ModelConfig.from_server_args(
+            server_args,
+            model_path=str(draft_path),
+            is_draft_model=True,
+        )
+
+    assert resolved_draft.hf_config.architectures == ["LlamaForCausalLMEagle3"]
+
+
+def test_runtime_config_hook_runs_once_during_server_args_launch(monkeypatch):
+    calls = []
+    original = Qwen4ExpConfig.apply_sglang_runtime_config
+
+    def counted_hook(config, server_args):
+        calls.append(config)
+        return original(config, server_args)
+
+    monkeypatch.setattr(Qwen4ExpConfig, "apply_sglang_runtime_config", counted_hook)
+    with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=True), patch(
+        "sglang.srt.server_args.is_cuda", return_value=True
+    ):
+        server_args = ServerArgs(
+            model_path=str(_MODEL_PATH),
+            ple_storage="pinned",
+            device="cuda",
+        )
+
+    assert calls == [server_args.get_model_config().hf_config]
+
+
+def test_weight_cache_daemon_warns_once_for_non_gpu_engine_storage(caplog):
+    daemon = WeightCacheDaemon(
+        model_path=str(_MODEL_PATH),
+        gpu_id=0,
+        ple_storage="disk",
+    )
+
+    with caplog.at_level("WARNING"):
+        selected = [daemon._ple_storage_for_cuda_ipc() for _ in range(2)]
+
+    assert selected == ["gpu", "gpu"]
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "--ple-storage disk" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_weight_cache_daemon_stamps_bf16_qwen4_loading_on_gpu_storage(tmp_path):
     with patch("sglang.srt.arg_groups.overrides.is_cuda", return_value=True), patch(
         "sglang.srt.server_args.is_cuda", return_value=True
     ):
@@ -148,9 +219,10 @@ def test_weight_cache_daemon_keeps_bf16_qwen4_loading_on_gpu_storage(tmp_path):
             model_path=str(_MODEL_PATH),
             dtype="bfloat16",
             device="cuda",
+            ple_storage="gpu",
         )
 
-    assert server_args.ple_storage == "pinned"
+    assert server_args.ple_storage == "gpu"
     model_config = _model_config_for_loading(server_args)
     assert model_config.hf_text_config.ple_storage == "gpu"
 

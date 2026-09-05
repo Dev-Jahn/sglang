@@ -34,7 +34,6 @@ Usage:
         --dist-init-method tcp://127.0.0.1:29500
 """
 
-import copy
 import logging
 import os
 import signal
@@ -84,17 +83,10 @@ def _model_config_for_loading(server_args):
         dtype=server_args.dtype,
         quantization=server_args.quantization,
     )
-    daemon_args = copy.copy(server_args)
-    object.__setattr__(daemon_args, "ple_storage", "gpu")
-    hook = getattr(model_config.hf_config, "apply_sglang_runtime_config", None)
-    if callable(hook):
-        hook(daemon_args)
-    if server_args.ple_storage not in (None, "gpu"):
-        logger.info(
-            "Weight-cache daemon uses GPU PLE storage while the requesting "
-            "engine uses %s storage; CUDA IPC exports device-resident weights",
-            server_args.ple_storage,
-        )
+    server_args._handle_offload_compatibility(
+        resolved=True,
+        model_config=model_config,
+    )
     return model_config
 
 
@@ -102,7 +94,9 @@ class WeightCacheDaemon:
     """Persistent GPU weight cache for a single TP rank.
 
     Holds the complete post-quantization state_dict in GPU memory and
-    serves CUDA IPC handles to engine processes via Unix socket.
+    serves CUDA IPC handles to engine processes via Unix socket. Its PLE copy
+    uses GPU storage even when the requesting engine uses pinned or disk storage;
+    each daemon logs that change once.
     """
 
     def __init__(
@@ -140,6 +134,7 @@ class WeightCacheDaemon:
         self.revision = revision
         self.dist_init_method = dist_init_method
         self.ple_storage = ple_storage
+        self._ple_storage_warning_emitted = False
 
         self.socket_path = get_socket_path(
             compute_global_rank(tp_size, pp_rank, tp_rank)
@@ -150,6 +145,19 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+
+    def _ple_storage_for_cuda_ipc(self) -> str:
+        if (
+            self.ple_storage not in (None, "gpu")
+            and not self._ple_storage_warning_emitted
+        ):
+            logger.warning(
+                "Weight-cache daemon received --ple-storage %s and uses "
+                "--ple-storage gpu for its CUDA IPC copy",
+                self.ple_storage,
+            )
+            self._ple_storage_warning_emitted = True
+        return "gpu"
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -249,14 +257,8 @@ class WeightCacheDaemon:
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
             revision=self.revision,
-            ple_storage="gpu",
+            ple_storage=self._ple_storage_for_cuda_ipc(),
         )
-        if self.ple_storage not in (None, "gpu"):
-            logger.info(
-                "Weight-cache daemon received engine PLE storage %s and uses "
-                "GPU storage for its CUDA IPC weight copy",
-                self.ple_storage,
-            )
         publish(server_args, role="weight_cache_daemon")
 
         # Initialize distributed backend for model loading

@@ -6,7 +6,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import msgspec
 import torch
@@ -41,9 +41,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.model_executor.model_hooks import StorageLifecycleHook
 
 logger = logging.getLogger(__name__)
+
+_PLE_DISK_REQUEST_ERROR = (
+    "--ple-storage disk does not support online weight updates or memory release "
+    "and resume requests"
+)
 
 
 def _get_draft_model_runner(draft_worker):
@@ -86,29 +90,10 @@ class SchedulerWeightUpdaterManager:
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
 
-    def _run_tp_storage_operation(
-        self, operation: Callable[[], None], operation_name: str
-    ) -> None:
-        local_error = None
-        try:
-            operation()
-        except BaseException as exc:
-            local_error = exc
-
-        failed = torch.tensor([local_error is not None], dtype=torch.uint8)
-        torch.distributed.all_reduce(
-            failed,
-            op=torch.distributed.ReduceOp.MAX,
-            group=self.tp_cpu_group,
-        )
-        torch.distributed.barrier(group=self.tp_cpu_group)
-
-        if local_error is not None:
-            raise local_error
-        if bool(failed.item()):
-            raise RuntimeError(
-                f"{operation_name} failed on another tensor-parallel rank"
-            )
+    def _reject_ple_disk_request(self) -> None:
+        server_args = self.tp_worker.model_runner.server_args
+        if getattr(server_args, "ple_storage", None) == "disk":
+            raise RuntimeError(_PLE_DISK_REQUEST_ERROR)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -134,6 +119,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        self._reject_ple_disk_request()
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -149,6 +135,7 @@ class SchedulerWeightUpdaterManager:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
+        self._reject_ple_disk_request()
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
@@ -157,6 +144,7 @@ class SchedulerWeightUpdaterManager:
         recv_req: DestroyWeightsUpdateGroupReqInput,
     ):
         """Destroy the online model parameter update group."""
+        self._reject_ple_disk_request()
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
@@ -165,6 +153,7 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        self._reject_ple_disk_request()
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -177,6 +166,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        self._reject_ple_disk_request()
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -192,6 +182,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        self._reject_ple_disk_request()
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -225,6 +216,7 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        self._reject_ple_disk_request()
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
@@ -257,14 +249,10 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
-            model = self.tp_worker.model_runner.model
-            self.stashed_model_static_state = _export_static_state(model)
-            torch.distributed.barrier(group=self.tp_cpu_group)
-            if getattr(model, "supports_storage_lifecycle_hook", False):
-                self._run_tp_storage_operation(
-                    cast(StorageLifecycleHook, model).close,
-                    "weight storage release",
-                )
+            self.stashed_model_static_state = _export_static_state(
+                self.tp_worker.model_runner.model
+            )
+            torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
@@ -275,6 +263,7 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        self._reject_ple_disk_request()
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -289,14 +278,11 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            model = self.tp_worker.model_runner.model
-            torch.distributed.barrier(group=self.tp_cpu_group)
-            _import_static_state(model, self.stashed_model_static_state)
-            if getattr(model, "supports_storage_lifecycle_hook", False):
-                self._run_tp_storage_operation(
-                    cast(StorageLifecycleHook, model).resume_storage,
-                    "weight storage resume",
-                )
+            torch.distributed.barrier(self.tp_cpu_group)
+            _import_static_state(
+                self.tp_worker.model_runner.model,
+                self.stashed_model_static_state,
+            )
             del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:

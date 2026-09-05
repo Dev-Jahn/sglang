@@ -143,6 +143,7 @@ _EXPOSED = {
     ("configs/model_config.py", "quantization"),
     ("configs/model_config.py", "speculative_algorithm"),
     ("configs/model_config.py", "speculative_draft_model_quantization"),
+    ("configs/qwen4_exp.py", "chunked_prefill_size"),
     ("constrained/base_grammar_backend.py", "grammar_backend"),
     ("constrained/base_grammar_backend.py", "reasoning_parser"),
     ("disaggregation/common/conn.py", "disaggregation_bootstrap_port"),

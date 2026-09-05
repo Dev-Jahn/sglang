@@ -34,43 +34,22 @@ def _checkpoint_with_disk_storage(tmp_path):
     return model_path
 
 
-def _server_args(**overrides):
-    values = {
-        "ple_storage": "gpu",
-        "ple_disk_dir": "/tmp/ple",
-        "ple_disk_hot_cache_gb": 0.0,
-        "ple_disk_hot_frequency_file": None,
-        "ple_disk_dynamic_cache_gb": 0.0,
-        "ple_disk_prefill_buffer_tokens": 16,
-        "ple_disk_prefill_read_pages": 2048,
-        "ple_disk_max_read_pages": None,
-        "ple_disk_stats_log_interval": 0,
-        "cpu_offload_gb": 0.0,
-        "offload_group_size": 0,
-        "pp_size": 1,
-        "dllm_algorithm": None,
-        "enable_dp_attention": False,
-        "enable_multi_layer_eagle": False,
-        "enable_pdmux": False,
-    }
-    values.update(overrides)
-    args = object.__new__(server_args_module.ServerArgs)
-    for name, value in values.items():
-        object.__setattr__(args, name, value)
-    return args
-
-
 def test_offload_compatibility_writes_nothing_after_resolution():
-    args = _server_args()
+    args = _cuda_server_args(model_path=str(_MODEL_PATH), ple_storage="gpu")
     before = vars(args).copy()
     args._handle_offload_compatibility(resolved=True)
     assert vars(args) == before
     assert args.ple_disk_max_read_pages is None
-    assert args.ple_disk_prefill_read_pages == 2048
+    assert args.ple_disk_prefill_read_pages > 0
 
 
 def test_unused_disk_options_warn_only_after_resolution(caplog):
-    args = _server_args()
+    args = _cuda_server_args(
+        model_path=str(_MODEL_PATH),
+        ple_storage="gpu",
+        ple_disk_hot_cache_gb=1.0,
+    )
+    caplog.clear()
     with caplog.at_level("WARNING"):
         args._handle_offload_compatibility(resolved=True)
         args._handle_offload_compatibility()
@@ -78,9 +57,8 @@ def test_unused_disk_options_warn_only_after_resolution(caplog):
 
 
 def test_explicit_max_read_pages_still_validated():
-    args = _server_args(ple_disk_max_read_pages=0)
     with pytest.raises(ValueError):
-        args._handle_offload_compatibility()
+        _cuda_server_args(model_path="dummy", ple_disk_max_read_pages=0)
 
 
 @pytest.mark.parametrize(
@@ -95,9 +73,8 @@ def test_explicit_max_read_pages_still_validated():
     ],
 )
 def test_disk_argument_bounds_are_validated(option, value, message):
-    args = _server_args(**{option: value})
     with pytest.raises(ValueError, match=message):
-        args._validate_ple_disk_args()
+        _cuda_server_args(model_path="dummy", **{option: value})
 
 
 @pytest.mark.parametrize(
@@ -116,9 +93,8 @@ def test_disk_argument_bounds_are_validated(option, value, message):
     ],
 )
 def test_prefill_argument_upper_bounds_are_validated(option, value, message):
-    args = _server_args(**{option: value})
     with pytest.raises(ValueError, match=message):
-        args._validate_ple_disk_args()
+        _cuda_server_args(model_path="dummy", **{option: value})
 
 
 def test_disk_storage_requires_an_image_directory():
@@ -303,11 +279,11 @@ def test_disk_storage_rejects_pdmux_after_resolution(tmp_path):
 
 
 def test_auto_selected_pinned_storage_names_the_explicit_escape():
-    args = _server_args(ple_storage="pinned", cpu_offload_gb=1.0)
-    args._resolved_overrides = [("qwen4 automatic storage", {"ple_storage": "pinned"})]
-
     with pytest.raises(ValueError) as exc_info:
-        args._handle_offload_compatibility(resolved=True)
+        _cuda_server_args(
+            model_path=str(_MODEL_PATH),
+            cpu_offload_gb=1.0,
+        )
 
     message = str(exc_info.value)
     assert "selected automatically" in message
@@ -343,15 +319,29 @@ def test_deprecated_no_ple_offload_embedding_alias_maps_to_gpu(caplog):
 
 
 @pytest.mark.parametrize(
-    "arguments",
+    ("arguments", "expected_error"),
     [
-        ["--ple-offload-embedding", "--ple-storage", "gpu"],
-        ["--ple-storage", "gpu", "--ple-offload-embedding"],
-        ["--no-ple-offload-embedding", "--ple-storage", "pinned"],
-        ["--ple-storage", "pinned", "--no-ple-offload-embedding"],
+        (
+            ["--ple-offload-embedding", "--ple-storage", "gpu"],
+            "--ple-storage conflicts with --ple-offload-embedding",
+        ),
+        (
+            ["--ple-storage", "gpu", "--ple-offload-embedding"],
+            "--ple-offload-embedding conflicts with --ple-storage",
+        ),
+        (
+            ["--no-ple-offload-embedding", "--ple-storage", "pinned"],
+            "--ple-storage conflicts with --no-ple-offload-embedding",
+        ),
+        (
+            ["--ple-storage", "pinned", "--no-ple-offload-embedding"],
+            "--no-ple-offload-embedding conflicts with --ple-storage",
+        ),
     ],
 )
-def test_deprecated_ple_alias_conflict_names_both_flags(arguments, capsys):
+def test_deprecated_ple_alias_conflict_names_both_flags(
+    arguments, expected_error, capsys
+):
     parser = server_args_module.argparse.ArgumentParser()
     server_args_module.ServerArgs.add_cli_args(parser)
 
@@ -359,11 +349,7 @@ def test_deprecated_ple_alias_conflict_names_both_flags(arguments, capsys):
         parser.parse_args(["--model-path", "dummy", *arguments])
 
     message = capsys.readouterr().err
-    assert "--ple-storage" in message
-    assert any(
-        option in message
-        for option in ("--ple-offload-embedding", "--no-ple-offload-embedding")
-    )
+    assert message.rstrip().endswith(f"error: {expected_error}")
 
 
 if __name__ == "__main__":

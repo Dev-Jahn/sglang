@@ -3854,17 +3854,6 @@ class ServerArgs:
 
         materialize_declarations(self)
         self._handle_offload_compatibility(resolved=True)
-        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
-            hf_config = self.get_model_config().hf_config
-            hook = getattr(hf_config, "apply_sglang_runtime_config", None)
-            applied = bool(hook(self)) if callable(hook) else False
-            if self.ple_storage in ("pinned", "disk") and not applied:
-                architectures = getattr(hf_config, "architectures", None)
-                architecture = architectures[0] if architectures else "unknown"
-                raise ValueError(
-                    f"--ple-storage {self.ple_storage} is unavailable for model "
-                    f"architecture {architecture}"
-                )
 
     def _validate_ple_disk_args(self):
         from sglang.srt.utils.ple_disk import (
@@ -3897,26 +3886,45 @@ class ServerArgs:
         if self.ple_disk_stats_log_interval < 0:
             raise ValueError("--ple-disk-stats-log-interval must be non-negative")
 
-    def _handle_offload_compatibility(self, *, resolved=False):
-        self._validate_ple_disk_args()
-        storage = self.ple_storage
-        changed_disk_options = []
+    def _handle_offload_compatibility(
+        self,
+        *,
+        resolved=False,
+        model_config=None,
+        is_draft_model=False,
+    ):
         connector_type = parse_connector_type(getattr(self, "model_path", ""))
-        if (
-            resolved
-            and storage not in (None, "gpu")
-            and hasattr(self, "model_path")
-            and connector_type != ConnectorType.INSTANCE
-        ):
-            hf_config = self.get_model_config().hf_config
+        if model_config is not None:
+            if connector_type == ConnectorType.INSTANCE:
+                return
+            hf_config = model_config.hf_config
             hook = getattr(hf_config, "apply_sglang_runtime_config", None)
-            if not callable(hook):
+            applied = bool(hook(self)) if callable(hook) else False
+            if (
+                self.ple_storage in ("pinned", "disk")
+                and not applied
+                and not is_draft_model
+            ):
                 architectures = getattr(hf_config, "architectures", None)
                 architecture = architectures[0] if architectures else "unknown"
                 raise ValueError(
-                    f"--ple-storage {storage} is unavailable for the selected "
+                    f"--ple-storage {self.ple_storage} is unavailable for "
                     f"model architecture {architecture}"
                 )
+            return
+
+        self._validate_ple_disk_args()
+        storage = self.ple_storage
+        changed_disk_options = []
+        if (
+            resolved
+            and hasattr(self, "model_path")
+            and connector_type != ConnectorType.INSTANCE
+        ):
+            self._handle_offload_compatibility(
+                resolved=True,
+                model_config=self.get_model_config(),
+            )
         if storage == "disk":
             if resolved:
                 from sglang.srt.arg_groups.overrides import declare_late_resolution

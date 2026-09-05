@@ -1,5 +1,8 @@
+import sys
 import timeit
 from typing import Any, Callable, List, Tuple, Type
+
+import pytest
 
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.utils import TypeBasedDispatcher
@@ -256,9 +259,4 @@ def simulate_real_workload():
 
 
 if __name__ == "__main__":
-    benchmark_dispatchers()
-    test_memory_usage()
-    test_edge_case()
-    simulate_real_workload()
-    test_inheritance()
-    benchmark_with_inheritance()
+    sys.exit(pytest.main([__file__]))

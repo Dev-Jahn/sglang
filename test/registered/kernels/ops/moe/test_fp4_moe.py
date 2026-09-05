@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
 from typing import Callable
 
 import pytest
@@ -341,4 +342,4 @@ def test_flashinfer_fp4_moe_no_graph(
 
 
 if __name__ == "__main__":
-    test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
+    sys.exit(pytest.main([__file__]))

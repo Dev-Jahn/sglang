@@ -51,13 +51,6 @@ _DIRECT_MAIN_RUNNER_FILES = {
     "test/registered/kernels/ops/communication/test_amd_deterministic_custom_allreduce.py",
     "test/registered/kernels/ops/communication/test_amd_nccl_allreduce_determinism.py",
 }
-# These files predate the entry-point rule and invoke their complete, small
-# function set directly. Convert them to pytest.main() when they are edited.
-_DIRECT_TEST_FUNCTION_RUNNER_FILES = {
-    "test/registered/kernels/ops/moe/test_fp4_moe.py",
-    "test/registered/unit/distributed/test_parallel_state.py",
-    "test/registered/utils/test_bench_typebaseddispatcher.py",
-}
 
 
 def _main_entrypoint_status(tree: ast.Module, filename: str) -> tuple[bool, bool, bool]:
@@ -96,10 +89,6 @@ def _main_entrypoint_status(tree: ast.Module, filename: str) -> tuple[bool, bool
                 continue
             if isinstance(child.func, ast.Name) and (
                 child.func.id in _ALTERNATE_TEST_RUNNERS
-                or (
-                    child.func.id.startswith("test_")
-                    and filename in _DIRECT_TEST_FUNCTION_RUNNER_FILES
-                )
                 or (child.func.id == "main" and filename in _DIRECT_MAIN_RUNNER_FILES)
             ):
                 runs_alternate = True
